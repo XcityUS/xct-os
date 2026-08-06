@@ -8,6 +8,12 @@ import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import { createWorkshopLogger } from "./observability";
 import { getAiGatewayConfig } from "./ai-gateway.js";
 import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-billing/limits/config.js";
+import { getXcityConfig } from "./xcity/config.js";
+import {
+  XcityModelPlane,
+  type XcityModelPlaneCache,
+  type XcityUserIdentity,
+} from "./xcity/model-plane.js";
 import type { AdminSettings } from "./admin-settings.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./blueprint-archive.js";
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
@@ -211,6 +217,11 @@ function makeUserStorage(storage: DurableObjectStorage) {
       // count. Folds the former standalone RateLimitDO into the user object.
       dailyLlmCount: <{ day: string; count: number } | null>null,
 
+      // Xcity sign-in identity and per-user model-plane cache. The litellm virtual key is a secret
+      // and never leaves this user object except as part of an internal model config.
+      xcityIdentity: <XcityUserIdentity | null>null,
+      xcityModelPlane: <XcityModelPlaneCache>{},
+
       // `passwordHash` value as passed to `login()`, but with an extra round of SHA-256 applied.
       //
       // null = password disabled (e.g. because some other auth mechanism is used)
@@ -409,6 +420,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return this.#newSessionToken();
   }
 
+  async setXcityIdentity(identity: XcityUserIdentity): Promise<void> {
+    this.storage.xcityIdentity.put(identity);
+  }
+
   // Whether this account has a password set (false for gatekeeper sign-in accounts).
   async hasPasswordLogin(): Promise<boolean> {
     return this.storage.passwordHashHash.get() !== null;
@@ -502,8 +517,42 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.storage.profile.put(profile);
   }
 
+  async #getXcityModelPlane(): Promise<XcityModelPlane | null> {
+    let config = getXcityConfig(this.env);
+    let identity = this.storage.xcityIdentity.get();
+    if (!config || !identity) return null;
+
+    try {
+      return await XcityModelPlane.forUser(
+          this.env, config, this.storage.xcityModelPlane, identity.userId,
+          identity.email ?? this.storage.profile.get().id);
+    } catch (err) {
+      logger.warn("failed to resolve xcity model plane", {
+        event: "xcity.model.plane.resolve.failed", error: err,
+      });
+      return null;
+    }
+  }
+
   async listModels(): Promise<AiChatAuthorInfo[]> {
     let result: AiChatAuthorInfo[] = [];
+
+    let xcityModelPlane = await this.#getXcityModelPlane();
+    if (xcityModelPlane) {
+      let xcityModelIds = new Set<string>();
+      for (let entry of xcityModelPlane.getModelList()) {
+        result.push(entry);
+        xcityModelIds.add(entry.id);
+      }
+
+      // User-configured models remain available, but tokenhub is authoritative for duplicates.
+      for (let model of this.storage.aiModels.list()) {
+        if (!xcityModelIds.has(model.profile.id)) {
+          result.push(model.profile);
+        }
+      }
+      return result;
+    }
 
     // When AI Gateway mode is active, include all suggested models for enabled providers.
     let gwConfig = getAiGatewayConfig(this.env);
@@ -535,6 +584,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async deleteModel(id: string): Promise<void> {
+    let xcityModelPlane = await this.#getXcityModelPlane();
+    let xcityModel = xcityModelPlane?.resolveModel(id);
+    if (xcityModel) {
+      throw new Error(`Cannot delete built-in model "${xcityModel.profile.name}".`);
+    }
+
     // In AI Gateway mode, don't allow deleting built-in suggested models.
     let gwConfig = getAiGatewayConfig(this.env);
     if (gwConfig) {
@@ -553,6 +608,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async getQuickModel(): Promise<null | string> {
+    let xcityModelPlane = await this.#getXcityModelPlane();
+    let xcityQuickModel = xcityModelPlane?.getQuickModelConfig();
+    if (xcityQuickModel) return xcityQuickModel.model;
+
     let result = this.storage.quickModel.get();
     if (result && this.storage.aiModels.get(result)) {
       return result;
@@ -568,8 +627,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async setPreferredModel(id: string | null): Promise<void> {
     if (id !== null) {
       // Validate that the model exists in the user's configured models or as a gateway model.
+      let xcityModelPlane = await this.#getXcityModelPlane();
       let gwConfig = getAiGatewayConfig(this.env);
-      let exists = !!this.storage.aiModels.get(id) || !!gwConfig?.resolveModel(id);
+      let exists = !!this.storage.aiModels.get(id) ||
+          !!xcityModelPlane?.resolveModel(id) ||
+          (!xcityModelPlane && !!gwConfig?.resolveModel(id));
       if (!exists) {
         throw new Error(`No such model: ${id}`);
       }
@@ -664,14 +726,18 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   // DO NOT MAKE PUBLIC -- returns API keys.
   async getChatContext(modelId: string | null): Promise<UserChatContext> {
+    let xcityModelPlane = await this.#getXcityModelPlane();
     let gwConfig = getAiGatewayConfig(this.env);
 
     let result: UserChatContext = {
       profile: this.storage.profile.get()
     };
     if (modelId) {
+      if (xcityModelPlane) {
+        result.aiModel = xcityModelPlane.resolveModel(modelId);
+      }
       // In AI Gateway mode, resolve gateway models first.
-      if (gwConfig) {
+      if (!result.aiModel && !xcityModelPlane && gwConfig) {
         result.aiModel = gwConfig.resolveModel(modelId);
       }
       if (!result.aiModel) {
@@ -681,8 +747,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     // Resolve the quick model (used for lightweight tasks like title generation).
-    if (gwConfig) {
-      // In AI Gateway mode, always use the hardcoded quick model.
+    if (xcityModelPlane) {
+      result.quickModel = gwConfig
+          ? gwConfig.getQuickModelConfig(xcityModelPlane)
+          : xcityModelPlane.getQuickModelConfig();
+    } else if (gwConfig) {
       result.quickModel = gwConfig.getQuickModelConfig();
     } else {
       let quickModelId = this.storage.quickModel.get();

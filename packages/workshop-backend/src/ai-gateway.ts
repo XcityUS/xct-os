@@ -79,7 +79,12 @@ export class AiGatewayConfig {
   /**
    * Get the AiModelConfig for the quick model (used for title generation).
    */
-  getQuickModelConfig(): AiModelConfig | undefined {
+  getQuickModelConfig(
+      xcityModelPlane?: { getQuickModelConfig(): AiModelConfig | undefined }
+  ): AiModelConfig | undefined {
+    let xcityQuickModel = xcityModelPlane?.getQuickModelConfig();
+    if (xcityQuickModel) return xcityQuickModel;
+
     // Always use Workers AI here.
     return {
       provider: "cloudflare",

@@ -21,9 +21,11 @@
 
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { GatekeeperConnectCallback, GatekeeperUser } from "@gadgets/workshop-shared/gatekeeper";
+import type { XcityGatekeeperUser } from "@gadgets/workshop-shared/xcity-gatekeeper";
 import { createWorkshopLogger } from "../observability";
 import { CLOUDFLARE_VENDOR_ID } from "../user.js";
 import { readAdminConfig } from "../admin-config.js";
+import { XCITY_VENDOR_ID } from "../xcity/model-plane.js";
 
 const logger = createWorkshopLogger("workshop.auth");
 
@@ -118,9 +120,20 @@ export class LoginConnectCallbackImpl
       }
       // For Cloudflare, signing in also links the account for AI Gateway billing: startGatekeeperLogin
       // requested full (non-transient) scopes, so persist the grant as a connected account before
-      // handing back the session. Other providers use minimal, transient sign-in grants (no persist).
+      // handing back the session. Xcity keeps only the stable GoTrue subject needed to mint a
+      // tokenhub key later; the transient OAuth grant still expires.
       if (this.ctx.props.vendorId === CLOUDFLARE_VENDOR_ID) {
         await userStub.linkConnectedAccountFromLogin(account, this.ctx.props.vendorId, expiresAt);
+      } else if (this.ctx.props.vendorId === XCITY_VENDOR_ID) {
+        const xcityUserId =
+            await (account as unknown as Fetcher<XcityGatekeeperUser>).getXcityUserId();
+        if (xcityUserId) {
+          await userStub.setXcityIdentity({ userId: xcityUserId, email });
+        } else {
+          loginLogger.warn("xcity login had no user id", {
+            event: "xcity.login.user.id.missing",
+          });
+        }
       }
       // Session tokens are "<doName>:<secret>"; PublicApi.authenticate() routes via idFromName of
       // the first part. The user DO is keyed by email, so the prefix must be the email.

@@ -1,4 +1,5 @@
-import type { Api } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { getXcityModelDescriptorMetadata } from "./xcity/model-plane";
 
 // PDF chat attachments, bridged over pi's image content parts.
 //
@@ -26,9 +27,13 @@ import type { Api } from "@earendil-works/pi-ai";
 export const PDF_MIME_TYPE = "application/pdf";
 
 /** Whether PDF attachments can reach this pi API (natively or via bridgePdfAttachments()). */
-export function modelApiSupportsPdfAttachments(api: Api): boolean {
-  return api === "anthropic-messages" || api === "openai-responses" ||
-      api === "google-generative-ai";
+export function modelApiSupportsPdfAttachments(api: Api, model?: Model<Api>): boolean {
+  if (api === "anthropic-messages" || api === "openai-responses" ||
+      api === "google-generative-ai") {
+    return true;
+  }
+  return api === "openai-completions" && model !== undefined &&
+      getXcityModelDescriptorMetadata(model)?.capabilities?.pdfInput === true;
 }
 
 /**

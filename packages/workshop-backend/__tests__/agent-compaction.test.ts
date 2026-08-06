@@ -5,6 +5,7 @@ import {
   buildCompactionState, buildSummaryPrompt, findCompactionBoundary, findProtectedFromSequence,
   getModelTokenLimits, isCompactionTurn, protectRetainedReverts, shouldCompactChat, startsAgentTurn,
 } from "../src/agent-compaction";
+import { parseTokenhubModelCatalog } from "../src/xcity/model-plane";
 import * as Y from "yjs";
 import type {Api, AssistantMessage, Message, Model} from "@earendil-works/pi-ai";
 import type {ChatBindingEntry} from "../src/agent";
@@ -116,6 +117,23 @@ describe("compaction trigger", () => {
     // Other providers fall back to the assumed window with nothing withheld.
     expect(getModelTokenLimits({provider: "ollama", model: "local", apiToken: ""}))
         .toEqual({inputBudget: 128_000, maxOutputTokens: undefined});
+  });
+
+  it("uses tokenhub context and output limits from Xcity model metadata", () => {
+    const [record] = parseTokenhubModelCatalog({
+      data: [{
+        id: "tokenhub-model",
+        context_window: 256_000,
+        max_output_tokens: 32_000,
+      }],
+    }, {
+      tokenhubUrl: "https://tokenhub.xcity.ai",
+      apiKey: "sk-tokenhub",
+      xcityUserId: "01823f64-8ac8-715e-bf17-0f92801f2af3",
+    })!;
+
+    expect(getModelTokenLimits(record.config))
+        .toEqual({inputBudget: 224_000, maxOutputTokens: 32_000});
   });
 
   it("recognizes /compact as the newest message, and only there", () => {

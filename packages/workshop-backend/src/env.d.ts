@@ -27,6 +27,7 @@ declare global {
       // per-user tokenhub key from wallet and route model inference directly to tokenhub.
       XCITY_TOKENHUB_URL?: string;
       XCITY_WALLET_URL?: string;
+      XCITY_HOME_URL?: string;
       WALLET_SERVICE_TOKEN?: string;
       XCITY_QUICK_MODEL?: string;
 

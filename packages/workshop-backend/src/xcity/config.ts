@@ -7,9 +7,35 @@ export interface XcityConfig {
   quickModel?: string;
 }
 
+export interface XcityUsageConfig {
+  walletUrl: string;
+  homeUrl?: string;
+}
+
 function getEnvString(env: Cloudflare.Env, name: keyof Cloudflare.Env): string | undefined {
   let value = env[name];
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+export function getXcityWalletUrl(env: Cloudflare.Env): string | undefined {
+  let walletUrl = getEnvString(env, "XCITY_WALLET_URL");
+  return walletUrl ? stripTrailingSlashes(walletUrl) : undefined;
+}
+
+export function getXcityHomeUrl(env: Cloudflare.Env): string | undefined {
+  let homeUrl = getEnvString(env, "XCITY_HOME_URL");
+  return homeUrl ? stripTrailingSlashes(homeUrl) : undefined;
+}
+
+export function getXcityUsageConfig(env: Cloudflare.Env): XcityUsageConfig | null {
+  let walletUrl = getXcityWalletUrl(env);
+  if (!walletUrl) return null;
+
+  let homeUrl = getXcityHomeUrl(env);
+  return {
+    walletUrl,
+    ...(homeUrl ? { homeUrl } : {}),
+  };
 }
 
 /**
@@ -18,14 +44,14 @@ function getEnvString(env: Cloudflare.Env, name: keyof Cloudflare.Env): string |
  */
 export function getXcityConfig(env: Cloudflare.Env): XcityConfig | null {
   let tokenhubUrl = getEnvString(env, "XCITY_TOKENHUB_URL");
-  let walletUrl = getEnvString(env, "XCITY_WALLET_URL");
+  let walletUrl = getXcityWalletUrl(env);
   let walletServiceToken = getEnvString(env, "WALLET_SERVICE_TOKEN");
   if (!tokenhubUrl || !walletUrl || !walletServiceToken) return null;
 
   let quickModel = getEnvString(env, "XCITY_QUICK_MODEL");
   return {
     tokenhubUrl: stripTrailingSlashes(tokenhubUrl),
-    walletUrl: stripTrailingSlashes(walletUrl),
+    walletUrl,
     walletServiceToken,
     ...(quickModel ? { quickModel } : {}),
   };

@@ -3,7 +3,8 @@ import { CloudflareUsageInfo, CloudflareAccountOption } from '@gadgets/workshop-
 import { Dialog, Button, Loader, useKumoToastManager } from '@cloudflare/kumo'
 import { CloudWarning, Lightning } from '@phosphor-icons/react'
 import { useOptionalAuthenticatedApi } from '../../AuthContext'
-import { buildAddCreditsUrl } from './creditsUrl'
+import { useServerConfig } from '../../ServerConfigContext'
+import { buildAddCreditsUrl, formatUsageBalance, isXcityUsage } from './creditsUrl'
 import ResetCountdown from './ResetCountdown'
 
 interface OutOfCreditsModalProps {
@@ -11,11 +12,11 @@ interface OutOfCreditsModalProps {
   onClose: () => void
 }
 
-// Modal shown when a user has exhausted their free daily allowance. Guides them to connect their
-// Cloudflare account (if not connected), pick which account to bill (if they have several), or top
-// up credits in the Cloudflare dashboard (if connected but low balance).
+// Modal shown when a server-side usage gate blocks a turn. Guides the user to the right billing
+// surface for the active deployment mode.
 export default function OutOfCreditsModal({ open, onClose }: OutOfCreditsModalProps) {
   const auth = useOptionalAuthenticatedApi()
+  const serverConfig = useServerConfig()
   const toasts = useKumoToastManager()
   const [usage, setUsage] = useState<CloudflareUsageInfo | null>(null)
   const [connecting, setConnecting] = useState(false)
@@ -84,20 +85,28 @@ export default function OutOfCreditsModal({ open, onClose }: OutOfCreditsModalPr
 
   const connected = usage?.connected ?? false
   const needsSelection = connected && (usage?.needsAccountSelection ?? false)
+  const xcity = isXcityUsage(usage)
+  const rechargeUrl = usage ? buildAddCreditsUrl(usage, serverConfig?.xcityHomeUrl) : null
 
   return (
     <Dialog.Root open={open} onOpenChange={(o) => { if (!o) onClose() }}>
       <Dialog className="p-6 sm:w-[560px]" size="base">
         <Dialog.Title className="text-lg font-semibold mb-2 flex items-center gap-2">
           <CloudWarning size={22} weight="bold" className="text-kumo-warning" />
-          You've reached your free usage limit
+          {xcity ? 'Recharge Xcity wallet' : "You've reached your free usage limit"}
         </Dialog.Title>
 
         {usage === null ? (
           <div className="flex justify-center py-8"><Loader size="base" /></div>
         ) : (
           <div className="space-y-4">
-            {!connected ? (
+            {xcity ? (
+              <p className="text-sm text-kumo-subtle">
+                Your Xcity wallet balance is{' '}
+                <strong>{formatUsageBalance(usage) ?? '0.0 KWH'}</strong>. Recharge to keep
+                building.
+              </p>
+            ) : !connected ? (
               <p className="text-sm text-kumo-subtle">
                 You've used all {usage.dailyLimit} of your free {usage.dailyLimit === 1 ? 'request' : 'requests'} for
                 today. Connect your Cloudflare account to keep building now — usage beyond the free
@@ -131,7 +140,7 @@ export default function OutOfCreditsModal({ open, onClose }: OutOfCreditsModalPr
               </p>
             )}
 
-            {needsSelection && (
+            {!xcity && needsSelection && (
               <div className="flex flex-col gap-2">
                 {accounts === null ? (
                   <p className="text-sm text-kumo-subtle">Loading accounts…</p>
@@ -154,21 +163,35 @@ export default function OutOfCreditsModal({ open, onClose }: OutOfCreditsModalPr
               </div>
             )}
 
-            <p className="text-sm text-kumo-subtle">
-              Learn more about{' '}
-              <a
-                href="https://developers.cloudflare.com/ai-gateway/features/unified-billing/"
-                target="_blank"
-                rel="noreferrer"
-                className="underline"
-              >
-                AI Gateway unified billing
-              </a>
-              .
-            </p>
+            {!xcity && (
+              <p className="text-sm text-kumo-subtle">
+                Learn more about{' '}
+                <a
+                  href="https://developers.cloudflare.com/ai-gateway/features/unified-billing/"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline"
+                >
+                  AI Gateway unified billing
+                </a>
+                .
+              </p>
+            )}
 
             <div className="flex items-center justify-end gap-2 pt-2">
-              {!connected ? (
+              {xcity ? (
+                <>
+                  <Button variant="secondary" onClick={onClose}>Close</Button>
+                  {rechargeUrl && (
+                    <Button
+                      variant="primary"
+                      onClick={() => window.open(rechargeUrl, '_blank')}
+                    >
+                      Recharge
+                    </Button>
+                  )}
+                </>
+              ) : !connected ? (
                 <>
                   <Button variant="secondary" onClick={onClose}>Maybe later</Button>
                   <Button variant="primary" onClick={connect} loading={connecting}>
@@ -183,7 +206,10 @@ export default function OutOfCreditsModal({ open, onClose }: OutOfCreditsModalPr
                   <Button variant="secondary" onClick={onClose}>Close</Button>
                   <Button
                     variant="primary"
-                    onClick={() => window.open(buildAddCreditsUrl(usage.accountId), '_blank')}
+                    onClick={() => {
+                      const url = buildAddCreditsUrl(usage)
+                      if (url) window.open(url, '_blank')
+                    }}
                   >
                     Add credits in Cloudflare
                   </Button>

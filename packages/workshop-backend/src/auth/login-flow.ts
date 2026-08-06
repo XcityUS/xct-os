@@ -14,10 +14,10 @@
 //      verified email, resolve/create the email-keyed user DO, mint a session, and deliver the token
 //      to the PendingLogin DO, which resolves the awaiting RPC.
 //
-// Sign-in only requests minimal scopes and the gatekeeper grant is transient (it self-destructs
-// shortly after we read the email) — so login does NOT create a persistent connected account.
-// Capability access (repos, docs, billing) is granted later when the user explicitly connects the
-// gatekeeper, which requests the full scopes and persists the connection.
+// Sign-in usually requests minimal scopes and the gatekeeper grant is transient (it self-destructs
+// shortly after we read the email), so login does not create a persistent connected account.
+// Cloudflare and Xcity are exceptions because their billing gates need a reusable user token; the
+// PublicApi requests their full non-transient scopes, and the callback persists the grant here.
 
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { GatekeeperConnectCallback, GatekeeperUser } from "@gadgets/workshop-shared/gatekeeper";
@@ -118,13 +118,12 @@ export class LoginConnectCallbackImpl
         await pending.fail("New sign-ups are currently disabled on this deployment.");
         return;
       }
-      // For Cloudflare, signing in also links the account for AI Gateway billing: startGatekeeperLogin
-      // requested full (non-transient) scopes, so persist the grant as a connected account before
-      // handing back the session. Xcity keeps only the stable GoTrue subject needed to mint a
-      // tokenhub key later; the transient OAuth grant still expires.
+      // For billing-aware providers, signing in also links the account: startGatekeeperLogin
+      // requested full (non-transient) scopes, so persist the grant before handing back the session.
       if (this.ctx.props.vendorId === CLOUDFLARE_VENDOR_ID) {
         await userStub.linkConnectedAccountFromLogin(account, this.ctx.props.vendorId, expiresAt);
       } else if (this.ctx.props.vendorId === XCITY_VENDOR_ID) {
+        await userStub.linkConnectedAccountFromLogin(account, this.ctx.props.vendorId, expiresAt);
         const xcityUserId =
             await (account as unknown as Fetcher<XcityGatekeeperUser>).getXcityUserId();
         if (xcityUserId) {

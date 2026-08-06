@@ -8,6 +8,8 @@ import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config
 import { getAuthVendorBinding } from "./auth/auth-vendors.js";
 import { getUsageInfo } from "./ai-gateway-billing/limits/usage-checker.js";
 import { listConnectedAccounts, selectAccount } from "./ai-gateway-billing/cloudflare/connection-service.js";
+import { getXcityUsageInfo } from "./xcity/usage-checker.js";
+import { getXcityUsageConfig } from "./xcity/config.js";
 import { PendingLogin, LoginConnectCallbackImpl } from "./auth/login-flow.js";
 import { deploymentOutputForBlueprint, listFormatOffers, readAdminConfig } from "./admin-config.js";
 
@@ -28,6 +30,7 @@ import { verifyCfAccessJwt } from "./access.js";
 import { resolveUiFeatureFlags } from "./feature-flags";
 import { serveSiteLogo, SITE_LOGO_PATH } from "./site-logo.js";
 import { createWorkshopLogger } from "./observability";
+import { XCITY_VENDOR_ID } from "./xcity/model-plane.js";
 
 const logger = createWorkshopLogger("workshop.server");
 
@@ -148,6 +151,9 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   getCloudflareUsage(): Promise<CloudflareUsageInfo> {
+    if (getXcityUsageConfig(this.env)) {
+      return getXcityUsageInfo(this.env, this.user);
+    }
     return getUsageInfo(this.env, this.user);
   }
 
@@ -651,10 +657,11 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     const callback = this.ctx.exports.LoginConnectCallbackImpl(
         { props: { pendingId: pendingId.toString(), vendorId } });
     // For most providers, sign-in needs only minimal scopes to verify the user's email (the grant is
-    // transient); capability scopes are requested later via an explicit connectAccount. Cloudflare is
-    // the exception: signing in with Cloudflare also links AI Gateway billing, so it requests the
-    // full (persistent) scope set up front and LoginConnectCallbackImpl persists the connection.
-    const scopes = vendorId === CLOUDFLARE_VENDOR_ID ? "full" : "auth";
+    // transient); capability scopes are requested later via an explicit connectAccount. Cloudflare
+    // and Xcity are exceptions: signing in also links billing, so request the full persistent scope
+    // set up front and let LoginConnectCallbackImpl persist the connection.
+    const scopes =
+        vendorId === CLOUDFLARE_VENDOR_ID || vendorId === XCITY_VENDOR_ID ? "full" : "auth";
     const { url } = await vendor.connectAccount(callback, { scopes });
     // @ts-expect-error Cap'n Web RPC stubs and native RPC targets are compatible but the type
     //     system doesn't know this.

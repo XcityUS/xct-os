@@ -3,6 +3,7 @@ import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTE
 import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
+import { XcityGatekeeperUser } from "@gadgets/workshop-shared/xcity-gatekeeper";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import { createWorkshopLogger } from "./observability";
@@ -11,6 +12,7 @@ import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-bi
 import { getXcityConfig } from "./xcity/config.js";
 import {
   XcityModelPlane,
+  XCITY_VENDOR_ID,
   type XcityModelPlaneCache,
   type XcityUserIdentity,
 } from "./xcity/model-plane.js";
@@ -141,6 +143,14 @@ type CloudflareBilling = {
   creditsUpdatedAt?: number;
 };
 
+// Cached Xcity wallet balance. The GoTrue tokens live in the connected Xcity gatekeeper account
+// (vendorId "xcity"); the usage checker reads a usable token from there via getUsableAccessToken.
+type XcityWalletBalance = {
+  // Cached wallet balance in Xcity credits and when it was last fetched (unix ms).
+  creditsRemaining?: number | null;
+  creditsUpdatedAt?: number;
+};
+
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length != b.length) {
     return false;
@@ -221,6 +231,7 @@ function makeUserStorage(storage: DurableObjectStorage) {
       // and never leaves this user object except as part of an internal model config.
       xcityIdentity: <XcityUserIdentity | null>null,
       xcityModelPlane: <XcityModelPlaneCache>{},
+      xcityWalletBalance: <XcityWalletBalance | null>null,
 
       // `passwordHash` value as passed to `login()`, but with an extra round of SHA-256 applied.
       //
@@ -688,6 +699,37 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     record.creditsRemaining = undefined;
     record.creditsUpdatedAt = undefined;
     this.storage.cloudflareBilling.put(record);
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Xcity wallet balance (optional KWH gate).
+  // ---------------------------------------------------------------------------------------------
+
+  // Return the connected Xcity *gatekeeper* account stub, if any. The Xcity usage checker narrows it
+  // to XcityGatekeeperUser to obtain a usable GoTrue access token for wallet reads.
+  async getXcityGatekeeperAccount(): Promise<Fetcher<XcityGatekeeperUser> | null> {
+    let nextAccountId = this.storage.nextAccountId.get();
+    for (let id = 0; id < nextAccountId; id++) {
+      let rec: ConnectedAccountRecord | undefined;
+      try { rec = this.storage.connectedAccounts.get(id); } catch { continue; }
+      if (rec && rec.vendorId === XCITY_VENDOR_ID) {
+        return rec.account as unknown as Fetcher<XcityGatekeeperUser>;
+      }
+    }
+    return null;
+  }
+
+  // The cached Xcity wallet balance, or null if unset.
+  async getXcityWalletBalance(): Promise<XcityWalletBalance | null> {
+    return this.storage.xcityWalletBalance.get();
+  }
+
+  // Update the cached Xcity wallet balance in credits.
+  async updateXcityWalletBalance(creditsRemaining: number | null): Promise<void> {
+    let record = this.storage.xcityWalletBalance.get() ?? {};
+    record.creditsRemaining = creditsRemaining;
+    record.creditsUpdatedAt = Date.now();
+    this.storage.xcityWalletBalance.put(record);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1557,6 +1599,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       // account + cached balance), which is meaningless without the underlying grant.
       if (account.vendorId === CLOUDFLARE_VENDOR_ID) {
         this.storage.cloudflareBilling.put(null);
+      } else if (account.vendorId === XCITY_VENDOR_ID) {
+        this.storage.xcityWalletBalance.put(null);
       }
       logger.info("account disconnected", {
         event: "account.disconnected",

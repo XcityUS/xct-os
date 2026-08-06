@@ -32,6 +32,8 @@ import { recordAnalytics } from "./analytics";
 import { reportIssue } from "@gadgets/backend-utils/error-reporting";
 import type { ProductAnalyticsConnectionType, ProductAnalyticsGadgetInput } from "./analytics";
 import { checkUsageAndBalance } from "./ai-gateway-billing/limits/usage-checker";
+import { getXcityUsageConfig } from "./xcity/config";
+import { checkXcityUsage } from "./xcity/usage-checker";
 import { completeAgentCatalogSnapshot, normalizeAgentCatalog } from "./agent-catalog";
 import { refreshCachedBalance } from "./ai-gateway-billing/cloudflare/connection-service";
 import { SharingManager, SharingCaller, CollaboratorRecord, ShareKeyRecord } from "./sharing";
@@ -3895,7 +3897,9 @@ class OverseerImpl implements AgentHooks {
       let byokRouting: UserGatewayRouting | undefined;
       if (!callbackInitiated && this.ownerId) {
         let ownerStub = this.users.get(this.users.idFromString(this.ownerId));
-        let usage = await checkUsageAndBalance(this.env, ownerStub);
+        let usage = getXcityUsageConfig(this.env)
+            ? await checkXcityUsage(this.env, ownerStub)
+            : await checkUsageAndBalance(this.env, ownerStub);
         if (!usage.allowed) {
           this.postAgentErrorMessage(chatId, aiModel.profile,
               usage.reason ?? "Usage limit reached.", "usage_limit");

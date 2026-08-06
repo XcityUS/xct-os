@@ -28,10 +28,10 @@ xct-studio）。部署在 https://os.xcity.ai。
 | 1 | 认证 | `packages/workshop-backend/src/auth/` + 部署配置 | 不改代码。通过 `AUTH_GATEKEEPERS=xcity` 白名单启用 `gatekeeper-xcity`（上游既有机制，见 `docs/oauth-signin.md`） |
 | 2 | 模型面 | `packages/workshop-backend/src/ai-models.ts` — `getModel()` | 在 `options.userGateway` 分支**之前**插入一个 `XCITY_TOKENHUB_URL` 门控分支，复用 `getModelDirect()` 的构造方式携带 per-user key。不碰 Cloudflare AI Gateway 的任何代码路径 |
 | 2b | quick model | `packages/workshop-backend/src/ai-gateway.ts` — `getQuickModelConfig()` | 门控下改用 tokenhub 的便宜模型替代硬编码的 Workers AI |
-| 3 | 额度门禁 | overseer 中 `checkUsageAndBalance` 的调用点 | 按 `XCITY_WALLET_URL` 门控，二选一地调用 `xcity/usage-checker.ts`；返回值与 `ai-gateway-billing/limits/usage-checker.ts` 的 `UsageCheckResult` 同形状 |
+| 3 | 额度门禁 | overseer 中 `checkUsageAndBalance` 的调用点 + billing UI | 按 `XCITY_WALLET_URL` 门控，二选一地调用 `packages/workshop-backend/src/xcity/usage-checker.ts`；该 checker 从持久化的 Xcity gatekeeper 连接取 GoTrue user token，查 `GET $XCITY_WALLET_URL/v1/wallet/balance`，在 `UserDurableObject` 缓存余额 5 分钟。`balance > 0` 放行且不扣费，`balance <= 0` 拦截并引导去 `XCITY_HOME_URL` 充值；拿不到 token、wallet 失败或响应异常时 fail-open（真正扣费/预算边界在 tokenhub/litellm）。前端沿用 `CloudflareUsageInfo` 通道的可选 `billingMode: "xcity"` 字段显示 KWH（credits / 100）并隐藏 Cloudflare 文案 |
 | 4 | Gadget 能力 | `packages/gatekeeper-mcp-portal/` | 转发用户的 tokenhub bearer；其余能力走新增的 `gatekeeper-xcity` |
 | 5 | 本地开发 | `run-dev-server.js` — `SHARED_GATEKEEPER_CREDS` | 加一行 `"gatekeeper-xcity": { id: "XCITY_CLIENT_ID", secret: "XCITY_CLIENT_SECRET" }`。仅影响本地 dev，不影响生产 |
-| 6 | 登录后置 | `packages/workshop-backend/src/auth/login-flow.ts` | Xcity 登录成功后把 GoTrue `sub` 存进 UserDurableObject（`setXcityIdentity`）。接缝 1 说"不改代码"，但铸 per-user litellm key 必须要这个 id，且这里是它唯一的自然落点。改动限于一个 `vendorId === XCITY_VENDOR_ID` 分支，与既有的 Cloudflare 分支并列 |
+| 6 | 登录后置 | `packages/workshop-backend/src/auth/login-flow.ts` / `server.ts` | Xcity 登录成功后把 GoTrue `sub` 存进 UserDurableObject（`setXcityIdentity`），并仿照 Cloudflare 登录计费路径请求 full scope、调用 `linkConnectedAccountFromLogin` 持久化 gatekeeper 连接，供余额门禁反复获取新鲜 GoTrue access token。接缝 1 说"不改代码"，但铸 per-user litellm key和余额门禁都必须有用户身份/连接，且这里是自然落点。改动限于 `vendorId === XCITY_VENDOR_ID` 分支，与既有的 Cloudflare 分支并列 |
 | 7 | 附件能力 | `chat-attachment-validation.ts` / `chat-attachment-pdf.ts` / `overseer.ts` 的调用点 | 把完整 `AiModelConfig` 而非仅 `provider` 传下去，让 tokenhub 的 per-model `vision` / `pdf_input` 能力生效。无 Xcity 元数据时逐字回落原有的 `ATTACHMENT_SUPPORT_BY_PROVIDER` 表 |
 
 **已知的结构性取舍**：Xcity 的模型元数据以 `XcityAiModelConfig = AiModelConfig & { xcity?: … }`
@@ -49,9 +49,9 @@ Gatekeeper 本身按目录名 `gatekeeper-*` 自动发现并绑定为 `GATEKEEPE
 | 变量 | 作用 | 不设时 |
 |---|---|---|
 | `XCITY_TOKENHUB_URL` | tokenhub 基址，如 `https://tokenhub.xcity.ai` | 模型面回落上游行为（BYOK / AI Gateway） |
-| `XCITY_WALLET_URL` | wallet 基址，如 `https://wallet.xcity.ai`；模型面用它铸 per-user litellm key，额度门禁也会用它 | 模型面回落上游行为；额度门禁回落上游 `ENABLE_CLOUDFLARE_LIMITS` 逻辑 |
+| `XCITY_WALLET_URL` | wallet 基址，如 `https://wallet.xcity.ai`；模型面用它铸 per-user litellm key，额度门禁用它查 KWH 余额 | 模型面回落上游行为；额度门禁回落上游 `ENABLE_CLOUDFLARE_LIMITS` 逻辑 |
 | `XCITY_AUTH_URL` | GoTrue 基址，如 `https://auth.xcity.ai` | gatekeeper-xcity 不可用 |
-| `XCITY_HOME_URL` | xct-home 基址，如 `https://xcity.ai`（agent 目录、充值跳转） | agent 目录与充值引导不可用 |
+| `XCITY_HOME_URL` | xct-home 基址，如 `https://xcity.ai`（agent 目录、充值跳转；通过 `ServerConfig` 下发给前端） | agent 目录与充值跳转不可用 |
 | `WALLET_SERVICE_TOKEN` | 铸 per-user litellm key 用（**secret**） | 无法自动发 key |
 | `XCITY_QUICK_MODEL` | quick model 指定的 tokenhub model id（可选） | 从 tokenhub 目录里挑成本最低的模型 |
 | `AUTH_GATEKEEPERS` | 设为 `xcity` 启用统一登录 | 上游默认（用户名密码 / Cloudflare Access） |

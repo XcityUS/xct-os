@@ -31,3 +31,9 @@ export function useAuthVendors(): AuthVendorInfo[] {
 export function useCloudflareLimitsEnabled(): boolean {
   return useContext(ServerConfigContext)?.cloudflareLimitsEnabled ?? false
 }
+
+// Convenience: whether any server-side usage billing gate should be shown in account UI.
+export function useUsageBillingEnabled(): boolean {
+  const config = useContext(ServerConfigContext)
+  return !!(config?.cloudflareLimitsEnabled || config?.xcityUsageEnabled)
+}

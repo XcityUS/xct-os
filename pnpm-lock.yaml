@@ -610,6 +610,28 @@ importers:
         specifier: ^4.115.0
         version: 4.115.0
 
+  packages/gatekeeper-xcity:
+    dependencies:
+      '@gadgets/backend-utils':
+        specifier: workspace:*
+        version: link:../backend-utils
+      '@gadgets/workshop-shared':
+        specifier: workspace:*
+        version: link:../workshop-shared
+      capnweb:
+        specifier: ^0.8.0
+        version: 0.8.0
+      capnweb-validate:
+        specifier: 0.2.1
+        version: 0.2.1(capnweb@0.8.0)(esbuild@0.28.1)(rollup@4.62.3)(typescript@5.9.3)(vite@7.3.6(@types/node@26.1.0)(jiti@2.7.0)(lightningcss@1.32.0)(terser@5.49.0)(yaml@2.9.0))
+    devDependencies:
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+      wrangler:
+        specifier: ^4.115.0
+        version: 4.115.0
+
   packages/gatekeeper-zoominfo:
     dependencies:
       '@gadgets/configurator-ui':

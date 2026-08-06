@@ -21,6 +21,10 @@
       "types": "./src/cloudflare-gatekeeper.ts",
       "import": "./src/cloudflare-gatekeeper.ts"
     },
+    "./xcity-gatekeeper": {
+      "types": "./src/xcity-gatekeeper.ts",
+      "import": "./src/xcity-gatekeeper.ts"
+    },
     "./limits": {
       "types": "./src/limits.ts",
       "import": "./src/limits.ts"

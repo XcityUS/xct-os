@@ -20,6 +20,12 @@ import { AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LI
 import { AiGatewayConfig, getAiGatewayConfig, type AiGatewayLogRoute } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
+import { getXcityConfig } from "./xcity/config.js";
+import {
+  attachXcityModelDescriptorMetadata,
+  getXcityModelMetadata,
+  xcityModelCost,
+} from "./xcity/model-plane.js";
 
  // Routing to bill a user's own Cloudflare account for inference (BYOK path once the free tier is
  // exhausted). Defined here to avoid a backend->ai-gateway-billing type import cycle at runtime.
@@ -133,10 +139,12 @@ function catalogModel(provider: AiModelConfig["provider"], modelId: string): Mod
 // gaps for models we don't list, and unknown models get conservative defaults.
 function modelTokenWindow(config: AiModelConfig, catalog: Model<Api> | undefined)
     : { contextWindow: number, maxTokens: number } {
+  let xcityMetadata = getXcityModelMetadata(config);
   const suggested = SUGGESTED_MODELS[config.provider]?.[config.model];
   return {
-    contextWindow: suggested?.contextWindow ?? catalog?.contextWindow ?? 128_000,
-    maxTokens: suggested?.outputLimit ??
+    contextWindow: xcityMetadata?.contextWindow ??
+        suggested?.contextWindow ?? catalog?.contextWindow ?? 128_000,
+    maxTokens: xcityMetadata?.maxOutputTokens ?? suggested?.outputLimit ??
         (config.provider === "cloudflare" ? WORKERS_AI_OUTPUT_LIMIT : undefined) ??
         catalog?.maxTokens ?? 4096,
   };
@@ -246,6 +254,10 @@ function getHeader(headers: Record<string, string>, name: string): string | unde
   return undefined;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 type HandleArgs = {
   model: Model<Api>;
   // Provider auth: a plain API key (pi turns it into the SDK's native auth) and/or headers.
@@ -256,6 +268,7 @@ type HandleArgs = {
   // Structured gateway attribution; sent as `cf-aig-metadata` on gateway-routed requests only
   // (pi does not forward options.metadata to that header itself).
   gatewayMetadata?: GatewayMetadata;
+  openAiRequestUser?: string;
   sessionAffinity?: string;
   aiGatewayLogRoute?: AiGatewayLogRoute;
 };
@@ -321,7 +334,14 @@ function makeHandle(args: HandleArgs): ModelHandle {
         // document blocks (no-op for payloads without one; see chat-attachment-pdf.ts).
         onPayload: async (payload, payloadModel) => {
           const replaced = await options.onPayload?.(payload, payloadModel);
-          return bridgePdfAttachments(args.model.api, replaced ?? payload) ?? replaced;
+          let current = replaced ?? payload;
+          let changed = replaced !== undefined;
+          if (args.openAiRequestUser && args.model.api === "openai-completions" &&
+              isRecord(current) && current.user === undefined) {
+            current = { ...current, user: args.openAiRequestUser };
+            changed = true;
+          }
+          return bridgePdfAttachments(args.model.api, current) ?? (changed ? current : undefined);
         },
         // NOTE(binding-transport): pi passes `options.fetch` into its SDK clients on all paths.
         // If Workers-binding-backed inference returns (upstream ask filed), inject a
@@ -342,6 +362,12 @@ function makeHandle(args: HandleArgs): ModelHandle {
 export function getModel(env: Cloudflare.Env, config: AiModelConfig,
                          initiator: AiChatAuthorInfo,
                          options: ModelRoutingOptions = {}): ModelHandle {
+  // Xcity model-plane configs already carry the tokenhub URL and the user's own litellm virtual
+  // key, so they must go straight through the direct OpenAI-compatible path.
+  if (getXcityConfig(env) && getXcityModelMetadata(config)) {
+    return getModelDirect(config, options.sessionAffinity);
+  }
+
   // BYOK: a connected user's own Cloudflare account pays for everything (all providers, including
   // Workers AI), routed through the user's own AI Gateway with unified billing. Honored regardless
   // of whether a platform AI Gateway is configured, so connected users are always billed correctly.
@@ -551,24 +577,32 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
       // local proxy may reject an unexpected bearer token): the OpenAI SDK requires *some* key,
       // so give it a placeholder while a null default header deletes the Authorization header
       // the SDK derives from it.
-      return makeHandle({
-        model: {
-          id: config.model,
-          name: config.model,
-          api: "openai-completions",
-          provider: "ollama",
-          baseUrl: `${stripTrailingSlashes(config.apiUrl ?? "http://localhost:11434")
-              .replace(/\/(api|v1)$/, "")}/v1`,
-          reasoning: true,
-          input: ["text", "image"],
-          cost: ZERO_COST,
-          ...window,
-        },
-        ...(config.apiToken === ""
-            ? { apiKey: "unused", headers: { Authorization: null } }
-            : { apiKey: config.apiToken }),
-        sessionAffinity,
-      });
+      {
+        const xcityMetadata = getXcityModelMetadata(config);
+        const input: ("text" | "image")[] = xcityMetadata
+            ? (xcityMetadata.capabilities?.vision === true ||
+                xcityMetadata.capabilities?.pdfInput === true ? ["text", "image"] : ["text"])
+            : ["text", "image"];
+        return makeHandle({
+          model: attachXcityModelDescriptorMetadata({
+            id: config.model,
+            name: config.model,
+            api: "openai-completions",
+            provider: "ollama",
+            baseUrl: `${stripTrailingSlashes(config.apiUrl ?? "http://localhost:11434")
+                .replace(/\/(api|v1)$/, "")}/v1`,
+            reasoning: true,
+            input,
+            cost: xcityModelCost(config) ?? ZERO_COST,
+            ...window,
+          }, config),
+          ...(config.apiToken === ""
+              ? { apiKey: "unused", headers: { Authorization: null } }
+              : { apiKey: config.apiToken }),
+          openAiRequestUser: xcityMetadata?.xcityUserId,
+          sessionAffinity,
+        });
+      }
     case "openai":
       return makeHandle({
         model: {

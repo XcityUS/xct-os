@@ -1467,7 +1467,7 @@ export async function runAgent(
                     text: `\n\n[Attached text file${filename}]\n${new TextDecoder().decode(data)}`,
                   }];
                 } else if (attachment.mimeType === PDF_MIME_TYPE &&
-                           modelApiSupportsPdfAttachments(handle.model.api)) {
+                           modelApiSupportsPdfAttachments(handle.model.api, handle.model)) {
                   // pi has no file/document content part, so a PDF rides an ImageContent part;
                   // the model handle rewrites it into the provider's native document block just
                   // before the request goes out (see chat-attachment-pdf.ts). The text part

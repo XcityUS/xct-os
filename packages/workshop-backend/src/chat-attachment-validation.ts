@@ -1,6 +1,7 @@
 import { isTextLikeAttachmentMimeType } from "@gadgets/workshop-shared/api";
 import type { AiModelConfig, AiModelProvider, ChatAttachmentUpload } from "@gadgets/workshop-shared/api";
 import { PDF_MIME_TYPE } from "./chat-attachment-pdf";
+import { getXcityModelMetadata } from "./xcity/model-plane";
 
 // Bounds attachment storage and the bytes replayed into model requests.
 const MAX_CHAT_ATTACHMENT_BYTES = 1024 * 1024;
@@ -40,6 +41,8 @@ const ATTACHMENT_SUPPORT_BY_PROVIDER = {
   ollama: isTextOrImageMime,
 } satisfies Record<AiModelProvider, (mimeType: string) => boolean>;
 
+type AttachmentModel = AiModelProvider | AiModelConfig | undefined;
+
 function sanitizeChatAttachmentMimeType(mimeType: string | undefined): string {
   if (!mimeType || /[\r\n]/.test(mimeType)) return "application/octet-stream";
   return mimeType.split(";", 1)[0].trim().toLowerCase() || "application/octet-stream";
@@ -51,9 +54,24 @@ function sanitizeChatAttachmentName(name: string | undefined): string | undefine
   return result || undefined;
 }
 
+function xcityAttachmentSupport(model: AttachmentModel, mimeType: string): boolean | undefined {
+  if (typeof model !== "object" || model === null) return undefined;
+  let metadata = getXcityModelMetadata(model);
+  if (!metadata) return undefined;
+
+  if (isTextLikeAttachmentMimeType(mimeType)) return true;
+  if (IMAGE_SIGNATURES.has(mimeType)) return metadata.capabilities?.vision === true;
+  if (mimeType === PDF_MIME_TYPE) return metadata.capabilities?.pdfInput === true;
+  return false;
+}
+
+function attachmentProvider(model: AttachmentModel): AiModelProvider | undefined {
+  return typeof model === "string" ? model : model?.provider;
+}
+
 /** Reject an attachment type that the selected provider cannot accept. */
 export function assertChatAttachmentSupportedByProvider(
-  provider: AiModelProvider | undefined,
+  provider: AttachmentModel,
   mimeType: string,
   byteLength: number,
 ): void {
@@ -61,12 +79,19 @@ export function assertChatAttachmentSupportedByProvider(
     throw new Error("Chat attachment is too large.");
   }
 
-  if (!provider) {
+  let xcitySupported = xcityAttachmentSupport(provider, mimeType);
+  if (xcitySupported !== undefined) {
+    if (xcitySupported) return;
+    throw new Error("Unsupported file type");
+  }
+
+  let resolvedProvider = attachmentProvider(provider);
+  if (!resolvedProvider) {
     if (isTextOrImageMime(mimeType)) return;
     throw new Error("Unsupported file type");
   }
 
-  if (ATTACHMENT_SUPPORT_BY_PROVIDER[provider](mimeType)) return;
+  if (ATTACHMENT_SUPPORT_BY_PROVIDER[resolvedProvider](mimeType)) return;
 
   throw new Error("Unsupported file type");
 }
@@ -74,7 +99,7 @@ export function assertChatAttachmentSupportedByProvider(
 /** Normalize and validate attachment bytes before staging them in chat storage. */
 export function validateChatAttachmentUpload(
   attachment: ChatAttachmentUpload,
-  provider?: AiModelConfig["provider"],
+  provider?: AttachmentModel,
 ): ChatAttachmentUpload {
   attachment.name = sanitizeChatAttachmentName(attachment.name);
   attachment.mimeType = sanitizeChatAttachmentMimeType(attachment.mimeType);

@@ -23,6 +23,14 @@ declare global {
       // Note: outside gateway mode, Workers AI (provider "cloudflare") is BYOK like every other
       // provider -- the account ID and API token live in the user's model config, not in env.
 
+      // Xcity model plane: when all required values are present, logged-in Xcity users receive a
+      // per-user tokenhub key from wallet and route model inference directly to tokenhub.
+      XCITY_TOKENHUB_URL?: string;
+      XCITY_WALLET_URL?: string;
+      XCITY_HOME_URL?: string;
+      WALLET_SERVICE_TOKEN?: string;
+      XCITY_QUICK_MODEL?: string;
+
       // Blueprint storage bindings.
       BLUEPRINTS: KVNamespace;             // Workers KV for blueprint metadata lookup
       BLUEPRINT_CONTENT: R2Bucket;         // R2 bucket for blueprint code snapshots

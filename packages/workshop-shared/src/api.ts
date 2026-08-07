@@ -861,6 +861,12 @@ export type ServerConfig = {
   // default, e.g. self-hosted), usage is unlimited and the credits UI is hidden.
   cloudflareLimitsEnabled: boolean;
 
+  /** Whether Xcity wallet KWH balance gating is enabled for this deployment. */
+  xcityUsageEnabled?: boolean;
+
+  /** Public xct-home base URL used for Xcity wallet recharge links, when configured. */
+  xcityHomeUrl?: string;
+
   // Whether new account signups are allowed (admin-configurable, default true). The signup page
   // hides the create-account form when false.
   signupsEnabled: boolean;
@@ -908,6 +914,15 @@ export type CloudflareUsageInfo = {
   // True when connected but the user has multiple Cloudflare accounts and must pick which one to
   // bill before usage can proceed. The client should prompt with selectCloudflareAccount().
   needsAccountSelection?: boolean;
+
+  /** Billing surface represented by this record. Omitted means the original Cloudflare flow. */
+  billingMode?: "cloudflare" | "xcity";
+
+  /** Unit represented by balance. Omitted means Cloudflare USD. */
+  balanceUnit?: "usd" | "credits";
+
+  /** Public URL where the user can add funds for this billing surface. */
+  rechargeUrl?: string;
 };
 
 // A Cloudflare account available to a connected user. Returned by `listCloudflareAccounts()`.

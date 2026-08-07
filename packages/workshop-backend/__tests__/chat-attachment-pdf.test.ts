@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { bridgePdfAttachments } from "../src/chat-attachment-pdf.js";
+import { bridgePdfAttachments, modelApiSupportsPdfAttachments } from "../src/chat-attachment-pdf.js";
+import {
+  attachXcityModelDescriptorMetadata,
+  parseTokenhubModelCatalog,
+} from "../src/xcity/model-plane.js";
 
 // Request-level coverage (real pi adapters emitting real payloads, then bridged) lives in
 // ai-models.test.ts; these tests pin the rewrite rules themselves.
@@ -87,5 +91,27 @@ describe("bridgePdfAttachments", () => {
     expect(bridgePdfAttachments("google-generative-ai", google)).toBeUndefined();
     const completions = { messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "data:application/pdf;base64,x" } }] }] };
     expect(bridgePdfAttachments("openai-completions", completions)).toBeUndefined();
+  });
+
+  it("allows Xcity PDF-capable tokenhub models on the OpenAI completions path", () => {
+    const [record] = parseTokenhubModelCatalog({
+      data: [{ id: "tokenhub-pdf", capabilities: { pdf_input: true } }],
+    }, {
+      tokenhubUrl: "https://tokenhub.xcity.ai",
+      apiKey: "sk-tokenhub",
+      xcityUserId: "01823f64-8ac8-715e-bf17-0f92801f2af3",
+    })!;
+    const model = attachXcityModelDescriptorMetadata({
+      id: "tokenhub-pdf",
+      name: "tokenhub-pdf",
+      api: "openai-completions",
+      provider: "ollama",
+      input: ["text", "image"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128_000,
+      maxTokens: 4096,
+    }, record.config);
+
+    expect(modelApiSupportsPdfAttachments("openai-completions", model)).toBe(true);
   });
 });

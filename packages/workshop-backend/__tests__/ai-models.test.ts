@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { AiChatAuthorInfo, AiModelConfig } from "@gadgets/workshop-shared/api";
 import { getModel, type ModelHandle } from "../src/ai-models.js";
+import { parseTokenhubModelCatalog } from "../src/xcity/model-plane.js";
 
 // These tests exercise the real pi-ai stack: no module mocks. Routing decisions are asserted on
 // the returned handle's model descriptor (baseUrl/id/api) and log route, and request-level
@@ -350,6 +351,43 @@ describe("getModel direct routing (no gateway)", () => {
 
     const request = await captureRequest(handle);
     expect(request.headers.get("authorization")).toBe("Bearer ollama-token");
+  }, 15000);
+
+  it("routes Xcity model-plane configs directly to tokenhub with user attribution", async () => {
+    const [record] = parseTokenhubModelCatalog({
+      data: [{
+        id: "gpt-5.5-xhigh",
+        context_window: 1_000_000,
+        max_output_tokens: 128_000,
+        capabilities: { vision: true, pdf_input: false },
+      }],
+    }, {
+      tokenhubUrl: "https://tokenhub.xcity.ai",
+      apiKey: "sk-tokenhub-user",
+      xcityUserId: "01823f64-8ac8-715e-bf17-0f92801f2af3",
+    })!;
+
+    const handle = getModel(env({
+      XCITY_TOKENHUB_URL: "https://tokenhub.xcity.ai",
+      XCITY_WALLET_URL: "https://wallet.xcity.ai",
+      WALLET_SERVICE_TOKEN: "wallet-service-token",
+    }), record.config, INITIATOR, {
+      userGateway: { accountId: "user-account-id", apiKey: "user-gateway-token" },
+      metadata: { source: "chat", gadgetId: "gadget-789", chatId: 9 },
+    });
+
+    expect(handle.model.api).toBe("openai-completions");
+    expect(handle.model.baseUrl).toBe("https://tokenhub.xcity.ai/v1");
+    expect(handle.aiGatewayLogRoute).toBeUndefined();
+
+    const request = await captureRequest(handle);
+    expect(request.url).toBe("https://tokenhub.xcity.ai/v1/chat/completions");
+    expect(request.headers.get("authorization")).toBe("Bearer sk-tokenhub-user");
+    expect(request.headers.get("cf-aig-authorization")).toBeNull();
+    expect(JSON.parse(request.body)).toMatchObject({
+      model: "gpt-5.5-xhigh",
+      user: "01823f64-8ac8-715e-bf17-0f92801f2af3",
+    });
   }, 15000);
 
   it("strips a legacy /api (or /v1) suffix from an Ollama base URL", () => {

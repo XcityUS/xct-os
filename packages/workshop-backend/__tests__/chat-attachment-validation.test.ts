@@ -4,6 +4,17 @@ import {
   isAllowedChatAttachmentImageMimeType,
   validateChatAttachmentUpload,
 } from "../src/chat-attachment-validation.js";
+import { parseTokenhubModelCatalog } from "../src/xcity/model-plane.js";
+
+function xcityConfig(capabilities: Record<string, boolean>) {
+  return parseTokenhubModelCatalog({
+    data: [{ id: "tokenhub-model", capabilities }],
+  }, {
+    tokenhubUrl: "https://tokenhub.xcity.ai",
+    apiKey: "sk-tokenhub",
+    xcityUserId: "01823f64-8ac8-715e-bf17-0f92801f2af3",
+  })![0].config;
+}
 
 describe("assertChatAttachmentSupportedByProvider", () => {
   it("allows text and supported images without a selected model", () => {
@@ -32,6 +43,21 @@ describe("assertChatAttachmentSupportedByProvider", () => {
     expect(() => assertChatAttachmentSupportedByProvider("cloudflare", "application/pdf", 1))
       .toThrow("Unsupported file type");
     expect(() => assertChatAttachmentSupportedByProvider("ollama", "application/zip", 1))
+      .toThrow("Unsupported file type");
+  });
+
+  it("applies Xcity per-model vision and PDF capability metadata", () => {
+    const pdfOnly = xcityConfig({ vision: false, pdf_input: true });
+    expect(() => assertChatAttachmentSupportedByProvider(pdfOnly, "text/plain", 1)).not.toThrow();
+    expect(() => assertChatAttachmentSupportedByProvider(pdfOnly, "application/pdf", 1))
+      .not.toThrow();
+    expect(() => assertChatAttachmentSupportedByProvider(pdfOnly, "image/png", 1))
+      .toThrow("Unsupported file type");
+
+    const visionOnly = xcityConfig({ vision: true, pdf_input: false });
+    expect(() => assertChatAttachmentSupportedByProvider(visionOnly, "image/png", 1))
+      .not.toThrow();
+    expect(() => assertChatAttachmentSupportedByProvider(visionOnly, "application/pdf", 1))
       .toThrow("Unsupported file type");
   });
 

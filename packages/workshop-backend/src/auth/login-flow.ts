@@ -14,16 +14,18 @@
 //      verified email, resolve/create the email-keyed user DO, mint a session, and deliver the token
 //      to the PendingLogin DO, which resolves the awaiting RPC.
 //
-// Sign-in only requests minimal scopes and the gatekeeper grant is transient (it self-destructs
-// shortly after we read the email) — so login does NOT create a persistent connected account.
-// Capability access (repos, docs, billing) is granted later when the user explicitly connects the
-// gatekeeper, which requests the full scopes and persists the connection.
+// Sign-in usually requests minimal scopes and the gatekeeper grant is transient (it self-destructs
+// shortly after we read the email), so login does not create a persistent connected account.
+// Cloudflare and Xcity are exceptions because their billing gates need a reusable user token; the
+// PublicApi requests their full non-transient scopes, and the callback persists the grant here.
 
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { GatekeeperConnectCallback, GatekeeperUser } from "@gadgets/workshop-shared/gatekeeper";
+import type { XcityGatekeeperUser } from "@gadgets/workshop-shared/xcity-gatekeeper";
 import { createWorkshopLogger } from "../observability";
 import { CLOUDFLARE_VENDOR_ID } from "../user.js";
 import { readAdminConfig } from "../admin-config.js";
+import { XCITY_VENDOR_ID } from "../xcity/model-plane.js";
 
 const logger = createWorkshopLogger("workshop.auth");
 
@@ -116,11 +118,21 @@ export class LoginConnectCallbackImpl
         await pending.fail("New sign-ups are currently disabled on this deployment.");
         return;
       }
-      // For Cloudflare, signing in also links the account for AI Gateway billing: startGatekeeperLogin
-      // requested full (non-transient) scopes, so persist the grant as a connected account before
-      // handing back the session. Other providers use minimal, transient sign-in grants (no persist).
+      // For billing-aware providers, signing in also links the account: startGatekeeperLogin
+      // requested full (non-transient) scopes, so persist the grant before handing back the session.
       if (this.ctx.props.vendorId === CLOUDFLARE_VENDOR_ID) {
         await userStub.linkConnectedAccountFromLogin(account, this.ctx.props.vendorId, expiresAt);
+      } else if (this.ctx.props.vendorId === XCITY_VENDOR_ID) {
+        await userStub.linkConnectedAccountFromLogin(account, this.ctx.props.vendorId, expiresAt);
+        const xcityUserId =
+            await (account as unknown as Fetcher<XcityGatekeeperUser>).getXcityUserId();
+        if (xcityUserId) {
+          await userStub.setXcityIdentity({ userId: xcityUserId, email });
+        } else {
+          loginLogger.warn("xcity login had no user id", {
+            event: "xcity.login.user.id.missing",
+          });
+        }
       }
       // Session tokens are "<doName>:<secret>"; PublicApi.authenticate() routes via idFromName of
       // the first part. The user DO is keyed by email, so the prefix must be the email.

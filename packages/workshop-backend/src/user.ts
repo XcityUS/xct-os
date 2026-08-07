@@ -3,11 +3,19 @@ import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTE
 import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
+import { XcityGatekeeperUser } from "@gadgets/workshop-shared/xcity-gatekeeper";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import { createWorkshopLogger } from "./observability";
 import { getAiGatewayConfig } from "./ai-gateway.js";
 import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-billing/limits/config.js";
+import { getXcityConfig } from "./xcity/config.js";
+import {
+  XcityModelPlane,
+  XCITY_VENDOR_ID,
+  type XcityModelPlaneCache,
+  type XcityUserIdentity,
+} from "./xcity/model-plane.js";
 import type { AdminSettings } from "./admin-settings.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./blueprint-archive.js";
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
@@ -135,6 +143,14 @@ type CloudflareBilling = {
   creditsUpdatedAt?: number;
 };
 
+// Cached Xcity wallet balance. The GoTrue tokens live in the connected Xcity gatekeeper account
+// (vendorId "xcity"); the usage checker reads a usable token from there via getUsableAccessToken.
+type XcityWalletBalance = {
+  // Cached wallet balance in Xcity credits and when it was last fetched (unix ms).
+  creditsRemaining?: number | null;
+  creditsUpdatedAt?: number;
+};
+
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length != b.length) {
     return false;
@@ -210,6 +226,12 @@ function makeUserStorage(storage: DurableObjectStorage) {
       // Stores the current UTC day and the calls made that day; a stale `day` implicitly resets the
       // count. Folds the former standalone RateLimitDO into the user object.
       dailyLlmCount: <{ day: string; count: number } | null>null,
+
+      // Xcity sign-in identity and per-user model-plane cache. The litellm virtual key is a secret
+      // and never leaves this user object except as part of an internal model config.
+      xcityIdentity: <XcityUserIdentity | null>null,
+      xcityModelPlane: <XcityModelPlaneCache>{},
+      xcityWalletBalance: <XcityWalletBalance | null>null,
 
       // `passwordHash` value as passed to `login()`, but with an extra round of SHA-256 applied.
       //
@@ -409,6 +431,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return this.#newSessionToken();
   }
 
+  async setXcityIdentity(identity: XcityUserIdentity): Promise<void> {
+    this.storage.xcityIdentity.put(identity);
+  }
+
   // Whether this account has a password set (false for gatekeeper sign-in accounts).
   async hasPasswordLogin(): Promise<boolean> {
     return this.storage.passwordHashHash.get() !== null;
@@ -502,8 +528,42 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.storage.profile.put(profile);
   }
 
+  async #getXcityModelPlane(): Promise<XcityModelPlane | null> {
+    let config = getXcityConfig(this.env);
+    let identity = this.storage.xcityIdentity.get();
+    if (!config || !identity) return null;
+
+    try {
+      return await XcityModelPlane.forUser(
+          this.env, config, this.storage.xcityModelPlane, identity.userId,
+          identity.email ?? this.storage.profile.get().id);
+    } catch (err) {
+      logger.warn("failed to resolve xcity model plane", {
+        event: "xcity.model.plane.resolve.failed", error: err,
+      });
+      return null;
+    }
+  }
+
   async listModels(): Promise<AiChatAuthorInfo[]> {
     let result: AiChatAuthorInfo[] = [];
+
+    let xcityModelPlane = await this.#getXcityModelPlane();
+    if (xcityModelPlane) {
+      let xcityModelIds = new Set<string>();
+      for (let entry of xcityModelPlane.getModelList()) {
+        result.push(entry);
+        xcityModelIds.add(entry.id);
+      }
+
+      // User-configured models remain available, but tokenhub is authoritative for duplicates.
+      for (let model of this.storage.aiModels.list()) {
+        if (!xcityModelIds.has(model.profile.id)) {
+          result.push(model.profile);
+        }
+      }
+      return result;
+    }
 
     // When AI Gateway mode is active, include all suggested models for enabled providers.
     let gwConfig = getAiGatewayConfig(this.env);
@@ -535,6 +595,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async deleteModel(id: string): Promise<void> {
+    let xcityModelPlane = await this.#getXcityModelPlane();
+    let xcityModel = xcityModelPlane?.resolveModel(id);
+    if (xcityModel) {
+      throw new Error(`Cannot delete built-in model "${xcityModel.profile.name}".`);
+    }
+
     // In AI Gateway mode, don't allow deleting built-in suggested models.
     let gwConfig = getAiGatewayConfig(this.env);
     if (gwConfig) {
@@ -553,6 +619,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async getQuickModel(): Promise<null | string> {
+    let xcityModelPlane = await this.#getXcityModelPlane();
+    let xcityQuickModel = xcityModelPlane?.getQuickModelConfig();
+    if (xcityQuickModel) return xcityQuickModel.model;
+
     let result = this.storage.quickModel.get();
     if (result && this.storage.aiModels.get(result)) {
       return result;
@@ -568,8 +638,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async setPreferredModel(id: string | null): Promise<void> {
     if (id !== null) {
       // Validate that the model exists in the user's configured models or as a gateway model.
+      let xcityModelPlane = await this.#getXcityModelPlane();
       let gwConfig = getAiGatewayConfig(this.env);
-      let exists = !!this.storage.aiModels.get(id) || !!gwConfig?.resolveModel(id);
+      let exists = !!this.storage.aiModels.get(id) ||
+          !!xcityModelPlane?.resolveModel(id) ||
+          (!xcityModelPlane && !!gwConfig?.resolveModel(id));
       if (!exists) {
         throw new Error(`No such model: ${id}`);
       }
@@ -629,6 +702,37 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   // ---------------------------------------------------------------------------------------------
+  // Xcity wallet balance (optional KWH gate).
+  // ---------------------------------------------------------------------------------------------
+
+  // Return the connected Xcity *gatekeeper* account stub, if any. The Xcity usage checker narrows it
+  // to XcityGatekeeperUser to obtain a usable GoTrue access token for wallet reads.
+  async getXcityGatekeeperAccount(): Promise<Fetcher<XcityGatekeeperUser> | null> {
+    let nextAccountId = this.storage.nextAccountId.get();
+    for (let id = 0; id < nextAccountId; id++) {
+      let rec: ConnectedAccountRecord | undefined;
+      try { rec = this.storage.connectedAccounts.get(id); } catch { continue; }
+      if (rec && rec.vendorId === XCITY_VENDOR_ID) {
+        return rec.account as unknown as Fetcher<XcityGatekeeperUser>;
+      }
+    }
+    return null;
+  }
+
+  // The cached Xcity wallet balance, or null if unset.
+  async getXcityWalletBalance(): Promise<XcityWalletBalance | null> {
+    return this.storage.xcityWalletBalance.get();
+  }
+
+  // Update the cached Xcity wallet balance in credits.
+  async updateXcityWalletBalance(creditsRemaining: number | null): Promise<void> {
+    let record = this.storage.xcityWalletBalance.get() ?? {};
+    record.creditsRemaining = creditsRemaining;
+    record.creditsUpdatedAt = Date.now();
+    this.storage.xcityWalletBalance.put(record);
+  }
+
+  // ---------------------------------------------------------------------------------------------
   // Free-tier daily LLM-call counter (folded in from the former standalone RateLimitDO). Only used
   // when ENABLE_CLOUDFLARE_LIMITS is on. Single-threaded DO execution makes the read-modify-write
   // race-free; the window resets at UTC midnight when the stored day no longer matches.
@@ -664,14 +768,18 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   // DO NOT MAKE PUBLIC -- returns API keys.
   async getChatContext(modelId: string | null): Promise<UserChatContext> {
+    let xcityModelPlane = await this.#getXcityModelPlane();
     let gwConfig = getAiGatewayConfig(this.env);
 
     let result: UserChatContext = {
       profile: this.storage.profile.get()
     };
     if (modelId) {
+      if (xcityModelPlane) {
+        result.aiModel = xcityModelPlane.resolveModel(modelId);
+      }
       // In AI Gateway mode, resolve gateway models first.
-      if (gwConfig) {
+      if (!result.aiModel && !xcityModelPlane && gwConfig) {
         result.aiModel = gwConfig.resolveModel(modelId);
       }
       if (!result.aiModel) {
@@ -681,8 +789,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     // Resolve the quick model (used for lightweight tasks like title generation).
-    if (gwConfig) {
-      // In AI Gateway mode, always use the hardcoded quick model.
+    if (xcityModelPlane) {
+      result.quickModel = gwConfig
+          ? gwConfig.getQuickModelConfig(xcityModelPlane)
+          : xcityModelPlane.getQuickModelConfig();
+    } else if (gwConfig) {
       result.quickModel = gwConfig.getQuickModelConfig();
     } else {
       let quickModelId = this.storage.quickModel.get();
@@ -1488,6 +1599,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       // account + cached balance), which is meaningless without the underlying grant.
       if (account.vendorId === CLOUDFLARE_VENDOR_ID) {
         this.storage.cloudflareBilling.put(null);
+      } else if (account.vendorId === XCITY_VENDOR_ID) {
+        this.storage.xcityWalletBalance.put(null);
       }
       logger.info("account disconnected", {
         event: "account.disconnected",

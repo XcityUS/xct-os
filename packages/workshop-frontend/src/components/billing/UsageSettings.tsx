@@ -4,14 +4,15 @@ import { Button, useKumoToastManager } from '@cloudflare/kumo'
 import { Lightning, CloudCheck, Warning } from '@phosphor-icons/react'
 import CloudflareLogo from '../auth/CloudflareLogo'
 import { useAuthenticatedApi } from '../../AuthContext'
-import { useCloudflareLimitsEnabled } from '../../ServerConfigContext'
-import { buildAddCreditsUrl } from './creditsUrl'
+import { useServerConfig, useUsageBillingEnabled } from '../../ServerConfigContext'
+import { buildAddCreditsUrl, formatUsageBalance, isXcityUsage } from './creditsUrl'
 import ResetCountdown from './ResetCountdown'
 
-// Shows the user's free-tier usage and Cloudflare connection / credit status on the profile page.
-// Renders nothing unless the Cloudflare limits flow is enabled server-side.
+// Shows the user's usage billing status on the profile page. Renders nothing unless a server-side
+// usage gate is enabled.
 export default function UsageSettings() {
-  const limitsEnabled = useCloudflareLimitsEnabled()
+  const limitsEnabled = useUsageBillingEnabled()
+  const serverConfig = useServerConfig()
   const { authenticatedApi } = useAuthenticatedApi()
   const toasts = useKumoToastManager()
   const [usage, setUsage] = useState<CloudflareUsageInfo | null>(null)
@@ -92,121 +93,174 @@ export default function UsageSettings() {
         <p className="text-sm text-kumo-subtle">Loading usage…</p>
       ) : (
         <div className="space-y-6">
-          {/* Free daily allowance */}
-          <div>
-            <p className="text-xs font-medium text-kumo-subtle mb-1">Free daily allowance</p>
-            <p className="text-sm text-kumo-default">
-              {usage.remaining} of {usage.dailyLimit}{' '}
-              {usage.dailyLimit === 1 ? 'request' : 'requests'} remaining today
-            </p>
-            {usage.resetAt && (
-              <p className="text-xs text-kumo-subtle mt-1">
-                Resets at 00:00 UTC, in{' '}
-                <ResetCountdown resetAt={usage.resetAt} onElapsed={refresh} />.
-              </p>
-            )}
-          </div>
-
-          {/* Cloudflare connection / credits */}
-          <div>
-            <p className="text-xs font-medium text-kumo-subtle mb-1">Cloudflare account</p>
-            {!usage.connected ? (
-              <div className="space-y-3">
-                <div className="flex items-center gap-2 text-sm text-kumo-subtle">
-                  <CloudflareLogo size={16} />
-                  <span>Not connected</span>
-                </div>
-                <p className="text-sm text-kumo-subtle">
-                  Connect your Cloudflare account to keep building once your free allowance runs
-                  out. Usage beyond the free tier is billed to your own Cloudflare AI Gateway
-                  credits.
-                </p>
-                <div className="pt-1">
-                  <Button variant="primary" size="sm" onClick={connect} loading={busy}>
-                    <Lightning size={14} weight="bold" className="mr-1" />
-                    Connect Cloudflare
-                  </Button>
-                </div>
-              </div>
-            ) : usage.needsAccountSelection ? (
-              // Connected, but multiple accounts — force the user to choose which one to bill.
-              <div className="space-y-3">
-                <div className="flex items-center gap-2 text-sm text-kumo-default">
-                  <Warning size={18} weight="bold" className="text-kumo-warning" />
-                  <span>Choose which Cloudflare account to bill</span>
-                </div>
-                <p className="text-sm text-kumo-subtle">
-                  Your connection has access to multiple Cloudflare accounts. Select the one whose
-                  AI Gateway credits should be used.
-                </p>
-                {accounts === null ? (
-                  <p className="text-sm text-kumo-subtle">Loading accounts…</p>
-                ) : accounts.length === 0 ? (
+          {isXcityUsage(usage) ? (
+            <div>
+              <p className="text-xs font-medium text-kumo-subtle mb-1">Xcity wallet</p>
+              {!usage.connected ? (
+                <div className="space-y-3">
+                  <div className="flex items-center gap-2 text-sm text-kumo-subtle">
+                    <Warning size={18} weight="bold" className="text-kumo-warning" />
+                    <span>Wallet connection unavailable</span>
+                  </div>
                   <p className="text-sm text-kumo-subtle">
-                    No accounts available on this connection.
+                    Sign in with Xcity again to refresh your wallet connection.
                   </p>
-                ) : (
-                  <div className="flex flex-col gap-2">
-                    {accounts.map((a) => (
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="flex items-center gap-2 text-sm text-kumo-default">
+                    <CloudCheck size={18} weight="bold" className="text-kumo-success" />
+                    <span>Connected</span>
+                  </div>
+                  <p className="text-sm text-kumo-default">
+                    Wallet balance:{' '}
+                    {formatUsageBalance(usage) ? (
+                      <strong>{formatUsageBalance(usage)}</strong>
+                    ) : (
+                      <span className="text-kumo-subtle">unknown</span>
+                    )}
+                  </p>
+
+                  {buildAddCreditsUrl(usage, serverConfig?.xcityHomeUrl) && (
+                    <div className="flex items-center gap-2 pt-1">
                       <Button
-                        key={a.accountId}
-                        variant="secondary"
+                        variant="primary"
                         size="sm"
-                        className="justify-start"
-                        onClick={() => selectAccount(a.accountId)}
-                        loading={selecting === a.accountId}
-                        disabled={selecting !== null}
+                        onClick={() => {
+                          const url = buildAddCreditsUrl(usage, serverConfig?.xcityHomeUrl)
+                          if (url) window.open(url, '_blank')
+                        }}
                       >
-                        {a.accountName}
+                        <Lightning size={14} weight="bold" className="mr-1" />
+                        Recharge
                       </Button>
-                    ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          ) : (
+            <>
+              {/* Free daily allowance */}
+              <div>
+                <p className="text-xs font-medium text-kumo-subtle mb-1">Free daily allowance</p>
+                <p className="text-sm text-kumo-default">
+                  {usage.remaining} of {usage.dailyLimit}{' '}
+                  {usage.dailyLimit === 1 ? 'request' : 'requests'} remaining today
+                </p>
+                {usage.resetAt && (
+                  <p className="text-xs text-kumo-subtle mt-1">
+                    Resets at 00:00 UTC, in{' '}
+                    <ResetCountdown resetAt={usage.resetAt} onElapsed={refresh} />.
+                  </p>
+                )}
+              </div>
+
+              {/* Cloudflare connection / credits */}
+              <div>
+                <p className="text-xs font-medium text-kumo-subtle mb-1">Cloudflare account</p>
+                {!usage.connected ? (
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 text-sm text-kumo-subtle">
+                      <CloudflareLogo size={16} />
+                      <span>Not connected</span>
+                    </div>
+                    <p className="text-sm text-kumo-subtle">
+                      Connect your Cloudflare account to keep building once your free allowance runs
+                      out. Usage beyond the free tier is billed to your own Cloudflare AI Gateway
+                      credits.
+                    </p>
+                    <div className="pt-1">
+                      <Button variant="primary" size="sm" onClick={connect} loading={busy}>
+                        <Lightning size={14} weight="bold" className="mr-1" />
+                        Connect Cloudflare
+                      </Button>
+                    </div>
+                  </div>
+                ) : usage.needsAccountSelection ? (
+                  // Connected, but multiple accounts — force the user to choose which one to bill.
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 text-sm text-kumo-default">
+                      <Warning size={18} weight="bold" className="text-kumo-warning" />
+                      <span>Choose which Cloudflare account to bill</span>
+                    </div>
+                    <p className="text-sm text-kumo-subtle">
+                      Your connection has access to multiple Cloudflare accounts. Select the one
+                      whose AI Gateway credits should be used.
+                    </p>
+                    {accounts === null ? (
+                      <p className="text-sm text-kumo-subtle">Loading accounts…</p>
+                    ) : accounts.length === 0 ? (
+                      <p className="text-sm text-kumo-subtle">
+                        No accounts available on this connection.
+                      </p>
+                    ) : (
+                      <div className="flex flex-col gap-2">
+                        {accounts.map((a) => (
+                          <Button
+                            key={a.accountId}
+                            variant="secondary"
+                            size="sm"
+                            className="justify-start"
+                            onClick={() => selectAccount(a.accountId)}
+                            loading={selecting === a.accountId}
+                            disabled={selecting !== null}
+                          >
+                            {a.accountName}
+                          </Button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 text-sm text-kumo-default">
+                      <CloudCheck size={18} weight="bold" className="text-kumo-success" />
+                      <span>
+                        Connected
+                        {usage.accountName && <> — {usage.accountName}</>}
+                      </span>
+                    </div>
+                    <p className="text-sm text-kumo-default">
+                      Account balance:{' '}
+                      {formatUsageBalance(usage) ? (
+                        <strong>{formatUsageBalance(usage)}</strong>
+                      ) : (
+                        <span className="text-kumo-subtle">unknown</span>
+                      )}
+                    </p>
+
+                    <div className="flex items-center gap-2 pt-1">
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        onClick={() => {
+                          const url = buildAddCreditsUrl(usage)
+                          if (url) window.open(url, '_blank')
+                        }}
+                      >
+                        <Lightning size={14} weight="bold" className="mr-1" />
+                        Add credits
+                      </Button>
+                    </div>
                   </div>
                 )}
               </div>
-            ) : (
-              <div className="space-y-3">
-                <div className="flex items-center gap-2 text-sm text-kumo-default">
-                  <CloudCheck size={18} weight="bold" className="text-kumo-success" />
-                  <span>
-                    Connected
-                    {usage.accountName && <> — {usage.accountName}</>}
-                  </span>
-                </div>
-                <p className="text-sm text-kumo-default">
-                  Account balance:{' '}
-                  {usage.balance !== null ? (
-                    <strong>${usage.balance.toFixed(2)}</strong>
-                  ) : (
-                    <span className="text-kumo-subtle">unknown</span>
-                  )}
-                </p>
 
-                <div className="flex items-center gap-2 pt-1">
-                  <Button
-                    variant="primary"
-                    size="sm"
-                    onClick={() => window.open(buildAddCreditsUrl(usage.accountId), '_blank')}
-                  >
-                    <Lightning size={14} weight="bold" className="mr-1" />
-                    Add credits
-                  </Button>
-                </div>
-              </div>
-            )}
-          </div>
-
-          <p className="text-xs text-kumo-subtle border-t border-kumo-line pt-3">
-            Learn more about{' '}
-            <a
-              href="https://developers.cloudflare.com/ai-gateway/features/unified-billing/"
-              target="_blank"
-              rel="noreferrer"
-              className="underline"
-            >
-              AI Gateway unified billing
-            </a>
-            .
-          </p>
+              <p className="text-xs text-kumo-subtle border-t border-kumo-line pt-3">
+                Learn more about{' '}
+                <a
+                  href="https://developers.cloudflare.com/ai-gateway/features/unified-billing/"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline"
+                >
+                  AI Gateway unified billing
+                </a>
+                .
+              </p>
+            </>
+          )}
         </div>
       )}
       </div>

@@ -32,6 +32,8 @@ import { recordAnalytics } from "./analytics";
 import { reportIssue } from "@gadgets/backend-utils/error-reporting";
 import type { ProductAnalyticsConnectionType, ProductAnalyticsGadgetInput } from "./analytics";
 import { checkUsageAndBalance } from "./ai-gateway-billing/limits/usage-checker";
+import { getXcityUsageConfig } from "./xcity/config";
+import { checkXcityUsage } from "./xcity/usage-checker";
 import { completeAgentCatalogSnapshot, normalizeAgentCatalog } from "./agent-catalog";
 import { refreshCachedBalance } from "./ai-gateway-billing/cloudflare/connection-service";
 import { SharingManager, SharingCaller, CollaboratorRecord, ShareKeyRecord } from "./sharing";
@@ -2713,7 +2715,7 @@ class OverseerImpl implements AgentHooks {
   // upload records before the message is stored in chat history.
   canonicalizeChatAttachmentRefs(
     attachments?: ChatAttachmentHandle[],
-    provider?: AiModelConfig["provider"],
+    provider?: AiModelConfig["provider"] | AiModelConfig,
   ): ChatAttachmentRef[] | undefined {
     if (!attachments || attachments.length === 0) return undefined;
     if (attachments.length > MAX_CHAT_ATTACHMENTS_PER_MESSAGE) {
@@ -3428,7 +3430,7 @@ class OverseerImpl implements AgentHooks {
       throw new Error("Slash commands cannot include resources or attachments.");
     }
     let canonicalAttachments = this.canonicalizeChatAttachmentRefs(
-        attachments, userMeta.aiModel?.config.provider);
+        attachments, userMeta.aiModel?.config);
     let prepared = await this.#prepareChatMessage(
         initialMessage, (canonicalAttachments?.length ?? 0) > 0);
 
@@ -3506,7 +3508,7 @@ class OverseerImpl implements AgentHooks {
       throw new Error("Slash commands cannot include resources or attachments.");
     }
     let canonicalAttachments = this.canonicalizeChatAttachmentRefs(
-        attachments, userMeta.aiModel?.config.provider);
+        attachments, userMeta.aiModel?.config);
     this.assertChatNotActive(chatId);
     using _chatMessageReservation = this.reserveChatMessagePreparation(chatId);
     let prepared = await this.#prepareChatMessage(
@@ -3895,7 +3897,9 @@ class OverseerImpl implements AgentHooks {
       let byokRouting: UserGatewayRouting | undefined;
       if (!callbackInitiated && this.ownerId) {
         let ownerStub = this.users.get(this.users.idFromString(this.ownerId));
-        let usage = await checkUsageAndBalance(this.env, ownerStub);
+        let usage = getXcityUsageConfig(this.env)
+            ? await checkXcityUsage(this.env, ownerStub)
+            : await checkUsageAndBalance(this.env, ownerStub);
         if (!usage.allowed) {
           this.postAgentErrorMessage(chatId, aiModel.profile,
               usage.reason ?? "Usage limit reached.", "usage_limit");
@@ -7954,12 +7958,14 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     modelId: string | null,
   ): Promise<ChatAttachmentHandle> {
     let provider: AiModelConfig["provider"] | undefined;
+    let modelConfig: AiModelConfig | undefined;
     if (modelId !== null) {
-      provider = (await this.clientUser.getChatContext(modelId)).aiModel?.config.provider;
+      modelConfig = (await this.clientUser.getChatContext(modelId)).aiModel?.config;
+      provider = modelConfig?.provider;
     }
     attachment = validateChatAttachmentUpload(
       attachment,
-      provider,
+      modelConfig ?? provider,
     );
 
     this.impl.sweepStagedChatAttachments();

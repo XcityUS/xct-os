@@ -18,7 +18,7 @@ xct-studio）。部署在 https://os.xcity.ai。
 
 新增文件不会与上游冲突，rebase 时零成本。
 
-## 允许修改的上游文件：四个接缝点
+## 允许修改的上游文件：八个接缝点
 
 **除下列位置外，不修改任何上游文件。** 每处改动限一个分支判断，且必须由环境变量门控 ——
 不设 `XCITY_*` 变量时，行为必须与上游完全一致。这条同时保证了随时可回滚。
@@ -33,6 +33,7 @@ xct-studio）。部署在 https://os.xcity.ai。
 | 5 | 本地开发 | `run-dev-server.js` — `SHARED_GATEKEEPER_CREDS` | 加一行 `"gatekeeper-xcity": { id: "XCITY_CLIENT_ID", secret: "XCITY_CLIENT_SECRET" }`。仅影响本地 dev，不影响生产 |
 | 6 | 登录后置 | `packages/workshop-backend/src/auth/login-flow.ts` / `server.ts` | Xcity 登录成功后把 GoTrue `sub` 存进 UserDurableObject（`setXcityIdentity`），并仿照 Cloudflare 登录计费路径请求 full scope、调用 `linkConnectedAccountFromLogin` 持久化 gatekeeper 连接，供余额门禁反复获取新鲜 GoTrue access token。接缝 1 说"不改代码"，但铸 per-user litellm key和余额门禁都必须有用户身份/连接，且这里是自然落点。改动限于 `vendorId === XCITY_VENDOR_ID` 分支，与既有的 Cloudflare 分支并列 |
 | 7 | 附件能力 | `chat-attachment-validation.ts` / `chat-attachment-pdf.ts` / `overseer.ts` 的调用点 | 把完整 `AiModelConfig` 而非仅 `provider` 传下去，让 tokenhub 的 per-model `vision` / `pdf_input` 能力生效。无 Xcity 元数据时逐字回落原有的 `ATTACHMENT_SUPPORT_BY_PROVIDER` 表 |
+| 8 | Agent Marketplace Persona | `packages/workshop-shared/src/api.ts` / `workshop-backend/src/{deployment-config.ts,server.ts,user.ts,overseer.ts,agent.ts}` / `workshop-frontend/src/{ChatInterface.tsx,routes/index.tsx,components/chat/XcityAgentPicker.tsx}` | 按 `XCITY_HOME_URL` + model-plane 配置门控，新增 authenticated catalog/persona-status RPC 与 `ServerConfig.xcityAgentMarketplaceEnabled`；catalog/persona 获取实现只放在 `workshop-backend/src/xcity/`。用户当前选择存在 User DO，chat 创建时把已校验 slug 的 persona snapshot 写入 `chatContext.xcityAgent` 和 metadata，普通 coding agent 在 system prompt slot 0 注入 persona；spawned agent 不继承。前端入口贴近 composer model picker，支持搜索/category 过滤和 `/?agent=<slug>` 深链校验 |
 
 **已知的结构性取舍**：Xcity 的模型元数据以 `XcityAiModelConfig = AiModelConfig & { xcity?: … }`
 的形式挂在共享类型上（`xcity/model-plane.ts`）。好处是元数据随配置天然流到每个消费点，
@@ -60,6 +61,9 @@ Gatekeeper 本身按目录名 `gatekeeper-*` 自动发现并绑定为 `GATEKEEPE
 
 **本仓库不持有 `LITELLM_MASTER_KEY`。** 列 agent 走 xct-home 的公开目录
 `GET $XCITY_HOME_URL/api/catalog/agents`（已剥离上游 `apiUrl`），而不是直接查 tokenhub 注册表。
+Agent persona 原文只通过用户自己的 tokenhub virtual key 读取
+`GET $XCITY_TOKENHUB_URL/v1/xct-skills/{slug}`，并且只进入后端 cache/chat context/system prompt，
+不下发到前端或无鉴权端点；缺失时降级为普通 coding-agent 会话，不走 `a2a/` 远端调用。
 
 ## 与上游同步
 

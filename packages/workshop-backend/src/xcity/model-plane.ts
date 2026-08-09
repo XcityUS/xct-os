@@ -342,6 +342,18 @@ export class XcityModelPlane {
     return plane;
   }
 
+  static async getUserTokenhubKey(
+      env: Cloudflare.Env,
+      config: XcityConfig,
+      storage: XcityModelPlaneStorage,
+      xcityUserId: string,
+      email?: string,
+      forceMint = false,
+  ): Promise<XcityVirtualKeyRecord | undefined> {
+    let plane = new XcityModelPlane(env, config, storage, xcityUserId, email, []);
+    return plane.#ensureKey(forceMint);
+  }
+
   getModelList(): AiChatAuthorInfo[] {
     return this.#models.map(record => record.profile);
   }

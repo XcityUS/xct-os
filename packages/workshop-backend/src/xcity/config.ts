@@ -12,6 +12,14 @@ export interface XcityUsageConfig {
   homeUrl?: string;
 }
 
+export interface XcityAgentMarketplaceConfig {
+  homeUrl: string;
+  tokenhubUrl: string;
+  walletUrl: string;
+  walletServiceToken: string;
+  quickModel?: string;
+}
+
 function getEnvString(env: Cloudflare.Env, name: keyof Cloudflare.Env): string | undefined {
   let value = env[name];
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -54,5 +62,17 @@ export function getXcityConfig(env: Cloudflare.Env): XcityConfig | null {
     walletUrl,
     walletServiceToken,
     ...(quickModel ? { quickModel } : {}),
+  };
+}
+
+export function getXcityAgentMarketplaceConfig(
+    env: Cloudflare.Env): XcityAgentMarketplaceConfig | null {
+  let homeUrl = getXcityHomeUrl(env);
+  let modelPlane = getXcityConfig(env);
+  if (!homeUrl || !modelPlane) return null;
+
+  return {
+    homeUrl,
+    ...modelPlane,
   };
 }

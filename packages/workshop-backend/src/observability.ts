@@ -4,6 +4,7 @@ import { createObservabilityContext } from "@gadgets/backend-utils/observability
 export type WorkshopObservabilityFields = {
   accountId: number;
   actionId: number | string;
+  agentSlug: string;
   autoProvisioned: boolean;
   blueprintId: string;
   callbackInitiated: boolean;

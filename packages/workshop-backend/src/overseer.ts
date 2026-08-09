@@ -26,7 +26,7 @@ import { foldProposedChanges, isCompactionTurn, type ChangeBatch } from "./agent
 import { ambientGatekeeperMode } from "./provisioning-policy";
 import { listFeaturedBlueprintsFromKv, readBlueprintContent, readBlueprintKvRecord, sanitizeBlueprintOutput } from "./blueprint-archive";
 import { WebFetchEnv } from "./web-fetch";
-import { UserDurableObject, UserAiModelRecord, type UserChatContext, type WorkspaceOutputEntry } from "./user";
+import { UserDurableObject, UserAiModelRecord, type UserChatContext, type WorkspaceOutputEntry, type XcityChatAgentPersona } from "./user";
 import { AgentSpawnerBinding } from "./agent-spawner-binding";
 import { recordAnalytics } from "./analytics";
 import { reportIssue } from "@gadgets/backend-utils/error-reporting";
@@ -3421,6 +3421,7 @@ class OverseerImpl implements AgentHooks {
     responseTargetRegistration?: ExternalMessageResponseTargetRegistration,
     externalChatKey?: string,
     formats?: MessageFormatRef[],
+    xcityAgentSlug?: string | null,
   ): Promise<number> {
     if (responseTargetRegistration) {
       let decision = this.#prepareExternalMessageResponseTargetRegistration(responseTargetRegistration);
@@ -3433,6 +3434,9 @@ class OverseerImpl implements AgentHooks {
         attachments, userMeta.aiModel?.config);
     let prepared = await this.#prepareChatMessage(
         initialMessage, (canonicalAttachments?.length ?? 0) > 0);
+    let xcityAgent = xcityAgentSlug
+        ? await this.#resolveXcityAgentPersona(clientUser, xcityAgentSlug)
+        : null;
 
     let chatId!: number;
     let timestamp = this.getChatTimestamp();
@@ -3447,7 +3451,20 @@ class OverseerImpl implements AgentHooks {
       if (prepared.message !== undefined && userMeta.aiModel) {
         meta.activeAgent = userMeta.aiModel.profile;
       }
+      if (xcityAgent) {
+        meta.xcityAgent = xcityAgent.info;
+      }
       this.storage.chatMeta.put(meta);
+      if (xcityAgent) {
+        this.storage.chatContext.put({
+          chatId,
+          xcityAgent: {
+            slug: xcityAgent.info.slug,
+            displayName: xcityAgent.info.displayName,
+            persona: xcityAgent.persona,
+          },
+        });
+      }
 
       let promptSequence = this.#commitPreparedChatMessage(
           chatId, timestamp, userMeta.profile, prepared, capsules, canonicalAttachments, formats);
@@ -3488,6 +3505,19 @@ class OverseerImpl implements AgentHooks {
     });
 
     return chatId;
+  }
+
+  async #resolveXcityAgentPersona(
+      clientUser: DurableObjectStub<UserDurableObject>,
+      slug: string): Promise<XcityChatAgentPersona | null> {
+    try {
+      return await clientUser.resolveXcityAgentPersona(slug);
+    } catch (err) {
+      this.logger.warn("failed to resolve xcity agent persona", {
+        event: "xcity.agent.persona.resolve.failed", agentSlug: slug, error: err,
+      });
+      return null;
+    }
   }
 
   async sendChatMessage(
@@ -8184,10 +8214,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async newChat(initialMessage: string | SlashCommandRequest, chosenModelId: string | null,
                 capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
-                formats?: MessageFormatRef[]): Promise<number> {
+                formats?: MessageFormatRef[], xcityAgentSlug?: string | null): Promise<number> {
     let userMeta = await this.clientUser.getChatContext(chosenModelId);
     return this.impl.newChat(this.clientUser, userMeta, initialMessage, capsules, attachments,
-                             undefined, undefined, formats);
+                             undefined, undefined, formats, xcityAgentSlug);
   }
 
   async sendChatMessage(
@@ -8929,7 +8959,8 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     this.#deny();
   }
   async newChat(_initialMessage: string | SlashCommandRequest, _modelId: string | null,
-                 _capsules?: CapsuleSpecifier[], _attachments?: ChatAttachmentHandle[]): Promise<number> {
+                 _capsules?: CapsuleSpecifier[], _attachments?: ChatAttachmentHandle[],
+                 _formats?: MessageFormatRef[], _xcityAgentSlug?: string | null): Promise<number> {
     this.#deny();
   }
   async sendChatMessage(_chatId: number, _message: string | SlashCommandRequest,

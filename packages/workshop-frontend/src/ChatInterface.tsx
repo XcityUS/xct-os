@@ -81,6 +81,7 @@ import {
   BlueprintOutput,
   MessageFormatRef,
   OutputFormatOffer,
+  XcityCatalogAgent,
 } from "@gadgets/workshop-shared/api";
 import { ActionKind, ResourceDescription } from "@gadgets/workshop-shared/gatekeeper";
 import {
@@ -121,6 +122,8 @@ import OutOfCreditsModal from "./components/billing/OutOfCreditsModal";
 import { useSlashCommandPicker } from "./components/chat/SlashCommandPicker";
 import { formatFullTimestamp } from "./utils/formatTimestamp";
 import { copyToClipboard } from "./clipboard";
+import { useServerConfig } from "./ServerConfigContext";
+import { XcityAgentPicker } from "./components/chat/XcityAgentPicker";
 
 export interface StreamingProposedChanges {
   updates: Uint8Array[];
@@ -1766,6 +1769,12 @@ export const ChatInput = ({
   models,
   selectedModel,
   onModelChange,
+  xcityAgents = [],
+  selectedXcityAgentSlug = null,
+  xcityPersonaAvailability = {},
+  xcityAgentsLoading = false,
+  xcityHomeUrl,
+  onXcityAgentChange,
   pendingConsoleLogCount = 0,
   consoleLogPreview = "",
   consoleLogSeverity = "info",
@@ -1797,11 +1806,18 @@ export const ChatInput = ({
     capsules?: CapsuleSpecifier[],
     attachments?: ChatAttachmentHandle[],
     formats?: MessageFormatRef[],
+    xcityAgentSlug?: string | null,
   ) => Promise<void> | void;
   isAgentActive: boolean;
   models: AiChatAuthorInfo[];
   selectedModel: string | null;
   onModelChange: (modelId: string | null) => void;
+  xcityAgents?: XcityCatalogAgent[];
+  selectedXcityAgentSlug?: string | null;
+  xcityPersonaAvailability?: Record<string, boolean | undefined>;
+  xcityAgentsLoading?: boolean;
+  xcityHomeUrl?: string;
+  onXcityAgentChange?: (slug: string | null) => void;
   pendingConsoleLogCount?: number;
   consoleLogPreview?: string;
   consoleLogSeverity?: "error" | "warn" | "info";
@@ -2437,7 +2453,8 @@ export const ChatInput = ({
       await onSend(message, selectedModel,
           capsuleSpecifiers?.length ? capsuleSpecifiers : undefined,
           readyAttachments.length ? readyAttachments : undefined,
-          formatRefs);
+          formatRefs,
+          onXcityAgentChange ? selectedXcityAgentSlug : undefined);
       for (const attachment of attachmentsSnapshot) {
         if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
       }
@@ -3315,6 +3332,16 @@ export const ChatInput = ({
 
           {/* Right actions */}
           <div className="ml-auto flex min-w-0 flex-shrink items-center gap-1.5">
+              {onXcityAgentChange && (
+                <XcityAgentPicker
+                  agents={xcityAgents}
+                  selectedSlug={selectedXcityAgentSlug}
+                  personaAvailability={xcityPersonaAvailability}
+                  homeUrl={xcityHomeUrl}
+                  loading={xcityAgentsLoading}
+                  onSelect={onXcityAgentChange}
+                />
+              )}
               <DropdownMenu>
                 <DropdownMenu.Trigger
                   render={
@@ -4240,7 +4267,8 @@ function ChatInterface({
 }: ChatInterfaceProps) {
   // Persistent cache that survives reconnects
   const toasts = useKumoToastManager();
-  const { currentUser } = useAuthenticatedApi();
+  const { currentUser, authenticatedApi } = useAuthenticatedApi();
+  const serverConfig = useServerConfig();
   const getOverseer = useCallback(() => overseer, [overseer]);
   const cacheRef = useRef<ChatCache>({
     chats: new Map(),
@@ -4322,6 +4350,11 @@ function ChatInterface({
     [],
   );
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [xcityAgents, setXcityAgents] = useState<XcityCatalogAgent[]>([]);
+  const [selectedXcityAgentSlug, setSelectedXcityAgentSlug] = useState<string | null>(null);
+  const [xcityPersonaAvailability, setXcityPersonaAvailability] =
+      useState<Record<string, boolean | undefined>>({});
+  const [xcityAgentsLoading, setXcityAgentsLoading] = useState(false);
   const [sidebarActiveTab, setSidebarActiveTab] = useState<
     "chat" | "connections"
   >("chat");
@@ -5237,6 +5270,50 @@ function ChatInterface({
     };
   }, [overseer]);
 
+  useEffect(() => {
+    if (!serverConfig?.xcityAgentMarketplaceEnabled) {
+      setXcityAgents([]);
+      setSelectedXcityAgentSlug(null);
+      setXcityPersonaAvailability({});
+      setXcityAgentsLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setXcityAgentsLoading(true);
+    setXcityPersonaAvailability({});
+    (async () => {
+      try {
+        const [agents, preferred] = await Promise.all([
+          authenticatedApi.listXcityAgents(),
+          authenticatedApi.getPreferredXcityAgent(),
+        ]);
+        if (cancelled) return;
+        setXcityAgents(agents);
+        setSelectedXcityAgentSlug(
+          preferred && agents.some(agent => agent.slug === preferred) ? preferred : null);
+        setXcityAgentsLoading(false);
+
+        const availability = await authenticatedApi.getXcityAgentPersonaAvailability(
+            agents.map(agent => agent.slug));
+        if (!cancelled) setXcityPersonaAvailability(availability);
+      } catch (err) {
+        console.error("Failed to load Xcity agents:", err);
+        reportIssue("chat.xcity-agents-load", err);
+        if (!cancelled) {
+          setXcityAgents([]);
+          setSelectedXcityAgentSlug(null);
+          setXcityPersonaAvailability({});
+          setXcityAgentsLoading(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authenticatedApi, serverConfig?.xcityAgentMarketplaceEnabled]);
+
   // Patch cached chat messages on action upserts.
   useActionEntries(overseer, (record) => {
     if (applyActionLogUpdateToCachedMessages(record)) scheduleUpdate();
@@ -5341,6 +5418,7 @@ function ChatInterface({
     capsules?: CapsuleSpecifier[],
     attachments?: ChatAttachmentHandle[],
     formats?: MessageFormatRef[],
+    xcityAgentSlug?: string | null,
   ) => {
     const message = typeof messageText === "string" ? messageText.trim() : messageText ?? "";
     if (!message && (!attachments || attachments.length === 0)) return;
@@ -5352,7 +5430,7 @@ function ChatInterface({
       if (selectedChatId === null) {
         // Create a new chat (with optional capsules).
         const newChatId = await overseer.newChat(
-            message, model, capsules, attachments, formats);
+            message, model, capsules, attachments, formats, xcityAgentSlug);
         onNavigateToChatRef.current(newChatId);
       } else {
         // Send message to existing chat.
@@ -5379,13 +5457,14 @@ function ChatInterface({
     capsules?: CapsuleSpecifier[],
     attachments?: ChatAttachmentHandle[],
     formats?: MessageFormatRef[],
+    xcityAgentSlug?: string | null,
   ) => {
     const message = typeof messageText === "string" ? messageText.trim() : messageText ?? "";
     if (!message && (!attachments || attachments.length === 0)) return;
     const model = modelId !== undefined ? modelId : selectedModel;
     try {
       const newChatId = await overseer.newChat(
-          message, model, capsules, attachments, formats);
+          message, model, capsules, attachments, formats, xcityAgentSlug);
       onNavigateToChatRef.current(newChatId);
     } catch (err) {
       console.error("Failed to create new chat:", err);
@@ -5398,6 +5477,16 @@ function ChatInterface({
   const handleModelChange = (modelId: string | null) => {
     setSelectedModel(modelId);
     persistSelectedModel(modelId);
+  };
+
+  const handleXcityAgentChange = (slug: string | null) => {
+    const previous = selectedXcityAgentSlug;
+    setSelectedXcityAgentSlug(slug);
+    authenticatedApi.setPreferredXcityAgent(slug).catch((err) => {
+      console.error("Failed to save Xcity agent preference:", err);
+      setSelectedXcityAgentSlug(previous);
+      toasts.add({ title: "Failed to save marketplace agent", variant: "error" });
+    });
   };
 
   // Handle stopping the agent
@@ -6629,6 +6718,14 @@ function ChatInterface({
             models={availableModels}
             selectedModel={selectedModel}
             onModelChange={handleModelChange}
+            xcityAgents={xcityAgents}
+            selectedXcityAgentSlug={selectedXcityAgentSlug}
+            xcityPersonaAvailability={xcityPersonaAvailability}
+            xcityAgentsLoading={xcityAgentsLoading}
+            xcityHomeUrl={serverConfig?.xcityHomeUrl}
+            onXcityAgentChange={serverConfig?.xcityAgentMarketplaceEnabled
+                ? handleXcityAgentChange
+                : undefined}
             showThinkingTraces={showThinkingTraces}
             onToggleThinkingTraces={toggleShowThinkingTraces}
             minRows={2}

@@ -336,6 +336,24 @@ export interface AuthenticatedApi extends RpcTarget {
   // Set the user's preferred model. Pass null to indicate "No agent".
   setPreferredModel(id: string | null): Promise<void>;
 
+  /** List Xcity marketplace agents available from the deployment's configured xct-home catalog. */
+  listXcityAgents(): Promise<XcityCatalogAgent[]>;
+
+  /** Resolve one Xcity marketplace agent by slug, returning null for disabled or unknown slugs. */
+  getXcityAgent(slug: string): Promise<XcityCatalogAgent | null>;
+
+  /**
+   * Check whether Xcity marketplace agents have persona prompts available to this user.
+   * The prompt text itself is never returned to the client.
+   */
+  getXcityAgentPersonaAvailability(slugs: string[]): Promise<Record<string, boolean>>;
+
+  /** Get the user's preferred Xcity marketplace agent slug for newly-created chats. */
+  getPreferredXcityAgent(): Promise<string | null>;
+
+  /** Set the user's preferred Xcity marketplace agent slug for newly-created chats. */
+  setPreferredXcityAgent(slug: string | null): Promise<void>;
+
   // Returns true if the user has completed the onboarding wizard.
   isOnboardingCompleted(): Promise<boolean>;
 
@@ -867,6 +885,9 @@ export type ServerConfig = {
   /** Public xct-home base URL used for Xcity wallet recharge links, when configured. */
   xcityHomeUrl?: string;
 
+  /** Whether the Xcity Agent Marketplace persona picker is enabled for this deployment. */
+  xcityAgentMarketplaceEnabled?: boolean;
+
   // Whether new account signups are allowed (admin-configurable, default true). The signup page
   // hides the create-account form when false.
   signupsEnabled: boolean;
@@ -888,6 +909,90 @@ export type ServerConfig = {
   // Deployment accent (brand) color as a hex string, or "" to use the default theme. The client
   // overrides the brand CSS variables with this (and derived shades) at runtime.
   accentColor: string;
+};
+
+/** One skill summary attached to an Xcity marketplace agent catalog entry. */
+export type XcityCatalogAgentSkill = {
+  /** Stable skill id from xct-home. */
+  id: string;
+
+  /** Human-readable skill name. */
+  name: string;
+
+  /** Short skill description. */
+  description?: string;
+
+  /** Skill search tags. */
+  tags: string[];
+
+  /** Example prompts or uses shown by xct-home, when available. */
+  examples: string[];
+};
+
+/** Public Xcity marketplace agent catalog entry, with no persona prompt text. */
+export type XcityCatalogAgent = {
+  /** Stable catalog id from xct-home. */
+  id: string;
+
+  /** Stable marketplace slug, also used as the tokenhub skill id. */
+  slug: string;
+
+  /** Primary display name shown in marketplace UI. */
+  displayName: string;
+
+  /** Optional emoji avatar from xct-home. */
+  emoji?: string;
+
+  /** Secondary/source name from xct-home, when different from displayName. */
+  name?: string;
+
+  /** Public catalog description. */
+  description?: string;
+
+  /** Public category label used for filtering. */
+  category?: string;
+
+  /** Public search tags. */
+  tags: string[];
+
+  /** Public skill summaries associated with the agent. */
+  skills: XcityCatalogAgentSkill[];
+
+  /** Catalog version string, when provided. */
+  version?: string;
+
+  /** Whether xct-home marks the agent as streaming-capable. */
+  streaming?: boolean;
+
+  /** Public source label from xct-home. */
+  source?: string;
+
+  /** Public author display name from xct-home. */
+  authorName?: string;
+
+  /** Public creator id/name from xct-home. */
+  createdBy?: string;
+
+  /** Plan ids for which xct-home lists the agent as available. */
+  availablePlans: string[];
+};
+
+/** Client-visible summary of the Xcity marketplace persona attached to one chat. */
+export type XcityChatAgentInfo = {
+  /** Stable marketplace slug selected for the chat. */
+  slug: string;
+
+  /** Primary display name shown in the UI. */
+  displayName: string;
+
+  /** Optional emoji avatar from xct-home. */
+  emoji?: string;
+
+  /** Public category label from xct-home. */
+  category?: string;
+
+  /** Whether the persona prompt was available when this chat was created. */
+  personaAvailable: boolean;
 };
 
 // Usage + Cloudflare-connection status for the optional limits flow. Returned by
@@ -1520,7 +1625,7 @@ export interface Overseer extends RpcTarget {
   // is already in the text.
   newChat(initialMessage: string | SlashCommandRequest, modelId: string | null,
           capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
-          formats?: MessageFormatRef[]): Promise<number>;
+          formats?: MessageFormatRef[], xcityAgentSlug?: string | null): Promise<number>;
 
   // Send a message to the chat from this client. Sending a message causes the LLM to start
   // running if it isn't already.
@@ -1728,6 +1833,9 @@ export type AiChatMetadata = {
 
   // If this was started from an agent spawner, the spawner's display name.
   spawnerName?: string;
+
+  /** Xcity marketplace persona selected for this chat, when one was chosen at chat creation. */
+  xcityAgent?: XcityChatAgentInfo;
 
   // Tokens the model reported for this conversation's last step, if known. Cleared when compaction
   // changes what the next prompt will contain, until a step measures it again.

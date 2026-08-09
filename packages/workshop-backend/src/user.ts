@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, XcityCatalogAgent, XcityChatAgentInfo } from '@gadgets/workshop-shared/api';
 import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
@@ -9,7 +9,9 @@ import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import { createWorkshopLogger } from "./observability";
 import { getAiGatewayConfig } from "./ai-gateway.js";
 import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-billing/limits/config.js";
-import { getXcityConfig } from "./xcity/config.js";
+import { getXcityAgentMarketplaceConfig, getXcityConfig } from "./xcity/config.js";
+import { getXcityAgent, isSafeXcityAgentSlug, listXcityAgents } from "./xcity/agent-catalog.js";
+import { getXcityAgentPersona } from "./xcity/agent-persona.js";
 import {
   XcityModelPlane,
   XCITY_VENDOR_ID,
@@ -80,6 +82,11 @@ export type UserChatContext = {
   aiModel?: UserAiModelRecord;
   quickModel?: AiModelConfig;
 }
+
+export type XcityChatAgentPersona = {
+  info: XcityChatAgentInfo;
+  persona: string | null;
+};
 
 type LoginSessionRecord = {
   tokenId: string,  // sha256 hash of token, hex-formatted
@@ -209,6 +216,7 @@ function makeUserStorage(storage: DurableObjectStorage) {
       },
       quickModel: <string | null>null,
       preferredModel: <string | null>null,
+      preferredXcityAgent: <string | null>null,
       onboardingCompleted: false,
 
       // Set once the user's pre-existing workspaces have been asked to populate the outputs index
@@ -648,6 +656,90 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       }
     }
     this.storage.preferredModel.put(id);
+  }
+
+  async listXcityAgents(): Promise<XcityCatalogAgent[]> {
+    if (!getXcityAgentMarketplaceConfig(this.env)) return [];
+    return listXcityAgents(this.env);
+  }
+
+  async getXcityAgent(slug: string): Promise<XcityCatalogAgent | null> {
+    if (!getXcityAgentMarketplaceConfig(this.env)) return null;
+    return getXcityAgent(this.env, slug);
+  }
+
+  async getXcityAgentPersonaAvailability(slugs: string[]): Promise<Record<string, boolean>> {
+    let result: Record<string, boolean> = Object.create(null);
+    let config = getXcityAgentMarketplaceConfig(this.env);
+    if (!config) return result;
+
+    let catalog = await listXcityAgents(this.env);
+    let validSlugs = new Set(catalog.map(agent => agent.slug));
+    let uniqueSlugs = [...new Set(slugs)]
+        .filter((slug): slug is string => typeof slug === "string" && isSafeXcityAgentSlug(slug))
+        .slice(0, 500);
+    let pending = uniqueSlugs.filter(slug => {
+      let valid = validSlugs.has(slug);
+      result[slug] = false;
+      return valid;
+    });
+
+    let workerCount = Math.min(8, pending.length);
+    let index = 0;
+    await Promise.all(Array.from({ length: workerCount }, async () => {
+      for (;;) {
+        let slug = pending[index++];
+        if (!slug) return;
+        result[slug] = await this.#getXcityAgentPersona(slug) !== null;
+      }
+    }));
+    return result;
+  }
+
+  async getPreferredXcityAgent(): Promise<string | null> {
+    let slug = this.storage.preferredXcityAgent.get();
+    if (!slug) return null;
+    if (await this.getXcityAgent(slug)) return slug;
+    this.storage.preferredXcityAgent.put(null);
+    return null;
+  }
+
+  async setPreferredXcityAgent(slug: string | null): Promise<void> {
+    if (slug !== null && !(await this.getXcityAgent(slug))) {
+      throw new Error(`No such Xcity agent: ${slug}`);
+    }
+    this.storage.preferredXcityAgent.put(slug);
+  }
+
+  async resolveXcityAgentPersona(slug: string): Promise<XcityChatAgentPersona | null> {
+    let agent = await this.getXcityAgent(slug);
+    if (!agent) return null;
+
+    let persona = await this.#getXcityAgentPersona(slug);
+    return {
+      info: {
+        slug: agent.slug,
+        displayName: agent.displayName,
+        emoji: agent.emoji,
+        category: agent.category,
+        personaAvailable: persona !== null,
+      },
+      persona,
+    };
+  }
+
+  async #getXcityAgentPersona(slug: string): Promise<string | null> {
+    let config = getXcityAgentMarketplaceConfig(this.env);
+    let identity = this.storage.xcityIdentity.get();
+    if (!config || !identity) return null;
+
+    return getXcityAgentPersona(
+        this.env,
+        config,
+        this.storage.xcityModelPlane,
+        identity,
+        slug,
+        identity.email ?? this.storage.profile.get().id);
   }
 
   async isOnboardingCompleted(): Promise<boolean> {

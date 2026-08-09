@@ -27,6 +27,26 @@ import {
 
 const logger = createWorkshopLogger("workshop.agent");
 
+function escapeXmlText(text: string): string {
+  return text.replace(/[<>&]/g, char => {
+    switch (char) {
+      case "<": return "&lt;";
+      case ">": return "&gt;";
+      case "&": return "&amp;";
+      default: return char;
+    }
+  });
+}
+
+export function formatAgentPersona(name: string, persona: string | null | undefined): string {
+  let trimmed = persona?.trim();
+  if (!trimmed) return "";
+  return `<xcity-agent-persona>\n` +
+      `<name>${escapeXmlText(name)}</name>\n` +
+      `<instructions>\n${trimmed}\n</instructions>\n` +
+      `</xcity-agent-persona>`;
+}
+
 // Additional per-chat-thread info needed by the AI agent but not by the client.
 export type AiChatAgentContext = {
   // Chat ID, corresponds to `chatMeta`.
@@ -64,6 +84,15 @@ export type AiChatAgentContext = {
   // Cached discovery catalogs for the always-available resources, keyed per gatekeeper.
   // Regenerable: re-fetched when missing/stale (see prepareChatBindings).
   alwaysAvailableCatalogs?: AgentCatalogSnapshot[];
+
+  // Xcity marketplace persona selected when this chat was created. `persona === null` records
+  // that the catalog selection was valid but tokenhub did not have the persona prompt at creation
+  // time, so the chat intentionally behaves like an ordinary coding-agent chat.
+  xcityAgent?: {
+    slug: string;
+    displayName: string;
+    persona: string | null;
+  };
 };
 
 // One entry of the chat's seed binding layer, as returned by AgentHooks.prepareChatBindings():
@@ -2189,10 +2218,11 @@ export async function runAgent(
     }
 
     // Split the system prompt into static and dynamic parts for better caching.
+    let agentPersona = formatAgentPersona(
+        agentContext.xcityAgent?.displayName ?? "", agentContext.xcityAgent?.persona);
+
     systemPromptSlots = [
-      instanceInstructions
-          ? `${SYSTEM_PROMPT}\n\n${instanceInstructions}`
-          : SYSTEM_PROMPT,
+      [SYSTEM_PROMPT, instanceInstructions, agentPersona].filter(Boolean).join("\n\n"),
       (standardFormats ? `${standardFormats}\n\n` : "") +
           `${systemPromptWorkspace}${systemPromptConnections}` +
           (alwaysAvailableResourcesPrompt ? `\n\n${alwaysAvailableResourcesPrompt}` : ""),

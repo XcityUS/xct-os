@@ -13,6 +13,7 @@ import {
   ChatAttachmentHandle,
   MessageFormatRef,
   SlashCommandRequest,
+  XcityCatalogAgent,
 } from "@gadgets/workshop-shared/api";
 import {
   getStoredSelectedModel,
@@ -20,13 +21,15 @@ import {
 } from "../modelSelection";
 import { useDocumentTitle } from "../useDocumentTitle";
 import { homePromptFromSearch } from "../homePrompt";
+import { useServerConfig } from "../ServerConfigContext";
 
-type HomeSearch = { prompt?: string };
+type HomeSearch = { prompt?: string; agent?: string };
 
 export const Route = createFileRoute("/")({
   component: HomePage,
   validateSearch: (search: Record<string, unknown>): HomeSearch => ({
     prompt: homePromptFromSearch(search.prompt),
+    agent: typeof search.agent === "string" ? search.agent : undefined,
   }),
 });
 
@@ -34,18 +37,24 @@ export const Route = createFileRoute("/")({
 // in the AppShell rail, so this page focuses on a single thing: composing the first message of a
 // new gadget — a centered column with a hero, the prompt composer, and a few task suggestions.
 function HomePage() {
-  return <HomePageContent prompt={Route.useSearch().prompt} />;
+  return <HomePageContent {...Route.useSearch()} />;
 }
 
-export function HomePageContent({ prompt }: HomeSearch) {
+export function HomePageContent({ prompt, agent }: HomeSearch) {
   useDocumentTitle("Home");
 
   const { authenticatedApi } = useAuthenticatedApi();
+  const serverConfig = useServerConfig();
   const navigate = useNavigate();
   const toasts = useKumoToastManager();
 
   const [models, setModels] = useState<AiChatAuthorInfo[]>([]);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [xcityAgents, setXcityAgents] = useState<XcityCatalogAgent[]>([]);
+  const [selectedXcityAgentSlug, setSelectedXcityAgentSlug] = useState<string | null>(null);
+  const [xcityPersonaAvailability, setXcityPersonaAvailability] =
+      useState<Record<string, boolean | undefined>>({});
+  const [xcityAgentsLoading, setXcityAgentsLoading] = useState(false);
   // Bumped each time a task suggestion is picked; the composer re-seeds its text off the nonce.
   const [seed, setSeed] = useState<{ text: string; nonce: number }>({ text: "", nonce: 0 });
 
@@ -73,10 +82,73 @@ export function HomePageContent({ prompt }: HomeSearch) {
     };
   }, [authenticatedApi]);
 
+  useEffect(() => {
+    if (!serverConfig?.xcityAgentMarketplaceEnabled) {
+      setXcityAgents([]);
+      setSelectedXcityAgentSlug(null);
+      setXcityPersonaAvailability({});
+      setXcityAgentsLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setXcityAgentsLoading(true);
+    setXcityPersonaAvailability({});
+    (async () => {
+      try {
+        const [agents, preferred, linkedAgent] = await Promise.all([
+          authenticatedApi.listXcityAgents(),
+          authenticatedApi.getPreferredXcityAgent(),
+          agent ? authenticatedApi.getXcityAgent(agent) : Promise.resolve(null),
+        ]);
+        if (cancelled) return;
+
+        setXcityAgents(agents);
+        const nextSlug = linkedAgent?.slug ??
+            (preferred && agents.some(entry => entry.slug === preferred) ? preferred : null);
+        setSelectedXcityAgentSlug(nextSlug);
+        setXcityAgentsLoading(false);
+        if (linkedAgent) {
+          await authenticatedApi.setPreferredXcityAgent(linkedAgent.slug);
+          if (cancelled) return;
+        }
+        if (agent) {
+          navigate({ to: "/", search: {}, replace: true });
+        }
+
+        const availability = await authenticatedApi.getXcityAgentPersonaAvailability(
+            agents.map(entry => entry.slug));
+        if (!cancelled) setXcityPersonaAvailability(availability);
+      } catch (err) {
+        console.error("Failed to load Xcity agents:", err);
+        if (!cancelled) {
+          setXcityAgents([]);
+          setSelectedXcityAgentSlug(null);
+          setXcityPersonaAvailability({});
+          setXcityAgentsLoading(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [agent, authenticatedApi, navigate, serverConfig?.xcityAgentMarketplaceEnabled]);
+
   const handleModelChange = useCallback((value: string | null) => {
     setSelectedModel(value);
     persistSelectedModel(value);
   }, []);
+
+  const handleXcityAgentChange = useCallback((slug: string | null) => {
+    const previous = selectedXcityAgentSlug;
+    setSelectedXcityAgentSlug(slug);
+    authenticatedApi.setPreferredXcityAgent(slug).catch((err) => {
+      console.error("Failed to save Xcity agent preference:", err);
+      setSelectedXcityAgentSlug(previous);
+      toasts.add({ title: "Failed to save marketplace agent", variant: "error" });
+    });
+  }, [authenticatedApi, selectedXcityAgentSlug, toasts]);
 
   // Pre-create a provisional gadget as soon as the user starts interacting, so that navigation
   // after submit is instant. Same pattern as before — disposed on unmount if never consumed.
@@ -103,13 +175,14 @@ export function HomePageContent({ prompt }: HomeSearch) {
       capsules?: CapsuleSpecifier[],
       attachments?: ChatAttachmentHandle[],
       formats?: MessageFormatRef[],
+      xcityAgentSlug?: string | null,
     ) => {
       try {
         ensureProvisionalGadget();
         const overseer = provisionalOverseerRef.current!.stub;
         // Pipeline both independent calls in one batch, but settle both before releasing the stub.
         const [chat, {id}] = await Promise.all([
-          overseer.newChat(message, modelId, capsules, attachments, formats),
+          overseer.newChat(message, modelId, capsules, attachments, formats, xcityAgentSlug),
           overseer.getMetadata(),
         ]);
         provisionalOverseerRef.current?.stub[Symbol.dispose]();
@@ -181,6 +254,14 @@ export function HomePageContent({ prompt }: HomeSearch) {
           models={models}
           selectedModel={selectedModel}
           onModelChange={handleModelChange}
+          xcityAgents={xcityAgents}
+          selectedXcityAgentSlug={selectedXcityAgentSlug}
+          xcityPersonaAvailability={xcityPersonaAvailability}
+          xcityAgentsLoading={xcityAgentsLoading}
+          xcityHomeUrl={serverConfig?.xcityHomeUrl}
+          onXcityAgentChange={serverConfig?.xcityAgentMarketplaceEnabled
+              ? handleXcityAgentChange
+              : undefined}
           newChat
           offerFormats
           autoFocus

@@ -4,6 +4,24 @@
 状态截至 2026-08-07 凌晨；完整设计见 `~/.claude/plans/foamy-conjuring-kazoo.md`，
 改动边界见 `XCITY-INTEGRATION.md`。
 
+## 当前进度
+
+| 阶段 | 状态 |
+|---|---|
+| Phase 1 统一登录 / 2 模型面 / 3 KWH 门禁 | ✅ 已在产线（Worker `fa349951`），**休眠中**，等下面第 1 节 |
+| Phase 4 Agent Persona | 🟡 PR [xct-os#2](https://github.com/XcityUS/xct-os/pull/2) 待合并（本文档在这个 PR 里） |
+| Phase 5 媒体生成 + MCP 配置 | 🟡 PR [xct-os#3](https://github.com/XcityUS/xct-os/pull/3) 待合并 |
+| 人格导入脚本 | 🟡 PR [xct-agents#5](https://github.com/XcityUS/xct-agents/pull/5) 待合并 |
+| wallet 周度免费额 | ✅ **已在产线并生效** —— 迁移已执行，free 用户读余额即触发发放 |
+
+合并 xct-os#2 和 #3 之后，跑一次 starter 部署把代码送上产线：
+
+```bash
+cd /Users/javen/workspace/cloudflare-os-starter && git pull && git -C cloudflare-os fetch origin && git -C cloudflare-os checkout origin/main && env -u CLOUDFLARE_API_TOKEN pnpm check && env -u CLOUDFLARE_API_TOKEN pnpm deploy
+```
+
+`xcity.enabled` 仍是 `false`，所以这次部署行为零变化 —— 只是把新代码放到位。
+
 ---
 
 ## 1. 点亮 Xcity SSO（阻塞 Phase 1/2/3 真正生效）

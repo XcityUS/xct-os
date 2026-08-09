@@ -457,7 +457,13 @@ class XcityMediaConfiguratorUI extends RpcTarget implements XcityMediaConfigurat
   }
 }
 
-@validateRpc()
+// Deliberately NOT @validateRpc(): the validator's runtime class decorator replaces the exported
+// class, and a durably-stored stub of the replaced class hangs on revival — dispatch never reaches
+// the method and the runtime cancels it ("code had hung"). Config-declared bindings resolve by
+// export name and are unaffected (GatekeeperVendor stays validated), but this class is exactly the
+// one the Workshop stores via allow_irrevocable_stub_storage. Its only caller is the Workshop over
+// typed RPC, so skipping arg validation here is the lesser evil. The Workshop's own undecorated
+// LoginConnectCallbackImpl is the working precedent: stored, revived and called on every sign-in.
 export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImplProps>
                                 implements XcityGatekeeperUser {
   #account() {

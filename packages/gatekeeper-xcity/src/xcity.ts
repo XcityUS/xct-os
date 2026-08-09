@@ -104,6 +104,17 @@ function getBaseUrl(env: Env) {
   return stripTrailingSlashes(env.BASE_URL || "http://localhost:8787/gatekeeper/xcity");
 }
 
+// The UserAccount namespace for contexts that must survive stub revival. GatekeeperUserImpl and
+// the media DO are reached through durably-stored stubs/facets; after the creating request dies,
+// their revived ctx.exports dispatches hang until the runtime cancels them, while `env` bindings
+// stay valid. ctx.exports remains as the fallback for dev configs without the binding.
+function userAccountNamespace(
+  env: Env, exports: { UserAccount: DurableObjectNamespace<UserAccount> },
+): DurableObjectNamespace<UserAccount> {
+  return (env as { USER_ACCOUNT?: DurableObjectNamespace<UserAccount> }).USER_ACCOUNT
+      ?? exports.UserAccount;
+}
+
 function getBasePath(env: Env) {
   const path = new URL(getBaseUrl(env)).pathname;
   return path === "/" ? "" : path;
@@ -450,8 +461,8 @@ class XcityMediaConfiguratorUI extends RpcTarget implements XcityMediaConfigurat
 export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImplProps>
                                 implements XcityGatekeeperUser {
   #account() {
-    const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
-    return this.ctx.exports.UserAccount.get(id);
+    const ns = userAccountNamespace(this.env, this.ctx.exports);
+    return ns.get(ns.idFromString(this.ctx.props.userObjectId));
   }
 
   async describe(): Promise<AccountDescription> {
@@ -752,8 +763,8 @@ class XcityMediaSessionImpl extends RpcTarget implements XcityMedia {
 export class XcityMediaGatekeeperImpl extends DurableObject<Env, XcityMediaGatekeeperProps>
     implements Gatekeeper<XcityMedia> {
   #userAccount() {
-    return this.ctx.exports.UserAccount.get(
-      this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
+    const ns = userAccountNamespace(this.env, this.ctx.exports);
+    return ns.get(ns.idFromString(this.ctx.props.userObjectId));
   }
 
   #mediaConfig(): XcityMediaConfig {

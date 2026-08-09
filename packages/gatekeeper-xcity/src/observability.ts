@@ -6,6 +6,8 @@ export type XcityObservabilityFields = {
   status: number;
   statusText: string;
   vendorId: string;
+  mediaId: string;
+  providerJobId: string;
 };
 
 /** Ambient observability fields for one Xcity gatekeeper operation. */

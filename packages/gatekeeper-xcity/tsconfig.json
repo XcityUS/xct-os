@@ -5,6 +5,8 @@
     "lib": ["ES2022"],
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "jsx": "react",
+    "jsxFactory": "h",
     "types": ["./worker-configuration.d.ts"],
     "outDir": "./dist",
     "declaration": true,
@@ -12,6 +14,7 @@
     "noEmit": false,
     "baseUrl": ".",
     "paths": {
+      "@gadgets/configurator-ui": ["../configurator-ui/src/index.ts"],
       "@gadgets/workshop-shared/*": ["../workshop-shared/src/*"]
     }
   },

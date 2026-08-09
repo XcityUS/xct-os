@@ -49,14 +49,22 @@ Gatekeeper 本身按目录名 `gatekeeper-*` 自动发现并绑定为 `GATEKEEPE
 | 变量 | 作用 | 不设时 |
 |---|---|---|
 | `XCITY_TOKENHUB_URL` | tokenhub 基址，如 `https://tokenhub.xcity.ai` | 模型面回落上游行为（BYOK / AI Gateway） |
+| `XCITY_MEDIA_WORKER_URL` | xcity-media Worker 基址，如 `https://media.xcity.ai`；`gatekeeper-xcity` 生成视频/图片后调用它归档到 R2 | `gatekeeper-xcity` 不暴露媒体生成资源 |
 | `XCITY_WALLET_URL` | wallet 基址，如 `https://wallet.xcity.ai`；模型面用它铸 per-user litellm key，额度门禁用它查 KWH 余额 | 模型面回落上游行为；额度门禁回落上游 `ENABLE_CLOUDFLARE_LIMITS` 逻辑 |
 | `XCITY_AUTH_URL` | GoTrue 基址，如 `https://auth.xcity.ai` | gatekeeper-xcity 不可用 |
 | `XCITY_HOME_URL` | xct-home 基址，如 `https://xcity.ai`（agent 目录、充值跳转；通过 `ServerConfig` 下发给前端） | agent 目录与充值跳转不可用 |
-| `WALLET_SERVICE_TOKEN` | 铸 per-user litellm key 用（**secret**） | 无法自动发 key |
+| `WALLET_SERVICE_TOKEN` | 铸 per-user litellm key 用（**secret**）；模型面和 `gatekeeper-xcity` 媒体生成复用同一个 wallet key mint 接口 | 无法自动发 key；`gatekeeper-xcity` 不暴露媒体生成资源 |
 | `XCITY_QUICK_MODEL` | quick model 指定的 tokenhub model id（可选） | 从 tokenhub 目录里挑成本最低的模型 |
+| `MCP_PORTAL_URL` | tokenhub MCP endpoint：`https://tokenhub.xcity.ai/mcp/` | Xcity MCP portal 不启用 |
+| `MCP_PORTAL_AUTH` | tokenhub MCP portal 鉴权模式：`oauth` | Xcity MCP portal 不启用 |
+| `MCP_PORTAL_NAME` | Connectors UI 显示名：`Xcity Tools` | Xcity MCP portal 使用默认名或不启用 |
 | `AUTH_GATEKEEPERS` | 设为 `xcity` 启用统一登录 | 上游默认（用户名密码 / Cloudflare Access） |
 | `DISABLE_PASSWORD_AUTH` | `true` 时只留 SSO | 保留密码登录 |
 | `ADMINS` | 管理员邮箱列表（上游既有，见 `packages/workshop-backend/src/server.ts`） | 无管理员 |
+
+`MCP_PORTAL_URL` / `MCP_PORTAL_AUTH=oauth` / `MCP_PORTAL_NAME` 只需要配置，不需要改
+`gatekeeper-mcp-portal` 代码；tokenhub 修好 `PROXY_BASE_URL` 让 OAuth metadata 广告 `https://`
+之后即可启用。
 
 **本仓库不持有 `LITELLM_MASTER_KEY`。** 列 agent 走 xct-home 的公开目录
 `GET $XCITY_HOME_URL/api/catalog/agents`（已剥离上游 `apiUrl`），而不是直接查 tokenhub 注册表。

@@ -1,5 +1,4 @@
 import { Link } from '@tanstack/react-router'
-import { Hexagon } from '@phosphor-icons/react'
 import { FormatGlyph } from './components/format/FormatVisuals'
 import { RpcStub } from 'capnweb'
 import {
@@ -15,6 +14,7 @@ import UserMenu from './components/UserMenu'
 import { GadgetPresence } from './components/GadgetPresence'
 import TopBarNotice from './TopBarNotice'
 import SiteLogo from './components/SiteLogo'
+import XcityMark from './components/XcityMark'
 import GadgetExportMenu from './GadgetExportMenu'
 
 // The minimal, "use"-only experience: a shared top bar plus the gadget's deployed UI, and nothing
@@ -66,7 +66,7 @@ export default function GadgetUseView({
         <div className="flex items-center gap-2 min-w-0">
           <Link to="/" aria-label="Home" className="flex-shrink-0 hover:opacity-80 transition-opacity">
             <SiteLogo size={22}>
-              <Hexagon size={22} className="text-kumo-brand" weight="bold" />
+              <XcityMark size={22} />
             </SiteLogo>
           </Link>
 

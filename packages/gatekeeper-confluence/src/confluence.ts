@@ -170,7 +170,7 @@ const htmlResponse = (body: string): Response =>
 
 const SELF_CLOSING_HTML = `<!DOCTYPE html>
 <html lang="en"><body><script>window.close();</script>
-<p>Authorization complete. You may close this tab and return to Cloudflare OS.</p></body></html>`;
+<p>Authorization complete. You may close this tab and return to Xcity OS.</p></body></html>`;
 
 const page = (title: string, color: string, message: string): string => `<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><title>${title}</title></head>
@@ -180,7 +180,7 @@ const page = (title: string, color: string, message: string): string => `<!DOCTY
 <p style="color: #555; line-height: 1.6;">${message}</p></div></body></html>`;
 
 const INVALID_LINK_HTML = page("Authorization Link Expired", "#d97706",
-  "This authorization link is invalid or has expired. Please return to Cloudflare OS and try again.");
+  "This authorization link is invalid or has expired. Please return to Xcity OS and try again.");
 const NOT_CONFIGURED_HTML = page("Confluence Gatekeeper Not Configured", "#d97706",
   "Please configure an Atlassian OAuth client ID and secret for this gatekeeper.");
 
@@ -245,7 +245,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
       color: "#deebff",
       tagline: "Read and write your Confluence pages and spaces",
       description:
-        "Connect your Atlassian Confluence site to let Cloudflare OS search, read, and edit the pages, " +
+        "Connect your Atlassian Confluence site to let Xcity OS search, read, and edit the pages, " +
         "blog posts, and spaces you share. Build agents that draft documentation, organize " +
         "knowledge bases, or keep pages up to date.",
     };

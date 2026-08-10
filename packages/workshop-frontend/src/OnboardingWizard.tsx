@@ -22,7 +22,6 @@ import {
   UsersThree,
   Key,
   Plugs,
-  Hexagon,
 } from '@phosphor-icons/react'
 import AddModelModal from './AddModelModal'
 import { persistSelectedModel } from './modelSelection'
@@ -33,6 +32,7 @@ import { invalidateAvatarCache } from './useAvatar'
 import { useTheme } from './ThemeContext'
 import { useSiteName } from './ServerConfigContext'
 import SiteLogo from './components/SiteLogo'
+import XcityMark from './components/XcityMark'
 import { useDocumentTitle } from './useDocumentTitle'
 
 // ─── constants ──────────────────────────────────────────────────────────────────
@@ -357,7 +357,7 @@ export default function OnboardingWizard({
           }`}
         >
           <SiteLogo size={22}>
-            <Hexagon size={22} className="text-kumo-brand" weight="bold" />
+            <XcityMark size={22} />
           </SiteLogo>
           <span className="text-base font-semibold tracking-tight text-kumo-default">
             {siteName}

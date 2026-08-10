@@ -184,7 +184,7 @@ const SELF_CLOSING_HTML = `<!DOCTYPE html>
 <html lang="en">
   <body>
     <script type="text/javascript">window.close();</script>
-    <p>Authorization complete. You may close this tab and return to Cloudflare OS.
+    <p>Authorization complete. You may close this tab and return to Xcity OS.
   </body>
 </html>`;
 
@@ -194,7 +194,7 @@ const INVALID_LINK_HTML = `<!DOCTYPE html>
   <body style="font-family: system-ui, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #f5f5f5;">
     <div style="max-width: 520px; padding: 2rem; background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center;">
       <h1 style="color: #d97706; font-size: 1.5rem; margin: 0 0 1rem 0;">Authorization Link Expired</h1>
-      <p style="color: #555; line-height: 1.6; margin: 0 0 1.5rem 0;">This authorization link is invalid or has expired. Please return to Cloudflare OS and try again.</p>
+      <p style="color: #555; line-height: 1.6; margin: 0 0 1.5rem 0;">This authorization link is invalid or has expired. Please return to Xcity OS and try again.</p>
       <button onclick="window.close()" style="padding: 0.5rem 1.5rem; background: #d97706; color: white; border: none; border-radius: 4px; font-size: 1rem; cursor: pointer;">Close</button>
     </div>
   </body>
@@ -284,7 +284,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
       color: "#f4ede4",
       tagline: "Read channels, DMs, and threads",
       description:
-          "Connect your Slack account to give Cloudflare OS read-only access to the workspaces, " +
+          "Connect your Slack account to give Xcity OS read-only access to the workspaces, " +
           "channels, direct messages, and threads you can see. Build agents that summarize " +
           "conversations, monitor channels, or search across your Slack history.",
     };

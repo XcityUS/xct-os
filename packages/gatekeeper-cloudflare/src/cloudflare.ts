@@ -78,14 +78,14 @@ function getBasePath(env: Env) {
 const SELF_CLOSING_HTML = `<!DOCTYPE html>
 <html lang="en"><body>
 <script type="text/javascript">window.close();</script>
-<p>Authorization complete. You may close this tab and return to Cloudflare OS.
+<p>Authorization complete. You may close this tab and return to Xcity OS.
 </body></html>`;
 
 const INVALID_LINK_HTML = `<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><title>Authorization Link Expired</title></head>
 <body style="font-family: system-ui, sans-serif; text-align: center; padding: 3rem;">
 <h1 style="color:#d97706;">Authorization Link Expired</h1>
-<p>This authorization link is invalid or has expired. Please return to Cloudflare OS and try again.</p>
+<p>This authorization link is invalid or has expired. Please return to Xcity OS and try again.</p>
 <button onclick="window.close()">Close</button></body></html>`;
 
 const NOT_CONFIGURED_HTML = `<!DOCTYPE html>

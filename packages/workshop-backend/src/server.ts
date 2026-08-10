@@ -817,6 +817,21 @@ export default {
     // OAuth redirect lands on `/gatekeeper/<name>/oauth`); the result is bridged back to the waiting
     // browser via the `attempt` stub from PublicApi.startGatekeeperLogin(). So the backend no longer
     // hosts /auth/* callbacks.
+    //
+    // In deployments where this Worker is the front door (no separate router in front, as in the
+    // starter), those gatekeeper HTTP endpoints are only reachable if we forward them: the asset
+    // layer would otherwise swallow /gatekeeper/* into the SPA fallback. The RPC bindings target
+    // the GatekeeperVendor entrypoint, which has no fetch handler, so forwarding uses a dedicated
+    // `GATEKEEPER_<NAME>_HTTP` binding to the gatekeeper's default entrypoint. Deployments with a
+    // real router simply don't configure the _HTTP bindings and this never matches.
+    {
+      let match = /^\/gatekeeper\/([a-z0-9-]+)\//.exec(url.pathname);
+      if (match) {
+        let binding = (env as unknown as Record<string, unknown>)[
+          `GATEKEEPER_${match[1].toUpperCase().replaceAll("-", "_")}_HTTP`];
+        if (binding) return (binding as Fetcher).fetch(req);
+      }
+    }
 
     if (url.pathname === "/api/client-errors") {
       return handleClientErrorRequest(req, env, ctx);

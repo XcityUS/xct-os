@@ -10,6 +10,16 @@
   "rules": [
     { "type": "Text", "globs": ["**/*.txt", "**/*.svg"], "fallthrough": false }
   ],
+  // A plain namespace binding for the account DO. GatekeeperUserImpl is a props-derived
+  // entrypoint that the Workshop stores durably (allow_irrevocable_stub_storage); once the
+  // creating request context is gone, dispatching through the revived instance's ctx.exports
+  // hangs until the runtime cancels it ("code had hung"). `env` survives revival, so account
+  // access goes through this binding, with ctx.exports kept only as a dev fallback.
+  "durable_objects": {
+    "bindings": [
+      { "name": "USER_ACCOUNT", "class_name": "UserAccount" }
+    ]
+  },
   "migrations": [
     {
       "tag": "v0",

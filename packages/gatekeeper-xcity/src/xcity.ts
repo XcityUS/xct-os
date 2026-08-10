@@ -104,6 +104,17 @@ function getBaseUrl(env: Env) {
   return stripTrailingSlashes(env.BASE_URL || "http://localhost:8787/gatekeeper/xcity");
 }
 
+// The UserAccount namespace for contexts that must survive stub revival. GatekeeperUserImpl and
+// the media DO are reached through durably-stored stubs/facets; after the creating request dies,
+// their revived ctx.exports dispatches hang until the runtime cancels them, while `env` bindings
+// stay valid. ctx.exports remains as the fallback for dev configs without the binding.
+function userAccountNamespace(
+  env: Env, exports: { UserAccount: DurableObjectNamespace<UserAccount> },
+): DurableObjectNamespace<UserAccount> {
+  return (env as { USER_ACCOUNT?: DurableObjectNamespace<UserAccount> }).USER_ACCOUNT
+      ?? exports.UserAccount;
+}
+
 function getBasePath(env: Env) {
   const path = new URL(getBaseUrl(env)).pathname;
   return path === "/" ? "" : path;
@@ -446,12 +457,18 @@ class XcityMediaConfiguratorUI extends RpcTarget implements XcityMediaConfigurat
   }
 }
 
-@validateRpc()
+// Deliberately NOT @validateRpc(): the validator's runtime class decorator replaces the exported
+// class, and a durably-stored stub of the replaced class hangs on revival — dispatch never reaches
+// the method and the runtime cancels it ("code had hung"). Config-declared bindings resolve by
+// export name and are unaffected (GatekeeperVendor stays validated), but this class is exactly the
+// one the Workshop stores via allow_irrevocable_stub_storage. Its only caller is the Workshop over
+// typed RPC, so skipping arg validation here is the lesser evil. The Workshop's own undecorated
+// LoginConnectCallbackImpl is the working precedent: stored, revived and called on every sign-in.
 export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImplProps>
                                 implements XcityGatekeeperUser {
   #account() {
-    const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
-    return this.ctx.exports.UserAccount.get(id);
+    const ns = userAccountNamespace(this.env, this.ctx.exports);
+    return ns.get(ns.idFromString(this.ctx.props.userObjectId));
   }
 
   async describe(): Promise<AccountDescription> {
@@ -752,8 +769,8 @@ class XcityMediaSessionImpl extends RpcTarget implements XcityMedia {
 export class XcityMediaGatekeeperImpl extends DurableObject<Env, XcityMediaGatekeeperProps>
     implements Gatekeeper<XcityMedia> {
   #userAccount() {
-    return this.ctx.exports.UserAccount.get(
-      this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
+    const ns = userAccountNamespace(this.env, this.ctx.exports);
+    return ns.get(ns.idFromString(this.ctx.props.userObjectId));
   }
 
   #mediaConfig(): XcityMediaConfig {

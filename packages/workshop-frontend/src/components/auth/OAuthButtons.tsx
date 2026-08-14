@@ -9,6 +9,8 @@ interface OAuthButtonsProps {
   onSuccess?: () => void
 }
 
+const LOGIN_TIMEOUT_MS = 2 * 60 * 1000
+
 // Renders a sign-in button per auth-capable gatekeeper vendor. Clicking opens the gatekeeper's
 // OAuth popup (which self-closes) and waits for the result over RPC; on success the session token is
 // stored and the app re-authenticates.
@@ -47,26 +49,31 @@ export default function OAuthButtons({ rpcStub, vendors, onSuccess }: OAuthButto
   const start = async (vendorId: string) => {
     setError(null)
     setPending(vendorId)
+    // Open synchronously inside the click handler. Opening only after the first await loses the
+    // browser's user-activation grant and can look like a stalled authorization on strict browsers.
+    // Don't pass "noopener": it makes window.open() return null, so we couldn't distinguish a
+    // blocked popup or observe the user closing it.
+    const popup = window.open('', 'gatekeeper-login', 'popup,width=520,height=680')
+    if (!popup) {
+      setError('Pop-up blocked. Please allow pop-ups and try again.')
+      setPending(null)
+      return
+    }
     try {
       const { url, attempt } = await rpcStub.startGatekeeperLogin(vendorId)
       // `attempt` is the capability to receive the session token; track it so we can dispose it
       // (cancelling the wait server-side) if the component unmounts mid-login.
       loginRpcRef.current = attempt as unknown as Disposable
-      // NB: don't pass "noopener" — window.open() returns null with it, so we couldn't tell a real
-      // pop-up block from a successful open (nor watch for the user closing it).
-      const popup = window.open(url, 'gatekeeper-login', 'popup,width=520,height=680')
-      if (!popup) {
-        try { (attempt as unknown as Disposable)[Symbol.dispose]() } catch { /* already disposed */ }
-        loginRpcRef.current = null
-        throw new Error('Pop-up blocked. Please allow pop-ups and try again.')
-      }
+      popup.location.href = url
       // Resolve when the gatekeeper finishes, or reject if the user closes the pop-up first.
       const token = await new Promise<string>((resolve, reject) => {
         let settled = false
+        let timeoutId: number | null = null
         const finish = (fn: () => void) => {
           if (settled) return
           settled = true
           if (pollRef.current !== null) { clearInterval(pollRef.current); pollRef.current = null }
+          if (timeoutId !== null) clearTimeout(timeoutId)
           // Dispose the attempt stub: cancels the in-flight wait() (e.g. pop-up closed), no-op if it
           // already settled.
           try { (attempt as unknown as Disposable)[Symbol.dispose]() } catch { /* already settled */ }
@@ -76,6 +83,8 @@ export default function OAuthButtons({ rpcStub, vendors, onSuccess }: OAuthButto
         pollRef.current = window.setInterval(() => {
           if (popup.closed) finish(() => reject(new Error('Sign-in was cancelled.')))
         }, 500)
+        timeoutId = window.setTimeout(() => finish(() => reject(new Error(
+          'Sign-in timed out. Please close the authorization window and try again.'))), LOGIN_TIMEOUT_MS)
         attempt.wait()
           .then(t => finish(() => resolve(t)))
           .catch(e => finish(() => reject(e instanceof Error ? e : new Error('Could not sign in'))))
@@ -85,6 +94,7 @@ export default function OAuthButtons({ rpcStub, vendors, onSuccess }: OAuthButto
       if (onSuccess) onSuccess()
       else window.location.reload()
     } catch (err) {
+      if (!popup.closed) popup.close()
       if (!mountedRef.current) return
       setError(err instanceof Error ? err.message : 'Could not sign in')
       setPending(null)

@@ -56,6 +56,11 @@ type StoredNonce = {
   stage: "initiation" | "oauth";
   verifier?: string;
   scopes?: string[];
+  // While at the "oauth" stage, the still-unexpired initiation link that started this flow. Auth
+  // frontends can bounce the browser back to the initiation URL after their own login step; keeping
+  // this lets that visit restart the authorize redirect instead of dead-ending on the "link
+  // expired" page.
+  initiation?: { value: string; expiresAt: number };
 };
 
 // A cached access token plus its absolute expiry (unix ms).
@@ -278,12 +283,17 @@ export class UserAccount extends DurableObject<Env> {
     });
   }
 
-  // Verify+consume the initiation nonce; mint a fresh OAuth nonce + PKCE pair. Returns the OAuth
-  // nonce (for the `state`) and the PKCE challenge (for the authorize URL), or null if invalid.
+  // Verify the initiation nonce; mint a fresh OAuth nonce + PKCE pair. Returns the OAuth nonce
+  // (for the `state`) and the PKCE challenge (for the authorize URL), or null if invalid. The
+  // initiation link stays usable until it expires or the flow completes, so a browser bounced back
+  // to it mid-flow just restarts the redirect rather than seeing the "link expired" page.
   async beginOAuthFlow(initiationNonce: string): Promise<{ oauthNonce: string; challenge: string; scopes: string[] } | null> {
     const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
-    if (!stored || stored.stage !== "initiation" ||
-        Date.now() >= stored.expiresAt || !constantTimeEqual(stored.value, initiationNonce)) {
+    const initiation = stored?.stage === "initiation"
+        ? { value: stored.value, expiresAt: stored.expiresAt }
+        : stored?.initiation;
+    if (!initiation || Date.now() >= initiation.expiresAt ||
+        !constantTimeEqual(initiation.value, initiationNonce)) {
       return null;
     }
     const oauthNonce = generateNonce();
@@ -293,6 +303,7 @@ export class UserAccount extends DurableObject<Env> {
       expiresAt: Date.now() + OAUTH_NONCE_LIFETIME_MS,
       stage: "oauth",
       verifier,
+      initiation,
     });
     const scopes = this.ctx.storage.kv.get<string[]>("scopes") ?? FULL_SCOPES;
     return { oauthNonce, challenge, scopes };

@@ -10,8 +10,10 @@ export function formatUsageBalance(usage: CloudflareUsageInfo): string | null {
   return `$${usage.balance.toFixed(2)}`
 }
 
-// Build the top-up URL for the current billing surface. For Cloudflare, when the account id is
-// known we deep-link directly, skipping the dashboard's account picker.
+/**
+ * Build the top-up URL for the current billing surface. For Cloudflare, when the account id is
+ * known we deep-link directly, skipping the dashboard's account picker.
+ */
 export function buildAddCreditsUrl(
   usage: Pick<CloudflareUsageInfo, 'accountId' | 'billingMode' | 'rechargeUrl'>,
   fallbackXcityHomeUrl?: string,

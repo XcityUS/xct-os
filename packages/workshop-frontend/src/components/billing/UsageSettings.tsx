@@ -8,8 +8,11 @@ import { useServerConfig, useUsageBillingEnabled } from '../../ServerConfigConte
 import { buildAddCreditsUrl, formatUsageBalance, isXcityUsage } from './creditsUrl'
 import ResetCountdown from './ResetCountdown'
 
-// Shows the user's usage billing status on the profile page. Renders nothing unless a server-side
-// usage gate is enabled.
+/**
+ * Shows the user's usage billing status on the profile page: free-tier usage and Cloudflare
+ * connection / credit status, or the Xcity wallet balance when `billingMode` is "xcity".
+ * Renders nothing unless a server-side usage gate is enabled.
+ */
 export default function UsageSettings() {
   const limitsEnabled = useUsageBillingEnabled()
   const serverConfig = useServerConfig()
@@ -59,7 +62,7 @@ export default function UsageSettings() {
     try {
       // Connecting (or signing in with) Cloudflare is handled by the Cloudflare gatekeeper. Open its
       // OAuth popup; the connected-accounts subscription + focus refresh pick up the result.
-      const { url } = await authenticatedApi.connectAccount('cloudflare')
+      const { url } = await authenticatedApi.connectAccount('cloudflare', [])
       window.open(url, '_blank', 'noopener,noreferrer')
     } catch {
       toasts.add({ title: 'Failed to start Cloudflare connection', variant: 'error' })

@@ -1,14 +1,16 @@
-import { useState, useEffect, useRef, useMemo, useCallback, type MutableRefObject } from 'react'
+import { logRpcFailure } from './rpcErrors'
+import { useState, useEffect, useMemo, useCallback, type MutableRefObject } from 'react'
 import { Tooltip, useKumoToastManager } from '@cloudflare/kumo'
 import { Plus, CaretRight, Warning } from '@phosphor-icons/react'
-import { RpcStub, RpcTarget } from 'capnweb'
-import { AuthenticatedApi, ConnectedAccountsSubscriber } from '@gadgets/workshop-shared/api'
+import { RpcStub } from 'capnweb'
+import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
 import { AccountDescription, SupportedResource, VendorDescription } from '@gadgets/workshop-shared/gatekeeper'
 import { extractHostname, extractBaseUrl, matchesResource, matchesResourceText, classifyMatch, getPlaceholderRanges } from './resourceMatching'
 import { GatekeeperIcon } from './components/GatekeeperIcon'
 import {
   PICKER_CAPTION, PICKER_EMPTY, PICKER_ROW, PICKER_ROW_ACTIVE, TabHint,
 } from './components/pickerRows'
+import { AccountsSubscriberAdapter } from './accountsSubscriber'
 
 export interface VendorOption {
   id: string
@@ -27,8 +29,10 @@ export type SelectableItem = {
   type: 'connect'
   vendorId: string
   vendorDescription: VendorDescription
-  // If the resource being connected is independently grantable, its `urlPattern`, so a new account
-  // requests just that resource's authorization. Undefined means request everything.
+  /**
+   * If the resource being connected is independently grantable, its `urlPattern`, so a new account
+   * requests just that resource's authorization. Undefined means request everything.
+   */
   resourceUrlPatterns?: string[]
 } | {
   type: 'refine'
@@ -49,12 +53,16 @@ export interface ResourcePickerProps {
     vendorDescription: VendorDescription,
   ) => void
   onRefine?: (newUrl: string, placeholderStart: number, placeholderEnd: number) => void
-  // Fires once the vendors and the connected accounts are both known. Until then the list grows a
-  // row at a time, so a floating caller should stay hidden rather than resize under the pointer.
+  /**
+   * Fires once the vendors and the connected accounts are both known. Until then the list grows a
+   * row at a time, so a floating caller should stay hidden rather than resize under the pointer.
+   */
   onReadyChange?: (ready: boolean) => void
   compact?: boolean
-  // Room the caller has measured for the list. Applied on top of the built-in cap, never instead of
-  // it: a caller with plenty of space should still get a modestly sized panel.
+  /**
+   * Room the caller has measured for the list. Applied on top of the built-in cap, never instead of
+   * it: a caller with plenty of space should still get a modestly sized panel.
+   */
   maxHeight?: number
   style?: React.CSSProperties
   activeIndex?: number
@@ -106,16 +114,12 @@ export default function ResourcePicker({
   const [reconnectingAccount, setReconnectingAccount] = useState<number | null>(null)
   const [grantingAccount, setGrantingAccount] = useState<number | null>(null)
 
-  const subscriptionRef = useRef<{ stub: { [Symbol.dispose](): void } } | null>(null)
-  const seenAccountIdsRef = useRef(new Set<number>())
-
   // Subscribe to connected accounts on mount.
   useEffect(() => {
-    seenAccountIdsRef.current = new Set()
+    let cancelled = false
 
-    class AccountsSubscriber extends RpcTarget implements ConnectedAccountsSubscriber {
-      add(id: number, description: AccountDescription, vendor: VendorDescription, supportedResources: SupportedResource[] = [], credentialsValid: boolean = true, _vendorId: string = '') {
-        seenAccountIdsRef.current.add(id)
+    const subscriber = new AccountsSubscriberAdapter({
+      add({ id, description, vendor, supportedResources, credentialsValid }) {
         setAllAccounts(prev => {
           const next = new Map(prev)
           next.set(id, { description, vendor, supportedResources, credentialsValid })
@@ -125,53 +129,29 @@ export default function ResourcePicker({
         if (credentialsValid) {
           setReconnectingAccount(prev => prev === id ? null : prev)
         }
-      }
-
-      remove(id: number) {
-        seenAccountIdsRef.current.delete(id)
+      },
+      remove(id) {
         setAllAccounts(prev => {
           const next = new Map(prev)
           next.delete(id)
           return next
         })
-      }
-
+      },
       ready() {
         setAccountsLoaded(true)
-        const seen = seenAccountIdsRef.current
-        seenAccountIdsRef.current = new Set()
-        setAllAccounts(prev => {
-          let changed = false
-          const next = new Map(prev)
-          for (const id of next.keys()) {
-            if (!seen.has(id)) {
-              next.delete(id)
-              changed = true
-            }
-          }
-          return changed ? next : prev
-        })
-      }
-    }
-
-    const subscriber = new AccountsSubscriber()
-    const subscribe = async () => {
-      try {
-        const stub = await authenticatedApi.subscribeConnectedAccounts(subscriber)
-        subscriptionRef.current = { stub }
-      } catch (error) {
-        console.error('Failed to subscribe to connected accounts:', error)
-        // Nothing more is coming, so show what we have rather than hiding forever.
-        setAccountsLoaded(true)
-      }
-    }
-    subscribe()
+      },
+    })
+    const subscription = authenticatedApi.subscribeConnectedAccounts(subscriber)
+    subscription.catch(error => {
+      if (cancelled) return
+      logRpcFailure('Failed to subscribe to connected accounts:', error)
+      // Nothing more is coming, so show what we have rather than hiding forever.
+      setAccountsLoaded(true)
+    })
 
     return () => {
-      if (subscriptionRef.current) {
-        subscriptionRef.current.stub[Symbol.dispose]()
-        subscriptionRef.current = null
-      }
+      cancelled = true
+      subscription[Symbol.dispose]()
     }
   }, [authenticatedApi])
 

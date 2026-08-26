@@ -14,6 +14,10 @@ permissions:
 
 jobs:
   CLAssistant:
+    # Cloudflare's CLA covers contributions to the upstream repo only. On forks (like this one,
+    # where upstream commits arrive wholesale via sync merges) the check would demand signatures
+    # from upstream committers, so it only runs upstream — same guard as preview.yml.
+    if: github.repository_owner == 'cloudflare'
     runs-on: ubuntu-latest
     steps:
       - name: "CLA Assistant"

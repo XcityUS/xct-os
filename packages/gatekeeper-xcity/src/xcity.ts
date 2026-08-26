@@ -156,7 +156,7 @@ const NOT_CONFIGURED_HTML = `<!DOCTYPE html>
 <p>Please see the README.md for instructions on configuring an OAuth client ID and secret.</p>
 </body></html>`;
 
-// Main HTTP entrypoint — used only to initiate and complete the OAuth flow.
+/** Main HTTP entrypoint — used only to initiate and complete the OAuth flow. */
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(req.url);
@@ -283,10 +283,12 @@ export class UserAccount extends DurableObject<Env> {
     });
   }
 
-  // Verify the initiation nonce; mint a fresh OAuth nonce + PKCE pair. Returns the OAuth nonce
-  // (for the `state`) and the PKCE challenge (for the authorize URL), or null if invalid. The
-  // initiation link stays usable until it expires or the flow completes, so a browser bounced back
-  // to it mid-flow just restarts the redirect rather than seeing the "link expired" page.
+  /**
+   * Verify the initiation nonce; mint a fresh OAuth nonce + PKCE pair. Returns the OAuth nonce
+   * (for the `state`) and the PKCE challenge (for the authorize URL), or null if invalid. The
+   * initiation link stays usable until it expires or the flow completes, so a browser bounced back
+   * to it mid-flow just restarts the redirect rather than seeing the "link expired" page.
+   */
   async beginOAuthFlow(initiationNonce: string): Promise<{ oauthNonce: string; challenge: string; scopes: string[] } | null> {
     const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
     const initiation = stored?.stage === "initiation"
@@ -359,8 +361,10 @@ export class UserAccount extends DurableObject<Env> {
     return this.ctx.storage.kv.get<string>("refreshToken") !== undefined;
   }
 
-  // Returns a usable access token (refreshing if needed), or null if the credentials are gone or
-  // can no longer be refreshed (in which case the workshop is notified via credentialsExpired()).
+  /**
+   * Returns a usable access token (refreshing if needed), or null if the credentials are gone or
+   * can no longer be refreshed (in which case the workshop is notified via credentialsExpired()).
+   */
   async getAccessToken(): Promise<string | null> {
     const refreshToken = this.ctx.storage.kv.get<string>("refreshToken");
     if (!refreshToken) return null;
@@ -468,13 +472,15 @@ class XcityMediaConfiguratorUI extends RpcTarget implements XcityMediaConfigurat
   }
 }
 
-// Deliberately NOT @validateRpc(): the validator's runtime class decorator replaces the exported
-// class, and a durably-stored stub of the replaced class hangs on revival — dispatch never reaches
-// the method and the runtime cancels it ("code had hung"). Config-declared bindings resolve by
-// export name and are unaffected (GatekeeperVendor stays validated), but this class is exactly the
-// one the Workshop stores via allow_irrevocable_stub_storage. Its only caller is the Workshop over
-// typed RPC, so skipping arg validation here is the lesser evil. The Workshop's own undecorated
-// LoginConnectCallbackImpl is the working precedent: stored, revived and called on every sign-in.
+/**
+ * Deliberately NOT @validateRpc(): the validator's runtime class decorator replaces the exported
+ * class, and a durably-stored stub of the replaced class hangs on revival — dispatch never reaches
+ * the method and the runtime cancels it ("code had hung"). Config-declared bindings resolve by
+ * export name and are unaffected (GatekeeperVendor stays validated), but this class is exactly the
+ * one the Workshop stores via allow_irrevocable_stub_storage. Its only caller is the Workshop over
+ * typed RPC, so skipping arg validation here is the lesser evil. The Workshop's own undecorated
+ * LoginConnectCallbackImpl is the working precedent: stored, revived and called on every sign-in.
+ */
 export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImplProps>
                                 implements XcityGatekeeperUser {
   #account() {
@@ -562,8 +568,10 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     return { url: `${getBaseUrl(this.env)}/${this.ctx.props.userObjectId}/${initiationNonce}` };
   }
 
-  // Mint a verifier representing this account. Xcity media uses low-stakes observer handling:
-  // generated URLs are public outputs, and there is no Xcity ACL oracle for generated media.
+  /**
+   * Mint a verifier representing this account. Xcity media uses low-stakes observer handling:
+   * generated URLs are public outputs, and there is no Xcity ACL oracle for generated media.
+   */
   @skipRpcValidation()
   async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
     return this.ctx.exports.XcityVerifier({});

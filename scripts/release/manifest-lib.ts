@@ -110,6 +110,8 @@ export interface WranglerConfig {
   r2_buckets?: BindingDecl[];
   /** Worker Loader bindings (the Gadget sandbox). */
   worker_loaders?: BindingDecl[];
+  /** Same-script Durable Object namespace bindings (gatekeeper-xcity's account DO). */
+  durable_objects?: { bindings?: { name: string; class_name: string; script_name?: string }[] };
   /** Service bindings; targets become `$WORKER_NAME(<pkg>)` placeholders. */
   services?: ServiceBinding[];
   /** Browser Rendering binding (Gadget PDF exports). */
@@ -235,6 +237,9 @@ const HANDLED_CONFIG_KEYS = new Set([
   "$schema", "name", "main", "build", "compatibility_date", "compatibility_flags", "rules",
   "migrations", "observability", "kv_namespaces", "r2_buckets", "worker_loaders", "services",
   "assets", "vars",
+  // Same-script DO namespace bindings (no placeholders; the class ships with the worker).
+  // gatekeeper-xcity binds its account DO explicitly instead of reaching it via ctx.exports.
+  "durable_objects",
   // Browser Rendering (Gadget PDF exports). Unlike artifacts it is generally available, so it
   // passes through to customer instances as a placeholder-free binding, like the AI binding.
   "browser",
@@ -365,6 +370,15 @@ export function buildWorkerEntry(
   }
   for (const loader of config.worker_loaders ?? []) {
     bindings.push({ type: "worker_loader", name: loader.binding });
+  }
+  for (const dobj of config.durable_objects?.bindings ?? []) {
+    // Cross-script namespaces would need a $WORKER_NAME-style placeholder; fail closed until a
+    // worker actually declares one.
+    if (dobj.script_name) {
+      throw new Error(`${pkgName} binds Durable Object ${dobj.name} from another script; ` +
+          `this generator only handles same-script DO bindings.`);
+    }
+    bindings.push({ type: "durable_object_namespace", name: dobj.name, class_name: dobj.class_name });
   }
   for (const svc of config.services ?? []) {
     bindings.push({

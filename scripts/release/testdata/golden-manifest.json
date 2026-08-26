@@ -912,6 +912,86 @@
         "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/supabase"
       }
     },
+    "gatekeeper-xcity": {
+      "bindings": [
+        {
+          "class_name": "UserAccount",
+          "name": "USER_ACCOUNT",
+          "type": "durable_object_namespace"
+        },
+        {
+          "name": "CLIENT_ID",
+          "text": "$SECRET(CLIENT_ID)",
+          "type": "secret_text"
+        },
+        {
+          "name": "CLIENT_SECRET",
+          "text": "$SECRET(CLIENT_SECRET)",
+          "type": "secret_text"
+        }
+      ],
+      "compatibilityDate": "2026-02-02",
+      "compatibilityFlags": [
+        "allow_irrevocable_stub_storage",
+        "nodejs_als"
+      ],
+      "inputs": [
+        {
+          "kind": "secret",
+          "label": "OAuth client ID",
+          "name": "CLIENT_ID"
+        },
+        {
+          "kind": "secret",
+          "label": "OAuth client secret",
+          "name": "CLIENT_SECRET"
+        }
+      ],
+      "installable": true,
+      "kind": "gatekeeper",
+      "mainModule": "xcity.js",
+      "migrations": [
+        {
+          "new_sqlite_classes": [
+            "UserAccount"
+          ],
+          "tag": "v0"
+        },
+        {
+          "new_sqlite_classes": [
+            "XcityMediaGatekeeperImpl"
+          ],
+          "tag": "v1"
+        }
+      ],
+      "modules": [
+        {
+          "name": "abc123-types.txt",
+          "r2Key": "blobs/modules/8b7a31aa9e87cf3fc3b6518e4ad81dd221a299322705e67b130cc150b76868bc",
+          "sha256": "8b7a31aa9e87cf3fc3b6518e4ad81dd221a299322705e67b130cc150b76868bc",
+          "size": 20,
+          "type": "text"
+        },
+        {
+          "name": "xcity.js",
+          "r2Key": "blobs/modules/33bea2329cffbb956293e7aa4a0d88321764817afbeb57bfdaa1ed82ab543eaf",
+          "sha256": "33bea2329cffbb956293e7aa4a0d88321764817afbeb57bfdaa1ed82ab543eaf",
+          "size": 58,
+          "type": "esm"
+        }
+      ],
+      "observability": {
+        "enabled": true,
+        "head_sampling_rate": 1,
+        "logs": {
+          "invocation_logs": false
+        }
+      },
+      "shortName": "xcity",
+      "vars": {
+        "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/xcity"
+      }
+    },
     "gatekeeper-zoominfo": {
       "bindings": [
         {

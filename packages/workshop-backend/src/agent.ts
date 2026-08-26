@@ -147,9 +147,11 @@ export type AiChatAgentContext = {
    */
   alwaysAvailableCatalogs?: AgentCatalogSnapshot[];
 
-  // Xcity marketplace persona selected when this chat was created. `persona === null` records
-  // that the catalog selection was valid but tokenhub did not have the persona prompt at creation
-  // time, so the chat intentionally behaves like an ordinary coding-agent chat.
+  /**
+   * Xcity marketplace persona selected when this chat was created. `persona === null` records
+   * that the catalog selection was valid but tokenhub did not have the persona prompt at creation
+   * time, so the chat intentionally behaves like an ordinary coding-agent chat.
+   */
   xcityAgent?: {
     slug: string;
     displayName: string;

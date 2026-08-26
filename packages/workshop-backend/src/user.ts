@@ -824,8 +824,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   // Xcity wallet balance (optional KWH gate).
   // ---------------------------------------------------------------------------------------------
 
-  // Return the connected Xcity *gatekeeper* account stub, if any. The Xcity usage checker narrows it
-  // to XcityGatekeeperUser to obtain a usable GoTrue access token for wallet reads.
+  /**
+   * Return the connected Xcity *gatekeeper* account stub, if any. The Xcity usage checker narrows it
+   * to XcityGatekeeperUser to obtain a usable GoTrue access token for wallet reads.
+   */
   async getXcityGatekeeperAccount(): Promise<Fetcher<XcityGatekeeperUser> | null> {
     let nextAccountId = this.storage.nextAccountId.get();
     for (let id = 0; id < nextAccountId; id++) {
@@ -838,12 +840,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return null;
   }
 
-  // The cached Xcity wallet balance, or null if unset.
+  /** The cached Xcity wallet balance, or null if unset. */
   async getXcityWalletBalance(): Promise<XcityWalletBalance | null> {
     return this.storage.xcityWalletBalance.get();
   }
 
-  // Update the cached Xcity wallet balance in credits.
+  /** Update the cached Xcity wallet balance in credits. */
   async updateXcityWalletBalance(creditsRemaining: number | null): Promise<void> {
     let record = this.storage.xcityWalletBalance.get() ?? {};
     record.creditsRemaining = creditsRemaining;

@@ -103,7 +103,7 @@ export async function exchangeCode(
   }));
 }
 
-// Refresh an access token using a refresh token.
+/** Refresh an access token using a refresh token. */
 export async function refreshTokens(
   config: XcityOAuthConfig, refreshToken: string,
 ): Promise<TokenResponse | null> {

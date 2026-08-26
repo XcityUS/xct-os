@@ -5,12 +5,7 @@
     "lib": ["ESNext"],
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "types": ["@cloudflare/workers-types"],
-    "outDir": "./dist",
-    "declaration": true,
-    "sourceMap": true,
-    "noEmit": false,
-    "baseUrl": ".",
+    "types": ["./worker-configuration.d.ts"],
     "paths": {
       "@gadgets/backend-utils/*": ["../backend-utils/src/*"],
       "@gadgets/workshop-shared/*": ["../workshop-shared/src/*"]

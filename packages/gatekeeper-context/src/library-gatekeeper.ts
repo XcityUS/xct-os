@@ -5,9 +5,8 @@
 import { WorkerEntrypoint, DurableObject, RpcStub as NativeRpcStub, RpcTarget as NativeRpcTarget } from "cloudflare:workers";
 import { RpcStub } from "capnweb";
 import { validateRpc, skipRpcValidation } from "capnweb-validate";
-import { boundAgentCatalog } from "@gadgets/workshop-shared/gatekeeper";
 import type {
-  VendorDescription, AccountDescription, AgentCatalog, AgentCatalogRequest,
+  VendorDescription, AccountDescription, AgentCatalog,
   AppUiContext, GatekeeperUser, GatekeeperUiFrame, ApprovalQueue, ObservationAuthorizer,
   GatekeeperConnectCallback, GatekeeperConnectOptions, SupportedResource,
   Gatekeeper, GatekeeperUserVerifier, ResourceDescription, ActionKind,
@@ -18,8 +17,7 @@ import { ContextApiImpl, loadEnabledContextCollections } from "./context-api.js"
 import { ContextObserverTracker } from "./context-observers.js";
 import type { ContextVerifierApi } from "./context-observers.js";
 import {
-  buildAgentSkillCatalogEntries, buildAgentSkillCommands, buildAgentSkillMessage,
-  parseSkillManifest,
+  buildAgentSkillCommands, buildAgentSkillMessage, buildContextCatalog, parseSkillManifest,
   type CollectionSkills,
 } from "./agent-skill.js";
 import type { EnabledCollectionInfo } from "./context-types.js";
@@ -139,7 +137,7 @@ export class ContextAccount
     };
   }
 
-  // Return the gadget-side read-path class, scoped by this account's props.
+  /** Return the gadget-side read-path class, scoped by this account's props. */
   async getSingletonGatekeeperClass(): Promise<DurableObjectClass<Gatekeeper<any>>> {
     return this.ctx.exports.ContextGatekeeper({
       props: { sharingDomain: this.ctx.props.sharingDomain, accountId: this.ctx.props.accountId },
@@ -155,7 +153,7 @@ export class ContextAccount
     return { iframeHtml: APP_HTML, ui };
   }
 
-  // --- GatekeeperUser resource surface (no URL-addressed resources) ---
+  /** --- GatekeeperUser resource surface (no URL-addressed resources) --- */
   async getSupportedResources(): Promise<SupportedResource[]> {
     return [];
   }
@@ -165,11 +163,11 @@ export class ContextAccount
   startResourceConfigurator(_resourceUrlPattern: string): never {
     throw new Error("The Context Library has no URL-addressed resources.");
   }
-  // No grantable resource types, so nothing to authorize and no URL to return.
+  /** No grantable resource types, so nothing to authorize and no URL to return. */
   async ensureResources(_resourceUrlPatterns: string[]): Promise<{url?: string}> {
     return {};
   }
-  // Delete private collections; public collections are domain-owned.
+  /** Delete private collections; public collections are domain-owned. */
   async revoke(): Promise<void> {
     let domain = this.ctx.props.sharingDomain;
     let userLibrary = this.#userLibraries().get(
@@ -189,8 +187,10 @@ export class ContextAccount
     return null;
   }
 
-  // Mint a verifier tied to this account. ContextGatekeeper uses it to check whether a prospective
-  // observer can independently read each collection the Gadget has observed.
+  /**
+   * Mint a verifier tied to this account. ContextGatekeeper uses it to check whether a prospective
+   * observer can independently read each collection the Gadget has observed.
+   */
   @skipRpcValidation()
   async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
     return this.ctx.exports.ContextVerifier({ props: this.ctx.props });
@@ -311,30 +311,17 @@ export class ContextGatekeeper
     let manifest = parseSkillManifest(document.path, document.content);
     return {
       skillName: manifest.name,
-      message: buildAgentSkillMessage(document.content, args),
+      message: buildAgentSkillMessage(id, document.content, args),
     };
   }
 
   async getAgentCatalog(
-      request: AgentCatalogRequest,
       authorizer: NativeRpcStub<ObservationAuthorizer>): Promise<AgentCatalog> {
     let domain = this.ctx.props.sharingDomain;
     let userLibrary = this.#userLibraries().get(
       this.#userLibraries().idFromName(domainName(domain, this.ctx.props.accountId)));
     let collections = await loadEnabledContextCollections(this.env, domain, userLibrary);
-    let loaded = await this.#loadSkills(collections);
-    let skillEntries = buildAgentSkillCatalogEntries(loaded);
-    let collectionEntries = collections
-        .map(collection => ({
-          id: collection.id,
-          title: collection.title,
-          description: collection.description,
-        }))
-        .toSorted((left, right) =>
-          left.title.localeCompare(right.title) || left.id.localeCompare(right.id));
-    let entries = [...skillEntries, ...collectionEntries].toSorted((left, right) =>
-      left.title.localeCompare(right.title) || left.id.localeCompare(right.id));
-    let catalog = boundAgentCatalog(entries, request);
+    let catalog = buildContextCatalog(collections, await this.#loadSkills(collections));
     if (catalog.entries.length > 0) {
       let collectionIds = [...new Set(catalog.entries.map(entry => {
         let slash = entry.id.indexOf("/");
@@ -351,13 +338,15 @@ export class ContextGatekeeper
     return catalog;
   }
 
-  // Read-only gatekeeper: no side-effecting actions, so nothing is ever auto-approvable.
+  /** Read-only gatekeeper: no side-effecting actions, so nothing is ever auto-approvable. */
   async getAutoApprovableActions(): Promise<ActionKind[]> {
     return [];
   }
 
-  // The Context singleton is a broad binding over public and account-private collections. Track the
-  // collections actually revealed and verify every observer against each one.
+  /**
+   * The Context singleton is a broad binding over public and account-private collections. Track the
+   * collections actually revealed and verify every observer against each one.
+   */
   async addObserver(id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
     await this.#observers().addObserver(
       id, user as unknown as Fetcher<ContextVerifierApi>);
@@ -367,7 +356,7 @@ export class ContextGatekeeper
     this.#observers().removeObserver(id);
   }
 
-  // Read-only gatekeeper: no actions are submitted, so these callbacks should never run.
+  /** Read-only gatekeeper: no actions are submitted, so these callbacks should never run. */
   applyAction(_action: number): Promise<void> {
     throw new Error("The Context Library is read-only and implements no actions.");
   }
@@ -403,9 +392,11 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env, Gatekeepe
     };
   }
 
-  // Mint a fresh account capability with no user identity.
-  //
-  // Skip return validation: proxy-wrapping a WorkerEntrypoint stub breaks Workers serialization.
+  /**
+   * Mint a fresh account capability with no user identity.
+   *
+   * Skip return validation: proxy-wrapping a WorkerEntrypoint stub breaks Workers serialization.
+   */
   @skipRpcValidation()
   async createAccount(): Promise<Fetcher<GatekeeperUser>> {
     let sharingDomain = this.ctx.props.sharingDomain ?? DEFAULT_SHARING_DOMAIN;

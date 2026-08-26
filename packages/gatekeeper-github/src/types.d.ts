@@ -53,8 +53,8 @@ export interface GitHubRepo {
   /**
    * Searches issues in this repository.
    *
-   * The search is limited to this repository. `query.text` is a plain-text search
-   * string; the remaining fields are structured filters.
+   * The search is limited to this repository. `query.text` is matched as a literal phrase;
+   * search qualifiers in it are not interpreted. The remaining fields are structured filters.
    */
   searchIssues(query: GitHubIssueSearch): Promise<Cursor<GitHubIssueSummary>>;
 

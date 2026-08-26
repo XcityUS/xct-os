@@ -7,59 +7,88 @@
 // =======================================================================================
 // Types
 
-// Specifies constraints on an indexed list() operation.
+/** Specifies constraints on an indexed list() operation. */
 export type ListOptions<T = string> = {
-  // List starting at the given key, including the key itself.
+  /** List starting at the given key, including the key itself. */
   start?: T;
 
-  // List starting immediately after the given key.
+  /** List starting immediately after the given key. */
   startAfter?: T;
 
-  // List ending immediately before the given key.
+  /** List ending immediately before the given key. */
   end?: T;
 
-  // List only keys starting with the given prefix.
-  //
-  // This only makes sense for string keys, not integers.
+  /**
+   * List only keys starting with the given prefix.
+   *
+   * This only makes sense for string keys, not integers.
+   */
   prefix?: T extends string ? T : never;
 
-  // Stop after the given number of matches.
-  //
-  // Note that for non-unique indexes, this counts the number of matching keys, not the number of
-  // records. Hence, more than `limit` records may be returned. Meanwhile, a subsequent `list()` can
-  // use `startAfter` set to the last record's key and be assured that it won't miss anything.
+  /**
+   * Stop after the given number of matches.
+   *
+   * Note that for non-unique indexes, this counts the number of matching keys, not the number of
+   * records. Hence, more than `limit` records may be returned. Meanwhile, a subsequent `list()` can
+   * use `startAfter` set to the last record's key and be assured that it won't miss anything.
+   */
   limit?: number;
 
-  // Normally, keys are listed in ascending order. Set `reverse: true` to list in descending order.
-  //
-  // For non-unique indexes, this also reverses the order of matches for a particular key.
+  /**
+   * Normally, keys are listed in ascending order. Set `reverse: true` to list in descending order.
+   *
+   * For non-unique indexes, this also reverses the order of matches for a particular key.
+   */
   reverse?: boolean;
 
-  // When listing by an index where each record may have multiple keys, the default is to
-  // list a record again for each key within the list range. Set `dedupe: true` to list each
-  // record only once.
-  //
-  // Note that when used together with the `limit` option, the limit is enforced on the total
-  // number of matching keys, before de-duplication, hence de-duplication may cause the returned
-  // list to have fewer than `limit` keys even if the limit was reached. Keep in mind also that
-  // any de-duplication applies only within a single call to list(), so if you are making several
-  // `limit`ed calls in sequence to list incrementally, you may still get duplicates between calls.
-  // Generally, `limit` and `dedupe` don't work well together.
+  /**
+   * When listing by an index where each record may have multiple keys, the default is to
+   * list a record again for each key within the list range. Set `dedupe: true` to list each
+   * record only once.
+   *
+   * Note that when used together with the `limit` option, the limit is enforced on the total
+   * number of matching keys, before de-duplication, hence de-duplication may cause the returned
+   * list to have fewer than `limit` keys even if the limit was reached. Keep in mind also that
+   * any de-duplication applies only within a single call to list(), so if you are making several
+   * `limit`ed calls in sequence to list incrementally, you may still get duplicates between calls.
+   * Generally, `limit` and `dedupe` don't work well together.
+   */
   dedupe?: boolean;
 };
 
-// An index where each key matches exactly one record.
+/** An index where each key matches exactly one record. */
 export interface UniqueIndex<T, Key> {
   get(key: Key): T | undefined;
   list(options?: ListOptions<Key>): Iterable<T>;
   delete(key: Key): boolean;
+
+  /**
+   * Discard the index's contents and re-derive them from the collection's records. Indexes are
+   * only maintained at write time, so an index declared after records already exist starts empty
+   * (and updates to those records would corrupt it, or throw); a migration must rebuild() such an
+   * index before the records are touched. Throws if two records derive the same key.
+   */
+  rebuild(): void;
 }
 
-// An index where each key may match multiple records.
-export interface NonUniqueIndex<T, Key> {
-  get(key: Key): Iterable<T>;
+/** An index where each key may match multiple records. */
+export interface NonUniqueIndex<T, Key, PK extends string | number = string | number> {
+  /**
+   * List the records matching `key`, ordered by primary key. `options` ranges and pages over the
+   * matching records' primary keys. Note that `limit` here counts records, unlike in a top-level
+   * list(), where it counts index keys.
+   */
+  get(key: Key, options?: ListOptions<PK>): Iterable<T>;
   list(options?: ListOptions<Key>): Iterable<T>;
   delete(key: Key): number;
+
+  /**
+   * Discard the index's contents and re-derive them from the collection's records. Indexes are
+   * only maintained at write time, so an index declared after records already exist starts empty
+   * (and updates to those records would corrupt it, or throw); a migration must rebuild() such an
+   * index before the records are touched.
+   */
+  rebuild(): void;
 }
 
 type Key = string | number;
@@ -78,8 +107,8 @@ type UniqueIndexed<T, Indexes> = {
   [K in keyof Indexes]: UniqueIndex<T, RemoveArray<ReturnType<Indexes[K]>>>
 }
 
-type NonUniqueIndexed<T, Indexes> = {
-  [K in keyof Indexes]: NonUniqueIndex<T, RemoveArray<ReturnType<Indexes[K]>>>
+type NonUniqueIndexed<T, Indexes, PK extends Key = Key> = {
+  [K in keyof Indexes]: NonUniqueIndex<T, RemoveArray<ReturnType<Indexes[K]>>, PK>
 }
 
 export interface Subscriber<T> {
@@ -88,7 +117,14 @@ export interface Subscriber<T> {
   remove(record: T): void;
 }
 
-export interface Collection<T extends object, PrimaryKey = string> extends UniqueIndex<T, PrimaryKey> {
+/**
+ * A collection of records addressed by primary key.
+ */
+export interface Collection<T extends object, PrimaryKey = string> {
+  get(key: PrimaryKey): T | undefined;
+  list(options?: ListOptions<PrimaryKey>): Iterable<T>;
+  delete(key: PrimaryKey): boolean;
+
   put(value: T): void;
 
   subscribe(subscriber: Subscriber<T>): void;
@@ -160,7 +196,7 @@ type CollectionImpl<T extends object,
                     NonUniqueIndexes> =
     & Collection<T, PrimaryKeyType<T, PrimaryKey>>
     & UniqueIndexed<T, UniqueIndexes>
-    & NonUniqueIndexed<T, NonUniqueIndexes>;
+    & NonUniqueIndexed<T, NonUniqueIndexes, PrimaryKeyType<T, PrimaryKey> & Key>;
 
 type TypedStorageImpl<Collections, Singletons> = TypedStorage
   & {
@@ -273,6 +309,21 @@ class KvPrefixedView<T extends StorageValue> {
     return new KvPrefixedView(this.#kv, `${this.#name}.${name}`);
   }
 
+  /**
+   * Delete every child row (`name.` prefix) and record (`name:` prefix) under this view,
+   * unbuffered -- point deletes are permitted under an open list() cursor. Sweeping the raw key
+   * ranges also reclaims child rows orphaned by earlier inconsistencies, which a walk of the
+   * parent keys would never reach. The `name#` unique-id counter is intentionally kept: ids must
+   * never be reused.
+   */
+  deleteAll(): void {
+    for (let prefix of [`${this.#name}.`, `${this.#name}:`]) {
+      for (let [key, _] of this.#kv.list({prefix})) {
+        this.#kv.delete(key);
+      }
+    }
+  }
+
   getUnidqueId(): number {
     let key = `${this.#name}#`;
     let id = this.#kv.get<number>(key) || 0;
@@ -367,14 +418,15 @@ function createCollection<
 
   // Add a subscriber subscribing on behalf of an index based on the given IndexFunction. This
   // code is shared for unique and non-unique indexes. This code in particular takes care of the
-  // case where the index function returns an array.
+  // case where the index function returns an array. Returns the subscriber's add(), so callers
+  // can also feed pre-existing records into the index (see rebuild()).
   function addIndexSubscriber(
       idx: IndexFunction<T>,
       ops: {
         add(idxKey: Key, pk: Key, type: "Insertion" | "Update"): void;
         remove(idxKey: Key, pk: Key): void;
-      }) {
-    subscribers.add({
+      }): (record: T) => void {
+    let subscriber: Subscriber<T> = {
       add(record: T) {
         let pk = pkForT(record);
         let idxKeys = idx(record);
@@ -443,7 +495,9 @@ function createCollection<
           ops.remove(idxKeys, pk);
         }
       }
-    });
+    };
+    subscribers.add(subscriber);
+    return subscriber.add;
   }
 
   // ---------------------------------------------------------------------------
@@ -451,6 +505,22 @@ function createCollection<
 
   for (let [idxName, idx] of Object.entries(schema.uniqueIndexes || {})) {
     let idxKv = new KvPrefixedView<Key>(storage.kv, `${name}.${idxName}`);
+
+    let addToIndex = addIndexSubscriber(idx as IndexFunction<T>, {
+      add(idxKey: Key, pk: Key, type: "Insertion" | "Update") {
+        let oldValue = idxKv.get(idxKey);
+        if (oldValue !== undefined) {
+          throw new Error(`${type} conflicts with record '${oldValue}' in '${name}.${idxName}'.`);
+        }
+        idxKv.put(idxKey, pk);
+      },
+      remove(idxKey: Key, pk: Key) {
+        if (!idxKv.delete(idxKey)) {
+          throw new Error(
+              `Index '${name}.${idxName}' is inconsistent: removed record is not present.`);
+        }
+      }
+    });
 
     let index: UniqueIndex<T, Key> = {
       get(key: Key): T | undefined {
@@ -476,24 +546,19 @@ function createCollection<
         let pk = idxKv.get(key);
         return pk === undefined ? false : collection.delete(pk);
       },
+      rebuild(): void {
+        // One transaction, so a mid-scan throw (e.g. a key conflict) can't leave the index
+        // partially built after the wipe. The adds are point reads/writes, permitted under the
+        // record scan's open cursor.
+        storage.transactionSync(() => {
+          idxKv.deleteAll();
+          for (let record of collection.list()) {
+            addToIndex(record);
+          }
+        });
+      },
     };
     result[idxName] = index;
-
-    addIndexSubscriber(idx as IndexFunction<T>, {
-      add(idxKey: Key, pk: Key, type: "Insertion" | "Update") {
-        let oldValue = idxKv.get(idxKey);
-        if (oldValue !== undefined) {
-          throw new Error(`${type} conflicts with record '${oldValue}' in '${name}.${idxName}'.`);
-        }
-        idxKv.put(idxKey, pk);
-      },
-      remove(idxKey: Key, pk: Key) {
-        if (!idxKv.delete(idxKey)) {
-          throw new Error(
-              `Index '${name}.${idxName}' is inconsistent: removed record is not present.`);
-        }
-      }
-    });
   }
 
   // ---------------------------------------------------------------------------
@@ -502,12 +567,38 @@ function createCollection<
   for (let [idxName, idx] of Object.entries(schema.nonUniqueIndexes || {})) {
     let idxKv = new KvPrefixedView<number>(storage.kv, `${name}.${idxName}`);
 
+    let addToIndex = addIndexSubscriber(idx as IndexFunction<T>, {
+      add(idxKey: Key, pk: Key, type: "Insertion" | "Update") {
+        let id = idxKv.get(idxKey);
+        if (id === undefined) {
+          id = idxKv.getUnidqueId();
+          idxKv.put(idxKey, id);
+        }
+
+        let child = idxKv.getChild(id.toString());
+        child.put(pk, {});
+      },
+      remove(idxKey: Key, pk: Key) {
+        let id = idxKv.get(idxKey);
+        if (id === undefined) {
+          throw new Error(
+              `Index '${name}.${idxName}' is inconsistent: removed record is not present.`);
+        }
+
+        let child = idxKv.getChild(id.toString());
+        child.delete(pk);
+        if (Array.from(child.list({limit: 1})).length == 0) {
+          idxKv.delete(idxKey);
+        }
+      }
+    });
+
     let index: NonUniqueIndex<T, Key> = {
-      *get(key: Key): Generator<T, void> {
+      *get(key: Key, options?: ListOptions<Key>): Generator<T, void> {
         let id = idxKv.get(key)
         if (id === undefined) return;
         let child = idxKv.getChild(id.toString());
-        for (let pk of child.listKeys()) {
+        for (let pk of child.listKeys(options)) {
           yield collection.get(pk)!;
         }
       },
@@ -554,34 +645,19 @@ function createCollection<
           return count;
         }
       },
+      rebuild(): void {
+        // One transaction, so a mid-scan throw (e.g. a key conflict) can't leave the index
+        // partially built after the wipe. The adds are point reads/writes, permitted under the
+        // record scan's open cursor.
+        storage.transactionSync(() => {
+          idxKv.deleteAll();
+          for (let record of collection.list()) {
+            addToIndex(record);
+          }
+        });
+      },
     };
     result[idxName] = index;
-
-    addIndexSubscriber(idx as IndexFunction<T>, {
-      add(idxKey: Key, pk: Key, type: "Insertion" | "Update") {
-        let id = idxKv.get(idxKey);
-        if (id === undefined) {
-          id = idxKv.getUnidqueId();
-          idxKv.put(idxKey, id);
-        }
-
-        let child = idxKv.getChild(id.toString());
-        child.put(pk, {});
-      },
-      remove(idxKey: Key, pk: Key) {
-        let id = idxKv.get(idxKey);
-        if (id === undefined) {
-          throw new Error(
-              `Index '${name}.${idxName}' is inconsistent: removed record is not present.`);
-        }
-
-        let child = idxKv.getChild(id.toString());
-        child.delete(pk);
-        if (Array.from(child.list({limit: 1})).length == 0) {
-          idxKv.delete(idxKey);
-        }
-      }
-    });
   }
 
   // ---------------------------------------------------------------------------

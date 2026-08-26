@@ -56,14 +56,40 @@ const AVATAR = {
 
 type VerifyOutcome = { allow: true } | { allow: false; reason: string };
 
+/**
+ * One addObserver()/removeObserver() call, mirrored here as it happens: the gatekeeper is a facet
+ * under the gadget's Overseer, unreachable from this worker's routes, and a log (not a boolean)
+ * also pins the add/remove ordering.
+ */
+type ObserverEvent = { resourceUrl: string; type: "add" | "remove"; id: string };
+
+function outcomeKey(label: string, resourceUrl?: string): string {
+  return resourceUrl ? `outcome:${label}:${resourceUrl}` : `outcome:${label}`;
+}
+
 export class TestControl extends DurableObject<Cloudflare.Env> {
-  setVerifyOutcome(label: string, outcome: VerifyOutcome): void {
-    this.ctx.storage.kv.put(`outcome:${label}`, outcome);
+  setVerifyOutcome(label: string, outcome: VerifyOutcome, resourceUrl?: string): void {
+    this.ctx.storage.kv.put(outcomeKey(label, resourceUrl), outcome);
   }
 
-  getVerifyOutcome(label: string): VerifyOutcome {
-    // Default to admitting: a collaborator's first open has to be able to succeed.
-    return this.ctx.storage.kv.get<VerifyOutcome>(`outcome:${label}`) ?? { allow: true };
+  getVerifyOutcome(label: string, resourceUrl?: string): VerifyOutcome {
+    // A resource-specific outcome wins over a label-wide one. Default to admitting: a
+    // collaborator's first open has to be able to succeed.
+    return this.ctx.storage.kv.get<VerifyOutcome>(outcomeKey(label, resourceUrl))
+        ?? this.ctx.storage.kv.get<VerifyOutcome>(outcomeKey(label))
+        ?? { allow: true };
+  }
+
+  recordObserverEvent(event: ObserverEvent): void {
+    const events = this.ctx.storage.kv.get<ObserverEvent[]>("observer-events") ?? [];
+    events.push(event);
+    this.ctx.storage.kv.put("observer-events", events);
+  }
+
+  /** Filtered here rather than in the test: tests run concurrently against one shared log. */
+  getObserverEvents(resourceUrl: string): ObserverEvent[] {
+    return (this.ctx.storage.kv.get<ObserverEvent[]>("observer-events") ?? [])
+        .filter(e => e.resourceUrl === resourceUrl);
   }
 
   recordAmbientVerification(label: string): void {
@@ -101,8 +127,10 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
     };
   }
 
-  // Reached via provisionAmbientAccount(). Each call mints a distinct account, so two users -- or two
-  // concurrent tests -- never share one.
+  /**
+   * Reached via provisionAmbientAccount(). Each call mints a distinct account, so two users -- or two
+   * concurrent tests -- never share one.
+   */
   async createAccount(): Promise<Fetcher<GatekeeperUser>> {
     const label = `test-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}@${VENDOR_HOST}`;
     return this.ctx.exports.TestAccount({ props: { label } });
@@ -116,8 +144,10 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
     return TYPES_CODE;
   }
 
-  // Required by the interface but unreachable: autoProvisionsAccount means the Workshop mints
-  // accounts through createAccount() and never offers a connect flow.
+  /**
+   * Required by the interface but unreachable: autoProvisionsAccount means the Workshop mints
+   * accounts through createAccount() and never offers a connect flow.
+   */
   async connectAccount(_callback: Fetcher<GatekeeperConnectCallback>): Promise<{ url: string }> {
     throw new Error("The test gatekeeper auto-provisions accounts; it has no connect flow.");
   }
@@ -148,8 +178,10 @@ export class TestAccount
     return SUPPORTED_RESOURCES;
   }
 
-  // Bind a resource. The Workshop calls this when the owner pastes a URL; the returned class becomes
-  // a Gatekeeper facet under that gadget's Overseer.
+  /**
+   * Bind a resource. The Workshop calls this when the owner pastes a URL; the returned class becomes
+   * a Gatekeeper facet under that gadget's Overseer.
+   */
   async getGatekeeperClassFor(url: string): Promise<{
     class: DurableObjectClass<Gatekeeper<TestSession>>;
     resource: SupportedResource;
@@ -166,7 +198,7 @@ export class TestAccount
     };
   }
 
-  // The capability the overseer hands to addObserver() to say "this is the user asking".
+  /** The capability the overseer hands to addObserver() to say "this is the user asking". */
   async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
     return this.ctx.exports.TestVerifier({ props: this.ctx.props });
   }
@@ -258,18 +290,21 @@ export class TestGatekeeper
    */
   async addObserver(id: string, user: Fetcher<TestVerifierApi>): Promise<void> {
     const label = await user.identify();
+    const { resourceUrl } = this.ctx.props;
     if (this.ctx.props.ambient) {
       await control(this.ctx.exports).recordAmbientVerification(label);
-      this.ctx.storage.kv.put(`observer:${id}`, label);
-      return;
+    } else {
+      const outcome = await control(this.ctx.exports).getVerifyOutcome(label, resourceUrl);
+      if (!outcome.allow) throw new Error(outcome.reason);
     }
-    const outcome = await control(this.ctx.exports).getVerifyOutcome(label);
-    if (!outcome.allow) throw new Error(outcome.reason);
     this.ctx.storage.kv.put(`observer:${id}`, label);
+    await control(this.ctx.exports).recordObserverEvent({ resourceUrl, type: "add", id });
   }
 
   async removeObserver(id: string): Promise<void> {
     this.ctx.storage.kv.delete(`observer:${id}`);
+    await control(this.ctx.exports).recordObserverEvent(
+        { resourceUrl: this.ctx.props.resourceUrl, type: "remove", id });
   }
 
   async applyAction(_action: number): Promise<void> {
@@ -319,21 +354,36 @@ export default {
       }
     }
 
-    // Set what addObserver() should do for one account.
-    // Body: {"label": "...", "allow": false, "reason": "..."}
+    // Set what addObserver() should do for one account, either everywhere or (when `resourceUrl`
+    // is given) at one binding only.
+    // Body: {"label": "...", "allow": false, "reason": "...", "resourceUrl": "..."}
     if (url.pathname === "/control/verify-outcome" && req.method === "POST") {
-      const { label, allow, reason } = body as Record<string, unknown>;
+      const { label, allow, reason, resourceUrl } = body as Record<string, unknown>;
       if (!isNonEmptyString(label)) return badRequest("`label` must be a non-empty string");
       if (typeof allow !== "boolean") return badRequest("`allow` must be a boolean");
       if (reason !== undefined && typeof reason !== "string") {
         return badRequest("`reason` must be a string when present");
       }
+      if (resourceUrl !== undefined && !isNonEmptyString(resourceUrl)) {
+        return badRequest("`resourceUrl` must be a non-empty string when present");
+      }
 
       const outcome: VerifyOutcome = allow
         ? { allow: true }
         : { allow: false, reason: reason ?? "The test gatekeeper refused this account." };
-      await control(ctx.exports).setVerifyOutcome(label, outcome);
+      await control(ctx.exports).setVerifyOutcome(label, outcome, resourceUrl);
       return new Response(null, { status: 204 });
+    }
+
+    // Read back the addObserver()/removeObserver() calls one binding's gatekeeper has seen, in
+    // order.
+    // Body: {"resourceUrl": "..."} -> {"events": [{"resourceUrl", "type", "id"}, ...]}
+    if (url.pathname === "/control/observer-events" && req.method === "POST") {
+      const { resourceUrl } = body as Record<string, unknown>;
+      if (!isNonEmptyString(resourceUrl)) {
+        return badRequest("`resourceUrl` must be a non-empty string");
+      }
+      return Response.json({ events: await control(ctx.exports).getObserverEvents(resourceUrl) });
     }
 
     if (url.pathname === "/control/ambient-verification-count" && req.method === "POST") {

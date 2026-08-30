@@ -1,6 +1,7 @@
 import { createWorkshopLogger } from "../observability.js";
 import type { XcityConfig } from "./config.js";
 import { isSafeXcityAgentSlug } from "./agent-catalog.js";
+import { fetchWithOneRetry } from "./fetch-retry.js";
 import {
   XcityModelPlane,
   type XcityModelPlaneStorage,
@@ -87,10 +88,10 @@ async function fetchSkillIndex(apiKey: string, config: XcityConfig): Promise<Map
 
     let response: Response;
     try {
-      response = await fetch(url, {
+      response = await fetchWithOneRetry(url, () => ({
         headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
         signal: AbortSignal.timeout(15_000),
-      });
+      }));
     } catch (error) {
       logger.warn("xcity skill index request failed", {
         event: "xcity.agent.persona.index.failed", error,
@@ -163,13 +164,14 @@ async function fetchPersona(apiKey: string, config: XcityConfig, slug: string): 
 
   let response: Response;
   try {
-    response = await fetch(`${config.tokenhubUrl}/v1/xct-skills/${encodeURIComponent(skillId)}`, {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        Accept: "application/json",
-      },
-      signal: AbortSignal.timeout(10_000),
-    });
+    response = await fetchWithOneRetry(
+        `${config.tokenhubUrl}/v1/xct-skills/${encodeURIComponent(skillId)}`, () => ({
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            Accept: "application/json",
+          },
+          signal: AbortSignal.timeout(10_000),
+        }));
   } catch (error) {
     logger.warn("xcity agent persona request failed", {
       event: "xcity.agent.persona.failed", agentSlug: slug, error,

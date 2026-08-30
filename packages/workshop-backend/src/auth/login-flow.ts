@@ -132,6 +132,14 @@ export class LoginConnectCallbackImpl
             await (account as unknown as Fetcher<XcityGatekeeperUser>).getXcityUserId();
         if (xcityUserId) {
           await userStub.setXcityIdentity({ userId: xcityUserId, email });
+          // Prewarm the model plane and agent catalog off the login path, so the frontend's
+          // first model/agent listing after sign-in is served from a warm cache instead of a
+          // possibly cold-starting tokenhub/wallet. Best-effort fire-and-forget.
+          this.ctx.waitUntil(userStub.prewarmXcityModelPlane().catch((err: unknown) => {
+            loginLogger.warn("xcity login prewarm failed", {
+              event: "xcity.login.prewarm.failed", error: err,
+            });
+          }));
         } else {
           loginLogger.warn("xcity login had no user id", {
             event: "xcity.login.user.id.missing",

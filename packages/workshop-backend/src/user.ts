@@ -682,6 +682,23 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.storage.preferredModel.put(id);
   }
 
+  /**
+   * Warms the Xcity model plane (per-user tokenhub key + model catalog) and the agent catalog so
+   * the frontend's first post-login requests hit warm caches. Best-effort: never throws, and a
+   * no-op when the Xcity model plane is not configured or the user has no Xcity identity.
+   */
+  async prewarmXcityModelPlane(): Promise<void> {
+    try {
+      // #getXcityModelPlane mints the key and loads the catalog into this DO's cache.
+      await this.#getXcityModelPlane();
+      await this.listXcityAgents();
+    } catch (err) {
+      logger.warn("xcity prewarm failed", {
+        event: "xcity.prewarm.failed", error: err,
+      });
+    }
+  }
+
   async listXcityAgents(): Promise<XcityCatalogAgent[]> {
     if (!getXcityAgentMarketplaceConfig(this.env)) return [];
     return listXcityAgents(this.env);

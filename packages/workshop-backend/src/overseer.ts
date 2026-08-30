@@ -5291,6 +5291,7 @@ class OverseerImpl implements AgentHooks {
     // modified in the chat (see ChatCodeBase). Until then the chat reads committed code live at
     // each gadget's current head.
     let chatId!: number;
+    let promptSequence: number | undefined;
     let timestamp = this.getChatTimestamp();
     this.ctx.storage.transactionSync(() => {
       chatId = this.nextChatId();
@@ -5318,7 +5319,7 @@ class OverseerImpl implements AgentHooks {
         });
       }
 
-      let promptSequence = this.#commitPreparedChatMessage(
+      promptSequence = this.#commitPreparedChatMessage(
           chatId, timestamp, userMeta.profile, prepared, capsules, canonicalAttachments, formats);
       if (responseTargetRegistration) {
         if (promptSequence === undefined) {
@@ -5338,6 +5339,9 @@ class OverseerImpl implements AgentHooks {
 
     if (prepared.message !== undefined && userMeta.aiModel) {
       let needsAgentTurnKeepAlive = responseTargetRegistration !== undefined;
+      if (xcityAgent?.persona != null && promptSequence !== undefined) {
+        this.#debitXcitySkillUse(clientUser, chatId, promptSequence, xcityAgent.info.slug);
+      }
       this.startAgent(chatId, userMeta.aiModel, userMeta.profile,
                       clientUser.id.toString(), false, needsAgentTurnKeepAlive);
     }
@@ -5357,6 +5361,26 @@ class OverseerImpl implements AgentHooks {
     });
 
     return chatId;
+  }
+
+  // Bill one skill-use to the prompting user's Xcity wallet when this chat runs with a priced
+  // marketplace persona. Fires only from the two user-prompt entry points (newChat /
+  // sendChatMessage), so callback continuations, retries, and resumes never re-bill; the prompt's
+  // message sequence makes the wallet idempotency key stable for the turn and distinct across
+  // turns. Fire-and-forget: the User DO fails open and this must never delay or block the turn.
+  // Chats only carry `xcityAgent` context when the Xcity marketplace env is configured, so this is
+  // never reached on non-Xcity deployments.
+  #debitXcitySkillUse(
+      clientUser: DurableObjectStub<UserDurableObject>,
+      chatId: number, promptSequence: number, slug: string): void {
+    let chatRef = `${this.ctx.id.toString()}:${chatId}`;
+    let requestId = `xct-skill:${chatRef}:${promptSequence}`;
+    this.ctx.waitUntil(
+        clientUser.debitXcitySkillUse(slug, requestId, chatRef).catch((err: unknown) => {
+          this.logger.warn("xcity skill-use debit dispatch failed", {
+            event: "xcity.skill.debit.dispatch.failed", agentSlug: slug, chatId, error: err,
+          });
+        }));
   }
 
   async #resolveXcityAgentPersona(
@@ -5406,9 +5430,10 @@ class OverseerImpl implements AgentHooks {
     if (runsAgentTurn && userMeta.aiModel) {
       meta.activeAgent = userMeta.aiModel.profile;
     }
+    let promptSequence: number | undefined;
     this.ctx.storage.transactionSync(() => {
       this.storage.chatMeta.put(meta);
-      let promptSequence = this.#commitPreparedChatMessage(
+      promptSequence = this.#commitPreparedChatMessage(
           chatId, meta.lastActive, userMeta.profile, prepared, capsules, canonicalAttachments,
           formats);
       if (responseTargetRegistration) {
@@ -5426,6 +5451,10 @@ class OverseerImpl implements AgentHooks {
 
     if (runsAgentTurn && userMeta.aiModel) {
       let needsAgentTurnKeepAlive = responseTargetRegistration !== undefined;
+      let xcityAgent = this.storage.chatContext.get(chatId)?.xcityAgent;
+      if (xcityAgent?.persona != null && promptSequence !== undefined) {
+        this.#debitXcitySkillUse(clientUser, chatId, promptSequence, xcityAgent.slug);
+      }
       this.startAgent(chatId, userMeta.aiModel, userMeta.profile,
                       clientUser.id.toString(), false, needsAgentTurnKeepAlive);
     }

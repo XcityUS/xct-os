@@ -12,6 +12,7 @@ import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-bi
 import { getXcityAgentMarketplaceConfig, getXcityConfig } from "./xcity/config.js";
 import { getXcityAgent, isSafeXcityAgentSlug, listXcityAgents } from "./xcity/agent-catalog.js";
 import { getXcityAgentPersona } from "./xcity/agent-persona.js";
+import { debitXcitySkillUseForTurn } from "./xcity/skill-billing.js";
 import {
   XcityModelPlane,
   XCITY_VENDOR_ID,
@@ -749,6 +750,24 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       },
       persona,
     };
+  }
+
+  /**
+   * Debit this user's Xcity wallet for one use of a priced marketplace skill. Called by the
+   * overseer once per user-prompted chat turn that runs with an active persona; `requestId` is the
+   * turn's idempotency key. Fail-open no-op when the marketplace is unconfigured, the user has no
+   * Xcity identity, or the skill is unpriced — billing must never block or fail a turn.
+   */
+  async debitXcitySkillUse(slug: string, requestId: string, chatRef?: string): Promise<void> {
+    let identity = this.storage.xcityIdentity.get();
+    await debitXcitySkillUseForTurn(
+        this.env,
+        this.storage.xcityModelPlane,
+        identity,
+        slug,
+        requestId,
+        chatRef,
+        identity?.email ?? this.storage.profile.get().id);
   }
 
   async #getXcityAgentPersona(slug: string): Promise<string | null> {

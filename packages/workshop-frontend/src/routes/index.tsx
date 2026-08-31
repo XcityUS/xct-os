@@ -68,11 +68,15 @@ export function HomePageContent({ prompt, agent }: HomeSearch) {
 
   useEffect(() => {
     let cancelled = false;
-    authenticatedApi.listModels()
-      .then((list) => {
+    Promise.all([
+      authenticatedApi.listModels(),
+      // The default model set on /providers; older backends may not implement it.
+      authenticatedApi.getQuickModel().catch(() => null),
+    ])
+      .then(([list, defaultModelId]) => {
         if (cancelled) return;
         setModels(list);
-        setSelectedModel(getStoredSelectedModel(list));
+        setSelectedModel(getStoredSelectedModel(list, defaultModelId));
       })
       .catch((err) => {
         logRpcFailure("Failed to fetch models:", err);

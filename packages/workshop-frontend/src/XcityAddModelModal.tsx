@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Dialog, Button, useKumoToastManager } from '@cloudflare/kumo'
-import { MagnifyingGlass, Plus } from '@phosphor-icons/react'
+import { Check, MagnifyingGlass, Plus } from '@phosphor-icons/react'
 import { RpcStub } from 'capnweb'
 import { AuthenticatedApi, XcityCatalogModel } from '@gadgets/workshop-shared/api'
 
@@ -38,8 +38,9 @@ export default function XcityAddModelModal({
     }
   }, [visible])
 
-  const hiddenModels = catalog.filter((m) => m.hidden)
-  const filtered = hiddenModels.filter((m) => {
+  // Show the whole catalog, not just hidden models: rows already in the list render as "Added",
+  // so the dialog doubles as a view of everything TokenHub grants this plan.
+  const filtered = catalog.filter((m) => {
     if (!search) return true
     const q = search.toLowerCase()
     return m.name.toLowerCase().includes(q) || m.id.toLowerCase().includes(q)
@@ -64,7 +65,8 @@ export default function XcityAddModelModal({
       <Dialog className="responsive-dialog overflow-y-auto p-6" size="lg">
         <Dialog.Title className="text-lg font-semibold mb-1">Add model</Dialog.Title>
         <p className="mb-4 text-[13px] leading-[18px] tracking-[-0.25px] text-kumo-subtle">
-          Models you removed from your list can be added back here.
+          Every model TokenHub grants your plan. Models you removed from your list can be added
+          back here.
         </p>
 
         {catalog.length === 0 ? (
@@ -73,10 +75,6 @@ export default function XcityAddModelModal({
           <div className="py-10 text-center text-[13px] leading-[18px] text-kumo-subtle">
             TokenHub hasn't made any models available to your plan yet. Check your plan's
             model list on the Xcity dashboard, or contact an administrator.
-          </div>
-        ) : hiddenModels.length === 0 ? (
-          <div className="py-10 text-center text-[13px] leading-[18px] text-kumo-subtle">
-            All TokenHub models are already in your list.
           </div>
         ) : (
           <>
@@ -114,16 +112,23 @@ export default function XcityAddModelModal({
                         {model.id}
                       </span>
                     </div>
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      loading={addingId === model.id}
-                      disabled={addingId !== null && addingId !== model.id}
-                      onClick={() => handleAdd(model)}
-                    >
-                      <Plus size={13} weight="bold" />
-                      Add
-                    </Button>
+                    {model.hidden ? (
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        loading={addingId === model.id}
+                        disabled={addingId !== null && addingId !== model.id}
+                        onClick={() => handleAdd(model)}
+                      >
+                        <Plus size={13} weight="bold" />
+                        Add
+                      </Button>
+                    ) : (
+                      <span className="inline-flex shrink-0 items-center gap-1 text-[12px] font-medium tracking-[-0.1px] text-kumo-subtle">
+                        <Check size={13} weight="bold" />
+                        Added
+                      </span>
+                    )}
                   </div>
                 ))}
               </div>

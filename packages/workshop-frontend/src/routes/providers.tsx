@@ -67,7 +67,7 @@ function ModelRow({
           onSetQuick()
         }
       }}
-      title={isQuick ? 'Quick model. Click to clear' : 'Click to set as quick model'}
+      title={isQuick ? 'Default model. Click to clear' : 'Click to set as default model'}
       className="group flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2.5 transition-colors duration-150 ease-out hover:bg-kumo-tint"
     >
       {/* Neutral monogram — matches the sidebar/workspaces treatment */}
@@ -94,7 +94,7 @@ function ModelRow({
           {isQuick && (
             <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[rgba(255,72,1,0.10)] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.4px] text-kumo-brand">
               <Lightning size={9} weight="fill" />
-              quick
+              default
             </span>
           )}
         </div>
@@ -119,7 +119,7 @@ function ModelRow({
           <DropdownMenu.Content className={MENU_CONTENT}>
             <DropdownMenu.Item onClick={onSetQuick} className={MENU_ITEM}>
               <Lightning size={13} className="mr-2" weight={isQuick ? 'fill' : 'regular'} />
-              {isQuick ? 'Clear quick model' : 'Set as quick model'}
+              {isQuick ? 'Clear default model' : 'Set as default model'}
             </DropdownMenu.Item>
             {!isBuiltIn && !isTokenhub && (
               <DropdownMenu.Item variant="danger" onClick={onDelete} className={MENU_ITEM_DANGER}>
@@ -401,11 +401,11 @@ function ProvidersPage() {
               <Notice>
                 <Lightning size={15} className="mt-px shrink-0 text-kumo-brand" />
                 <span>
-                  <strong className="font-medium text-kumo-default">Quick model:</strong>{' '}
+                  <strong className="font-medium text-kumo-default">Default model:</strong>{' '}
                   {quickModel
                     ? `${models.find((m) => m.id === quickModel)?.name ?? quickModel}.`
                     : 'none set.'}{' '}
-                  Used for fast tasks like generating chat titles. Click a model to set it.
+                  Used for new chats, agents, and fast tasks like generating chat titles. Click a model to set it.
                 </span>
               </Notice>
             )}

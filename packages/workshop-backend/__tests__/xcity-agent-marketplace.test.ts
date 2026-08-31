@@ -46,8 +46,8 @@ function makeStorage(): XcityModelPlaneStorage {
   };
 }
 
-afterEach(() => {
-  clearXcityAgentCatalogCacheForTests();
+afterEach(async () => {
+  await clearXcityAgentCatalogCacheForTests();
   clearXcityAgentPersonaCacheForTests();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -84,13 +84,17 @@ describe("Xcity agent catalog", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("returns an empty list for degraded catalogs", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({
+  it("serves a degraded catalog when nothing is cached, without caching it", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({
       degraded: true,
       data: [{ id: "agent-1", slug: "builder", displayName: "Builder" }],
-    })));
+    }));
+    vi.stubGlobal("fetch", fetchMock);
 
-    await expect(listXcityAgents(ENV)).resolves.toEqual([]);
+    await expect(listXcityAgents(ENV)).resolves.toMatchObject([{ slug: "builder" }]);
+    // The degraded snapshot is not cached: the next call goes back upstream for a full catalog.
+    await expect(listXcityAgents(ENV)).resolves.toMatchObject([{ slug: "builder" }]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("rejects unsafe slugs without fetching the catalog", async () => {

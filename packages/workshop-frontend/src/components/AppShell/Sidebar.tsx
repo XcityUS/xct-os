@@ -21,6 +21,7 @@ import {
   SidebarWorkspacesLists,
 } from './SidebarWorkspaces'
 import SidebarUtilityStrip from './SidebarUtilityStrip'
+import SidebarBuildVersion from './SidebarBuildVersion'
 
 /**
  * The persistent left rail. Three pinned regions sandwich a single scrolling region of lists, so
@@ -200,6 +201,7 @@ export default function Sidebar({
       </SidebarWorkspacesProvider>
 
       <SidebarUtilityStrip collapsed={collapsed} />
+      <SidebarBuildVersion collapsed={collapsed} />
     </aside>
   )
 }

@@ -63,6 +63,10 @@ describe("getXcityProviderInfoForUser", () => {
       email: "user@example.com",
       apiKey: "sk-tokenhub-user",
       modelIds: ["gpt-5.5-xhigh", "cheap-model"],
+      catalog: [
+        { id: "gpt-5.5-xhigh", name: "gpt-5.5-xhigh", hidden: false },
+        { id: "cheap-model", name: "cheap-model", hidden: false },
+      ],
     });
   });
 
@@ -85,6 +89,7 @@ describe("getXcityProviderInfoForUser", () => {
       tokenhubUrl: "https://tokenhub.xcity.ai",
       apiKey: "sk-tokenhub-user",
       modelIds: ["only-model"],
+      catalog: [{ id: "only-model", name: "only-model", hidden: false }],
     });
   });
 
@@ -126,6 +131,7 @@ describe("getXcityProviderInfoForUser", () => {
       email: "user@example.com",
       apiKey: "sk-tokenhub-user",
       modelIds: [],
+      catalog: [],
     });
   });
 
@@ -138,6 +144,7 @@ describe("getXcityProviderInfoForUser", () => {
       tokenhubUrl: "https://tokenhub.xcity.ai",
       email: "user@example.com",
       modelIds: [],
+      catalog: [],
     });
   });
 
@@ -158,6 +165,7 @@ describe("getXcityProviderInfoForUser", () => {
       tokenhubUrl: "https://tokenhub.xcity.ai",
       email: "user@example.com",
       modelIds: [],
+      catalog: [],
     });
   });
 });

@@ -446,6 +446,13 @@ export interface AuthenticatedApi extends RpcTarget {
    */
   getXcityProviderInfo(): Promise<XcityProviderInfo | null>;
 
+  /**
+   * Show or hide one Xcity TokenHub catalog model in the user's model list. Hiding is a per-user
+   * visibility toggle, not a deletion: hidden models still resolve for existing chats and can be
+   * re-added at any time. Ids not in the tokenhub catalog are ignored.
+   */
+  setXcityModelHidden(modelId: string, hidden: boolean): Promise<void>;
+
   /** Returns true if the user has completed the onboarding wizard. */
   isOnboardingCompleted(): Promise<boolean>;
 
@@ -1152,8 +1159,27 @@ export type XcityProviderInfo = {
    */
   apiKey?: string;
 
-  /** IDs of the models listModels() currently sources from tokenhub. */
+  /** IDs of the models listModels() currently sources from tokenhub (visible models only). */
   modelIds: string[];
+
+  /**
+   * The full tokenhub model catalog with this user's per-model visibility. Entries with
+   * `hidden: true` are omitted from listModels() (and from `modelIds`) but still resolve for
+   * existing chats, and can be re-added at any time via setXcityModelHidden().
+   */
+  catalog: XcityCatalogModel[];
+};
+
+/** One tokenhub catalog model entry inside XcityProviderInfo, with per-user visibility. */
+export type XcityCatalogModel = {
+  /** Tokenhub model id (also the model's id in listModels()). */
+  id: string;
+
+  /** Human-readable model name. */
+  name: string;
+
+  /** True when the user has hidden this model from their model list. */
+  hidden: boolean;
 };
 
 /** One skill summary attached to an Xcity marketplace agent catalog entry. */

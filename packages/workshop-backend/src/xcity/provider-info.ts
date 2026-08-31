@@ -20,28 +20,37 @@ const logger = createWorkshopLogger("workshop.xcity.provider-info");
  *
  * `mintEmail` is the email forwarded to the wallet when the key still has to be minted (same
  * fallback the model plane uses elsewhere); the returned `email` is always the identity's own.
+ * `hiddenModelIds` is the user's per-model visibility state: hidden models are still part of the
+ * returned `catalog` (flagged `hidden: true`) but excluded from `modelIds`.
  */
 export async function getXcityProviderInfoForUser(
     env: Cloudflare.Env,
     storage: XcityModelPlaneStorage,
     identity: XcityUserIdentity | null,
     mintEmail?: string,
+    hiddenModelIds: readonly string[] = [],
 ): Promise<XcityProviderInfo | null> {
   let config = getXcityConfig(env);
   if (!config || !identity) return null;
 
-  let modelIds: string[] = [];
+  let catalog: XcityProviderInfo["catalog"] = [];
   try {
     // forUser mints the per-user key if absent and loads the catalog through the resilient
     // cache; both are best-effort inside the plane itself.
     let plane = await XcityModelPlane.forUser(
         env, config, storage, identity.userId, mintEmail ?? identity.email);
-    modelIds = plane.getModelList().map(model => model.id);
+    let hidden = new Set(hiddenModelIds);
+    catalog = plane.getModelList().map(model => ({
+      id: model.id,
+      name: model.name,
+      hidden: hidden.has(model.id),
+    }));
   } catch (error) {
     logger.warn("failed to resolve xcity provider info from the model plane", {
       event: "xcity.provider.info.failed", error,
     });
   }
+  let modelIds = catalog.filter(model => !model.hidden).map(model => model.id);
 
   // Surface only a key minted for this user against the currently-configured wallet.
   let key = storage.get().key;
@@ -53,5 +62,6 @@ export async function getXcityProviderInfoForUser(
     ...(identity.email ? { email: identity.email } : {}),
     ...(apiKey ? { apiKey } : {}),
     modelIds,
+    catalog,
   };
 }

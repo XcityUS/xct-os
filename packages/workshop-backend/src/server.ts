@@ -172,6 +172,9 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   getXcityProviderInfo(): Promise<XcityProviderInfo | null> {
     return retryOnDoReset(() => this.#user.getXcityProviderInfo());
   }
+  setXcityModelHidden(modelId: string, hidden: boolean): Promise<void> {
+    return this.#user.setXcityModelHidden(modelId, hidden);
+  }
   isOnboardingCompleted(): Promise<boolean> {
     return retryOnDoReset(() => this.#user.isOnboardingCompleted());
   }

@@ -22,6 +22,7 @@ import {
   ArrowSquareOut,
 } from '@phosphor-icons/react'
 import AddModelModal from '../AddModelModal'
+import XcityAddModelModal from '../XcityAddModelModal'
 import { useDocumentTitle } from '../useDocumentTitle'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER } from '../components/menuStyles'
 
@@ -44,6 +45,7 @@ function ModelRow({
   isBuiltIn,
   isTokenhub,
   onDelete,
+  onRemove,
   onSetQuick,
 }: {
   model: AiChatAuthorInfo
@@ -51,6 +53,7 @@ function ModelRow({
   isBuiltIn: boolean
   isTokenhub: boolean
   onDelete: () => void
+  onRemove: () => void
   onSetQuick: () => void
 }) {
   return (
@@ -122,6 +125,13 @@ function ModelRow({
               <DropdownMenu.Item variant="danger" onClick={onDelete} className={MENU_ITEM_DANGER}>
                 <Trash size={13} className="mr-2" />
                 Delete provider
+              </DropdownMenu.Item>
+            )}
+            {/* Tokenhub rows are hidden, not deleted: re-addable any time via "Add model". */}
+            {isTokenhub && (
+              <DropdownMenu.Item onClick={onRemove} className={MENU_ITEM}>
+                <EyeSlash size={13} className="mr-2" />
+                Remove from list
               </DropdownMenu.Item>
             )}
           </DropdownMenu.Content>
@@ -275,6 +285,26 @@ function ProvidersPage() {
   const isTokenhub = (modelId: string): boolean =>
     xcityInfo != null && xcityInfo.modelIds.includes(modelId)
 
+  // Hide a tokenhub model from the list (per-user visibility toggle, not a deletion — it can be
+  // re-added any time via the "Add model" dialog). If it was the quick model, clear that too so
+  // the default doesn't dangle on a hidden model.
+  const handleRemove = async (model: AiChatAuthorInfo) => {
+    setDeletingId(model.id)
+    try {
+      await authenticatedApi.setXcityModelHidden(model.id, true)
+      if (quickModel === model.id) {
+        await authenticatedApi.setQuickModel(null)
+        setQuickModel(null)
+      }
+      await fetchAll()
+    } catch (err) {
+      console.error('Failed to remove model:', err)
+      toasts.add({ title: 'Failed to remove model', variant: 'error' })
+    } finally {
+      setDeletingId(null)
+    }
+  }
+
   const handleDelete = async (model: AiChatAuthorInfo) => {
     if (!confirm(`Delete "${model.name}"? This cannot be undone.`)) return
     setDeletingId(model.id)
@@ -325,7 +355,7 @@ function ProvidersPage() {
         </div>
         <button type="button" onClick={() => setSheetOpen(true)} className={`${PRIMARY_BTN} h-11 justify-center text-[14px] sm:h-9 sm:text-[13px]`}>
           <Plus size={14} weight="bold" />
-          Add provider
+          {xcityInfo ? 'Add model' : 'Add provider'}
         </button>
       </header>
 
@@ -402,14 +432,18 @@ function ProvidersPage() {
               <Lightning size={18} />
             </div>
             <div>
-              <p className="text-sm font-medium text-kumo-default">No AI providers yet</p>
+              <p className="text-sm font-medium text-kumo-default">
+                {xcityInfo ? 'No models in your list' : 'No AI providers yet'}
+              </p>
               <p className="mt-1 text-[13px] leading-[18px] text-kumo-subtle">
-                Add a provider to start building workspaces with AI.
+                {xcityInfo
+                  ? 'Add a TokenHub model to start building workspaces with AI.'
+                  : 'Add a provider to start building workspaces with AI.'}
               </p>
             </div>
             <button type="button" onClick={() => setSheetOpen(true)} className={PRIMARY_BTN}>
               <Plus size={14} weight="bold" />
-              Add your first provider
+              {xcityInfo ? 'Add a model' : 'Add your first provider'}
             </button>
           </div>
         ) : filtered.length === 0 ? (
@@ -426,6 +460,7 @@ function ProvidersPage() {
                 isBuiltIn={isBuiltIn(model.id)}
                 isTokenhub={isTokenhub(model.id)}
                 onDelete={() => handleDelete(model)}
+                onRemove={() => handleRemove(model)}
                 onSetQuick={() => handleSetQuick(model.id)}
               />
             </div>
@@ -433,17 +468,28 @@ function ProvidersPage() {
         )}
       </div>
 
-      {/* Add model dialog */}
-      <AddModelModal
-        visible={sheetOpen}
-        onCancel={() => setSheetOpen(false)}
-        onSuccess={() => {
-          setSheetOpen(false)
-          fetchAll()
-        }}
-        authenticatedApi={authenticatedApi}
-        aiConfig={aiConfig}
-      />
+      {/* Add model dialog. On Xcity deployments tokenhub is the only model source, so "adding"
+          re-shows hidden catalog models; the BYOK flow stays for everyone else. */}
+      {xcityInfo ? (
+        <XcityAddModelModal
+          visible={sheetOpen}
+          onCancel={() => setSheetOpen(false)}
+          onAdded={fetchAll}
+          authenticatedApi={authenticatedApi}
+          catalog={xcityInfo.catalog}
+        />
+      ) : (
+        <AddModelModal
+          visible={sheetOpen}
+          onCancel={() => setSheetOpen(false)}
+          onSuccess={() => {
+            setSheetOpen(false)
+            fetchAll()
+          }}
+          authenticatedApi={authenticatedApi}
+          aiConfig={aiConfig}
+        />
+      )}
     </div>
   )
 }

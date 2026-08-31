@@ -12,6 +12,7 @@ import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-bi
 import { getXcityAgentMarketplaceConfig, getXcityConfig } from "./xcity/config.js";
 import { getXcityAgent, isSafeXcityAgentSlug, listXcityAgents } from "./xcity/agent-catalog.js";
 import { getXcityProviderInfoForUser } from "./xcity/provider-info.js";
+import { filterVisibleXcityModels, toggleXcityHiddenModelId } from "./xcity/model-visibility.js";
 import { getXcityAgentPersona } from "./xcity/agent-persona.js";
 import { debitXcitySkillUseForTurn } from "./xcity/skill-billing.js";
 import {
@@ -248,6 +249,10 @@ function makeUserStorage(storage: DurableObjectStorage) {
       xcityIdentity: <XcityUserIdentity | null>null,
       xcityModelPlane: <XcityModelPlaneCache>{},
       xcityWalletBalance: <XcityWalletBalance | null>null,
+
+      // Tokenhub catalog models the user has hidden from their model list. Visibility only:
+      // hidden models still resolve in getChatContext() so existing chats keep working.
+      xcityHiddenModelIds: <string[]>[],
 
       // `passwordHash` value as passed to `login()`, but with an extra round of SHA-256 applied.
       //
@@ -586,7 +591,21 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let identity = this.storage.xcityIdentity.get();
     return getXcityProviderInfoForUser(
         this.env, this.storage.xcityModelPlane, identity,
-        identity?.email ?? this.storage.profile.get().id);
+        identity?.email ?? this.storage.profile.get().id,
+        this.storage.xcityHiddenModelIds.get());
+  }
+
+  /**
+   * Show or hide one Xcity TokenHub catalog model in this user's model list. Visibility only —
+   * hidden models still resolve in getChatContext(), so existing chats keep working. Ids not in
+   * the tokenhub catalog are ignored (with a warning inside the toggle helper).
+   */
+  async setXcityModelHidden(modelId: string, hidden: boolean): Promise<void> {
+    let xcityModelPlane = await this.#getXcityModelPlane();
+    let catalogIds = new Set(
+        (xcityModelPlane?.getModelList() ?? []).map(model => model.id));
+    this.storage.xcityHiddenModelIds.put(toggleXcityHiddenModelId(
+        this.storage.xcityHiddenModelIds.get(), catalogIds, modelId, hidden));
   }
 
   async listModels(): Promise<AiChatAuthorInfo[]> {
@@ -594,19 +613,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
     let xcityModelPlane = await this.#getXcityModelPlane();
     if (xcityModelPlane) {
-      let xcityModelIds = new Set<string>();
-      for (let entry of xcityModelPlane.getModelList()) {
-        result.push(entry);
-        xcityModelIds.add(entry.id);
-      }
-
-      // User-configured models remain available, but tokenhub is authoritative for duplicates.
-      for (let model of this.storage.aiModels.list()) {
-        if (!xcityModelIds.has(model.profile.id)) {
-          result.push(model.profile);
-        }
-      }
-      return result;
+      // Tokenhub is the ONLY model source on Xcity deployments: user-configured (BYOK) models
+      // are not merged in, and models the user has hidden are filtered out. Both are list-only
+      // exclusions — getChatContext() still resolves hidden and BYOK models, so existing chats
+      // keep working.
+      return filterVisibleXcityModels(
+          xcityModelPlane.getModelList(), this.storage.xcityHiddenModelIds.get());
     }
 
     // When AI Gateway mode is active, include all suggested models for enabled providers.

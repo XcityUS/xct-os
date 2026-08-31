@@ -439,6 +439,13 @@ export interface AuthenticatedApi extends RpcTarget {
   /** Set the user's preferred Xcity marketplace agent slug for newly-created chats. */
   setPreferredXcityAgent(slug: string | null): Promise<void>;
 
+  /**
+   * Describe the user's default Xcity TokenHub provider: connected identity, tokenhub virtual
+   * key, and which model IDs come from tokenhub. Returns null when the deployment has no Xcity
+   * model plane configured or the user has no Xcity identity.
+   */
+  getXcityProviderInfo(): Promise<XcityProviderInfo | null>;
+
   /** Returns true if the user has completed the onboarding wizard. */
   isOnboardingCompleted(): Promise<boolean>;
 
@@ -1125,6 +1132,28 @@ export type ServerConfig = {
    * overrides the brand CSS variables with this (and derived shades) at runtime.
    */
   accentColor: string;
+};
+
+/**
+ * The user's default Xcity TokenHub provider, shown on the /providers page when the deployment
+ * routes models through tokenhub. Contains the user's own tokenhub virtual key (a per-user
+ * secret already used as the apiToken of every tokenhub model config).
+ */
+export type XcityProviderInfo = {
+  /** Public tokenhub base URL the user's models are served from. */
+  tokenhubUrl: string;
+
+  /** Email of the connected Xcity identity, when known. */
+  email?: string;
+
+  /**
+   * The user's tokenhub virtual key — the same key the xcity.ai dashboard shows. Present once
+   * minted; absent while minting has not succeeded yet.
+   */
+  apiKey?: string;
+
+  /** IDs of the models listModels() currently sources from tokenhub. */
+  modelIds: string[];
 };
 
 /** One skill summary attached to an Xcity marketplace agent catalog entry. */

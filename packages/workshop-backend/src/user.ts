@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, XcityCatalogAgent, XcityChatAgentInfo } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, XcityCatalogAgent, XcityChatAgentInfo, XcityProviderInfo } from '@gadgets/workshop-shared/api';
 import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
@@ -11,6 +11,7 @@ import { getAiGatewayConfig } from "./ai-gateway.js";
 import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-billing/limits/config.js";
 import { getXcityAgentMarketplaceConfig, getXcityConfig } from "./xcity/config.js";
 import { getXcityAgent, isSafeXcityAgentSlug, listXcityAgents } from "./xcity/agent-catalog.js";
+import { getXcityProviderInfoForUser } from "./xcity/provider-info.js";
 import { getXcityAgentPersona } from "./xcity/agent-persona.js";
 import { debitXcitySkillUseForTurn } from "./xcity/skill-billing.js";
 import {
@@ -575,6 +576,17 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       });
       return null;
     }
+  }
+
+  /**
+   * Describe the user's default Xcity TokenHub provider for the /providers page. Null when the
+   * Xcity model plane is not configured or the user has no Xcity identity; never throws.
+   */
+  async getXcityProviderInfo(): Promise<XcityProviderInfo | null> {
+    let identity = this.storage.xcityIdentity.get();
+    return getXcityProviderInfoForUser(
+        this.env, this.storage.xcityModelPlane, identity,
+        identity?.email ?? this.storage.profile.get().id);
   }
 
   async listModels(): Promise<AiChatAuthorInfo[]> {

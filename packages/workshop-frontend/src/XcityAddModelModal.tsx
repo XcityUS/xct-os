@@ -67,7 +67,14 @@ export default function XcityAddModelModal({
           Models you removed from your list can be added back here.
         </p>
 
-        {hiddenModels.length === 0 ? (
+        {catalog.length === 0 ? (
+          // An empty catalog means the user's TokenHub key has no models granted at all —
+          // a plan/entitlement problem, not "everything is already added".
+          <div className="py-10 text-center text-[13px] leading-[18px] text-kumo-subtle">
+            TokenHub hasn't made any models available to your plan yet. Check your plan's
+            model list on the Xcity dashboard, or contact an administrator.
+          </div>
+        ) : hiddenModels.length === 0 ? (
           <div className="py-10 text-center text-[13px] leading-[18px] text-kumo-subtle">
             All TokenHub models are already in your list.
           </div>

@@ -31,7 +31,10 @@ vi.mock('@cloudflare/kumo', async (importOriginal) => {
 
 vi.mock('./AuthContext', () => {
   const context = {
-    authenticatedApi: { listGatekeeperVendors: async () => [] },
+    authenticatedApi: {
+      listGatekeeperVendors: async () => [],
+      getQuickModel: async () => null,
+    },
     currentUser: null,
   }
   return {

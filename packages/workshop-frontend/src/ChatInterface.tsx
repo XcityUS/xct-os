@@ -4755,6 +4755,9 @@ function ChatInterface({
   const [availableModels, setAvailableModels] = useState<AiChatAuthorInfo[]>(
     [],
   );
+  // The default model set on /providers; preferred for new chats over the device-local last
+  // selection.
+  const [defaultModelId, setDefaultModelId] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
   const [xcityAgents, setXcityAgents] = useState<XcityCatalogAgent[]>([]);
   const [selectedXcityAgentSlug, setSelectedXcityAgentSlug] = useState<string | null>(null);
@@ -5299,7 +5302,7 @@ function ChatInterface({
   // Update selected model when switching chats
   useEffect(() => {
     if (selectedChatId === null) {
-      setSelectedModel(getStoredSelectedModel(availableModels));
+      setSelectedModel(getStoredSelectedModel(availableModels, defaultModelId));
     } else {
       // For existing threads:
       // 1. If an AI agent is currently active, use that agent's model
@@ -5315,7 +5318,7 @@ function ChatInterface({
         );
       }
     }
-  }, [selectedChatId, availableModels, currentMessages, activeAgent]);
+  }, [selectedChatId, availableModels, defaultModelId, currentMessages, activeAgent]);
 
   // Keep the ref in sync with selectedChatId state
   useEffect(() => {
@@ -5751,9 +5754,11 @@ function ChatInterface({
 
           // After subscribing, load the list of chats and models
           // This is safe because subscription will catch any new activity
-          const [chats, models] = await Promise.all([
+          const [chats, models, quickModel] = await Promise.all([
             overseer.listChats(),
             overseer.listModels(),
+            // The default model set on /providers; older backends may not implement it.
+            authenticatedApi.getQuickModel().catch(() => null),
           ]);
 
           chats.forEach((chat) => {
@@ -5763,8 +5768,9 @@ function ChatInterface({
           setChatListReady(true);
 
           setAvailableModels(models);
+          setDefaultModelId(quickModel);
 
-          setSelectedModel(getStoredSelectedModel(models));
+          setSelectedModel(getStoredSelectedModel(models, quickModel));
 
           forceUpdate();
         }

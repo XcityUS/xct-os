@@ -12,8 +12,12 @@ interface OutOfCreditsModalProps {
   onClose: () => void
 }
 
-// Modal shown when a server-side usage gate blocks a turn. Guides the user to the right billing
-// surface for the active deployment mode.
+/**
+ * Modal shown when a server-side usage gate blocks a turn. On Cloudflare billing it guides the
+ * user to connect their Cloudflare account (if not connected), pick which account to bill (if they
+ * have several), or top up credits in the Cloudflare dashboard (if connected but low balance).
+ * With `billingMode: "xcity"` it shows the KWH balance and a recharge link instead.
+ */
 export default function OutOfCreditsModal({ open, onClose }: OutOfCreditsModalProps) {
   const auth = useOptionalAuthenticatedApi()
   const serverConfig = useServerConfig()
@@ -59,7 +63,7 @@ export default function OutOfCreditsModal({ open, onClose }: OutOfCreditsModalPr
     if (!auth) return
     setConnecting(true)
     try {
-      const { url } = await auth.authenticatedApi.connectAccount('cloudflare')
+      const { url } = await auth.authenticatedApi.connectAccount('cloudflare', [])
       window.open(url, '_blank', 'noopener,noreferrer')
     } catch {
       // ignore
@@ -90,7 +94,7 @@ export default function OutOfCreditsModal({ open, onClose }: OutOfCreditsModalPr
 
   return (
     <Dialog.Root open={open} onOpenChange={(o) => { if (!o) onClose() }}>
-      <Dialog className="p-6 sm:w-[560px]" size="base">
+      <Dialog className="responsive-dialog overflow-y-auto p-6 sm:w-[560px]" size="base">
         <Dialog.Title className="text-lg font-semibold mb-2 flex items-center gap-2">
           <CloudWarning size={22} weight="bold" className="text-kumo-warning" />
           {xcity ? 'Recharge Xcity wallet' : "You've reached your free usage limit"}

@@ -157,7 +157,7 @@ const SELF_CLOSING_HTML = `<!DOCTYPE html>
 <html lang="en">
   <body>
     <script type="text/javascript">window.close();</script>
-    <p>Authorization complete. You may close this tab and return to Cloudflare OS.</p>
+    <p>Authorization complete. You may close this tab and return to Xcity OS.</p>
   </body>
 </html>`;
 
@@ -167,7 +167,7 @@ const INVALID_LINK_HTML = `<!DOCTYPE html>
   <body style="font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #f5f5f5;">
     <div style="max-width: 520px; padding: 2rem; background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center;">
       <h1 style="color: #EE3524; font-size: 1.5rem; margin: 0 0 1rem 0;">Authorization Link Expired</h1>
-      <p style="color: #555; line-height: 1.6; margin: 0 0 1.5rem 0;">This authorization link is invalid or has expired. Please return to Cloudflare OS and try again.</p>
+      <p style="color: #555; line-height: 1.6; margin: 0 0 1.5rem 0;">This authorization link is invalid or has expired. Please return to Xcity OS and try again.</p>
       <button onclick="window.close()" style="padding: 0.5rem 1.5rem; background: #EE3524; color: white; border: none; border-radius: 4px; font-size: 1rem; cursor: pointer;">Close</button>
     </div>
   </body>
@@ -287,7 +287,7 @@ export default {
       const error = url.searchParams.get("error");
       if (error) {
         return new Response(
-          "ZoomInfo authorization failed or was denied. Please restart the connection flow from Cloudflare OS.",
+          "ZoomInfo authorization failed or was denied. Please restart the connection flow from Xcity OS.",
           { status: 400, headers: { "Content-Type": "text/plain; charset=utf-8" } },
         );
       }
@@ -330,7 +330,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
       color: "#EE3524",
       tagline: "Search and enrich B2B company & contact intelligence",
       description:
-        "Connect your ZoomInfo account so Cloudflare OS can resolve filter values, search companies, " +
+        "Connect your ZoomInfo account so Xcity OS can resolve filter values, search companies, " +
         "contacts, intent signals, scoops, and news, and enrich matched records into full detail. " +
         "Search is free; enrichment consumes ZoomInfo credits. Build agents that assemble target " +
         "account lists, research accounts, and prioritize outreach on buying signals.",
@@ -383,8 +383,10 @@ export class UserAccount extends DurableObject<Env> {
     });
   }
 
-  // Verify the initiation nonce, then mint the PKCE pair for the authorize redirect. The
-  // code_verifier is stored server-side (never leaves the DO) and consumed at token exchange.
+  /**
+   * Verify the initiation nonce, then mint the PKCE pair for the authorize redirect. The
+   * code_verifier is stored server-side (never leaves the DO) and consumed at token exchange.
+   */
   async beginOAuthFlow(
     initiationNonce: string,
   ): Promise<{ oauthNonce: string; codeChallenge: string } | null> {
@@ -540,7 +542,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     };
   }
 
-  // ZoomInfo is not offered as a sign-in identity provider.
+  /** ZoomInfo is not offered as a sign-in identity provider. */
   async getAuthenticatedEmail(): Promise<string | null> {
     return null;
   }
@@ -581,8 +583,10 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     return { url: `${getBaseUrl(this.env)}/${this.ctx.props.userObjectId}/${initiationNonce}` };
   }
 
-  // ZoomInfo uses the private-only observer strategy. The verifier is never consulted, but the
-  // overseer mints one on every collaborator open, so getVerifier must still return a valid stub.
+  /**
+   * ZoomInfo uses the private-only observer strategy. The verifier is never consulted, but the
+   * overseer mints one on every collaborator open, so getVerifier must still return a valid stub.
+   */
   @skipRpcValidation()
   async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
     return this.ctx.exports.ZoomInfoVerifier({});
@@ -646,10 +650,12 @@ export class ZoomInfoGatekeeperImpl extends DurableObject<Env, ZoomInfoGatekeepe
       this.#userAccount(), approvalQueue.dup(), resolveOAuthConfig(this.env).apiBaseUrl, this.ctx.storage.kv);
   }
 
-  // Approved: replay the queued enrichment against ZoomInfo (spending credits) and store the result
-  // for the Gadget to read via getEnrichmentResult(). A ZoomInfo failure is recorded as a "failed"
-  // outcome rather than re-thrown: the action is considered resolved (we don't want the overseer to
-  // retry a paid operation that may have already charged credits), and the Gadget sees the failure.
+  /**
+   * Approved: replay the queued enrichment against ZoomInfo (spending credits) and store the result
+   * for the Gadget to read via getEnrichmentResult(). A ZoomInfo failure is recorded as a "failed"
+   * outcome rather than re-thrown: the action is considered resolved (we don't want the overseer to
+   * retry a paid operation that may have already charged credits), and the Gadget sees the failure.
+   */
   async applyAction(action: number): Promise<void> {
     const store = new EnrichmentStore(this.ctx.storage.kv);
     const pending = store.getPending(action);
@@ -669,15 +675,17 @@ export class ZoomInfoGatekeeperImpl extends DurableObject<Env, ZoomInfoGatekeepe
     store.removePending(action);
   }
 
-  // Rejected: discard the queued enrichment (no credits spent) and record the outcome.
+  /** Rejected: discard the queued enrichment (no credits spent) and record the outcome. */
   async rejectAction(action: number): Promise<void> {
     const store = new EnrichmentStore(this.ctx.storage.kv);
     store.removePending(action);
     store.putResult(action, { status: "rejected" });
   }
 
-  // Enrichment isn't revertable: spent credits can't be refunded. submitAction sets
-  // implementsRevert: false, so this is not normally reached; we drop the stored result defensively.
+  /**
+   * Enrichment isn't revertable: spent credits can't be refunded. submitAction sets
+   * implementsRevert: false, so this is not normally reached; we drop the stored result defensively.
+   */
   async revertAction(action: number): Promise<void | { message?: string; canRetry?: boolean }> {
     new EnrichmentStore(this.ctx.storage.kv).removeResult(action);
     return {
@@ -687,9 +695,11 @@ export class ZoomInfoGatekeeperImpl extends DurableObject<Env, ZoomInfoGatekeepe
     };
   }
 
-  // Observer tracking — strategy A (private-only). This whole-account binding exposes licensed,
-  // entitlement-dependent data and account-specific intelligence, and ZoomInfo provides no ACL
-  // oracle that can prove another account could read every historical result.
+  /**
+   * Observer tracking — strategy A (private-only). This whole-account binding exposes licensed,
+   * entitlement-dependent data and account-specific intelligence, and ZoomInfo provides no ACL
+   * oracle that can prove another account could read every historical result.
+   */
   async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
     throw new Error(
       "ZoomInfo data cannot be shared with other users: this workspace's ZoomInfo account may only " +

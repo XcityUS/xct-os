@@ -1,12 +1,14 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { DropdownMenu, useKumoToastManager } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from '../AuthContext'
+import { useServerConfig } from '../ServerConfigContext'
 import {
   AiChatAuthorInfo,
   AiGatewayInfo,
   AiModelProvider,
   SUGGESTED_MODELS,
+  XcityProviderInfo,
 } from '@gadgets/workshop-shared/api'
 import {
   Plus,
@@ -14,8 +16,13 @@ import {
   Lightning,
   MagnifyingGlass,
   DotsThreeVertical,
+  Eye,
+  EyeSlash,
+  Copy,
+  ArrowSquareOut,
 } from '@phosphor-icons/react'
 import AddModelModal from '../AddModelModal'
+import XcityAddModelModal from '../XcityAddModelModal'
 import { useDocumentTitle } from '../useDocumentTitle'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER } from '../components/menuStyles'
 
@@ -36,13 +43,17 @@ function ModelRow({
   model,
   isQuick,
   isBuiltIn,
+  isTokenhub,
   onDelete,
+  onRemove,
   onSetQuick,
 }: {
   model: AiChatAuthorInfo
   isQuick: boolean
   isBuiltIn: boolean
+  isTokenhub: boolean
   onDelete: () => void
+  onRemove: () => void
   onSetQuick: () => void
 }) {
   return (
@@ -75,6 +86,11 @@ function ModelRow({
               built-in
             </span>
           )}
+          {isTokenhub && (
+            <span className="shrink-0 rounded-full bg-kumo-tint px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.4px] text-kumo-subtle">
+              tokenhub
+            </span>
+          )}
           {isQuick && (
             <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[rgba(255,72,1,0.10)] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.4px] text-kumo-brand">
               <Lightning size={9} weight="fill" />
@@ -105,10 +121,17 @@ function ModelRow({
               <Lightning size={13} className="mr-2" weight={isQuick ? 'fill' : 'regular'} />
               {isQuick ? 'Clear quick model' : 'Set as quick model'}
             </DropdownMenu.Item>
-            {!isBuiltIn && (
+            {!isBuiltIn && !isTokenhub && (
               <DropdownMenu.Item variant="danger" onClick={onDelete} className={MENU_ITEM_DANGER}>
                 <Trash size={13} className="mr-2" />
                 Delete provider
+              </DropdownMenu.Item>
+            )}
+            {/* Tokenhub rows are hidden, not deleted: re-addable any time via "Add model". */}
+            {isTokenhub && (
+              <DropdownMenu.Item onClick={onRemove} className={MENU_ITEM}>
+                <EyeSlash size={13} className="mr-2" />
+                Remove from list
               </DropdownMenu.Item>
             )}
           </DropdownMenu.Content>
@@ -128,6 +151,86 @@ function Notice({ children }: { children: React.ReactNode }) {
   )
 }
 
+// ─── Xcity TokenHub default-provider card ─────────────────────────────────────
+
+// Small icon button matching the kebab-trigger treatment used by ModelRow.
+const ICON_BTN =
+  'cursor-pointer rounded-md p-1.5 text-kumo-subtle transition-colors hover:bg-kumo-fill hover:text-kumo-default'
+
+function XcityProviderCard({ info }: { info: XcityProviderInfo }) {
+  const toasts = useKumoToastManager()
+  const xcityHomeUrl = useServerConfig()?.xcityHomeUrl
+  const [keyVisible, setKeyVisible] = useState(false)
+
+  const copyKey = async () => {
+    if (!info.apiKey) return
+    try {
+      await navigator.clipboard.writeText(info.apiKey)
+      toasts.add({ title: 'API key copied' })
+    } catch (err) {
+      console.error('Failed to copy API key:', err)
+      toasts.add({ title: 'Failed to copy API key', variant: 'error' })
+    }
+  }
+
+  return (
+    <div className="rounded-xl border border-kumo-line bg-kumo-base px-4 py-3">
+      {/* Row 1: identity */}
+      <div className="flex items-center gap-3">
+        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-kumo-fill text-[12px] font-medium text-kumo-subtle">
+          X
+        </div>
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <span className="truncate text-sm font-medium tracking-[-0.25px] text-kumo-default">
+            Xcity TokenHub
+          </span>
+          <span className="shrink-0 rounded-full bg-kumo-tint px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.4px] text-kumo-subtle">
+            default
+          </span>
+        </div>
+        {xcityHomeUrl && (
+          <a
+            href={`${xcityHomeUrl}/dashboard`}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex shrink-0 items-center gap-1 text-[13px] tracking-[-0.25px] text-kumo-brand hover:underline"
+          >
+            Manage in dashboard
+            <ArrowSquareOut size={13} />
+          </a>
+        )}
+      </div>
+
+      {/* Row 2: connection details */}
+      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 pl-12 text-[13px] leading-[18px] tracking-[-0.25px] text-kumo-subtle">
+        {info.email && <span className="truncate">Connected as {info.email}</span>}
+        <span>{info.modelIds.length} models from TokenHub</span>
+      </div>
+
+      {/* Row 3: API key */}
+      {info.apiKey && (
+        <div className="mt-2 flex items-center gap-2 pl-12">
+          <span className="shrink-0 text-[13px] tracking-[-0.25px] text-kumo-subtle">API key</span>
+          <span className="min-w-0 truncate font-mono text-[12px] tracking-[-0.1px] text-kumo-default">
+            {keyVisible ? info.apiKey : `sk-…${info.apiKey.slice(-4)}`}
+          </span>
+          <button
+            type="button"
+            aria-label={keyVisible ? 'Hide API key' : 'Reveal API key'}
+            onClick={() => setKeyVisible((v) => !v)}
+            className={ICON_BTN}
+          >
+            {keyVisible ? <EyeSlash size={14} /> : <Eye size={14} />}
+          </button>
+          <button type="button" aria-label="Copy API key" onClick={copyKey} className={ICON_BTN}>
+            <Copy size={14} />
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── main page ────────────────────────────────────────────────────────────────
 
 function ProvidersPage() {
@@ -138,6 +241,7 @@ function ProvidersPage() {
   const [models, setModels] = useState<AiChatAuthorInfo[]>([])
   const [quickModel, setQuickModel] = useState<string | null>(null)
   const [aiConfig, setAiConfig] = useState<AiGatewayInfo | null>(null)
+  const [xcityInfo, setXcityInfo] = useState<XcityProviderInfo | null>(null)
   const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState(false)
@@ -147,14 +251,17 @@ function ProvidersPage() {
   const fetchAll = async () => {
     setLoadError(false)
     try {
-      const [modelList, qm, cfg] = await Promise.all([
+      const [modelList, qm, cfg, xcity] = await Promise.all([
         authenticatedApi.listModels(),
         authenticatedApi.getQuickModel(),
         authenticatedApi.getAiConfig(),
+        // Older backends don't implement this RPC; treat a rejection as "not an Xcity deployment".
+        authenticatedApi.getXcityProviderInfo().catch(() => null),
       ])
       setModels(modelList)
       setQuickModel(qm)
       setAiConfig(cfg)
+      setXcityInfo(xcity)
     } catch (err) {
       console.error('Failed to load providers:', err)
       setLoadError(true)
@@ -173,6 +280,31 @@ function ProvidersPage() {
     return PROVIDER_ORDER.some((p) => enabled.has(p) && modelId in SUGGESTED_MODELS[p])
   }
 
+  // Models sourced from the Xcity TokenHub catalog behave like built-in rows: badged, and not
+  // user-deletable (the backend refuses to delete them anyway).
+  const isTokenhub = (modelId: string): boolean =>
+    xcityInfo != null && xcityInfo.modelIds.includes(modelId)
+
+  // Hide a tokenhub model from the list (per-user visibility toggle, not a deletion — it can be
+  // re-added any time via the "Add model" dialog). If it was the quick model, clear that too so
+  // the default doesn't dangle on a hidden model.
+  const handleRemove = async (model: AiChatAuthorInfo) => {
+    setDeletingId(model.id)
+    try {
+      await authenticatedApi.setXcityModelHidden(model.id, true)
+      if (quickModel === model.id) {
+        await authenticatedApi.setQuickModel(null)
+        setQuickModel(null)
+      }
+      await fetchAll()
+    } catch (err) {
+      console.error('Failed to remove model:', err)
+      toasts.add({ title: 'Failed to remove model', variant: 'error' })
+    } finally {
+      setDeletingId(null)
+    }
+  }
+
   const handleDelete = async (model: AiChatAuthorInfo) => {
     if (!confirm(`Delete "${model.name}"? This cannot be undone.`)) return
     setDeletingId(model.id)
@@ -187,7 +319,12 @@ function ProvidersPage() {
     }
   }
 
+  // Overlapping setQuickModel calls have no ordering guarantee, so ignore clicks while one is
+  // in flight.
+  const quickInFlight = useRef(false)
   const handleSetQuick = async (modelId: string) => {
+    if (quickInFlight.current) return
+    quickInFlight.current = true
     const next = quickModel === modelId ? null : modelId
     setQuickModel(next)
     try {
@@ -196,6 +333,8 @@ function ProvidersPage() {
       console.error('Failed to set quick model:', err)
       setQuickModel(quickModel) // revert
       toasts.add({ title: 'Failed to update default model', variant: 'error' })
+    } finally {
+      quickInFlight.current = false
     }
   }
 
@@ -206,19 +345,26 @@ function ProvidersPage() {
   })
 
   return (
-    <div className="mx-auto flex h-full w-full max-w-4xl flex-col px-6 sm:px-10">
-      <header className="flex items-end justify-between gap-4 px-3 pb-3 pt-10">
+    <div className="mx-auto flex h-full w-full max-w-4xl flex-col px-3 sm:px-10">
+      <header className="flex flex-col items-stretch gap-4 px-3 pb-3 pt-6 sm:flex-row sm:items-end sm:justify-between sm:pt-10">
         <div className="min-w-0">
           <h1 className="text-2xl font-semibold tracking-tight text-kumo-default">AI providers</h1>
           <p className="mt-1 text-[13px] leading-[18px] tracking-[-0.25px] text-kumo-subtle">
             Configure the AI models available to your workspaces.
           </p>
         </div>
-        <button type="button" onClick={() => setSheetOpen(true)} className={PRIMARY_BTN}>
+        <button type="button" onClick={() => setSheetOpen(true)} className={`${PRIMARY_BTN} h-11 justify-center text-[14px] sm:h-9 sm:text-[13px]`}>
           <Plus size={14} weight="bold" />
-          Add provider
+          {xcityInfo ? 'Add model' : 'Add provider'}
         </button>
       </header>
+
+      {/* Default Xcity TokenHub provider — only on Xcity deployments with a connected identity */}
+      {xcityInfo && !loading && !loadError && (
+        <div className="mb-3 px-3">
+          <XcityProviderCard info={xcityInfo} />
+        </div>
+      )}
 
       {/* Search — hidden when the user has no models */}
       {!loading && !loadError && models.length > 0 && (
@@ -286,14 +432,18 @@ function ProvidersPage() {
               <Lightning size={18} />
             </div>
             <div>
-              <p className="text-sm font-medium text-kumo-default">No AI providers yet</p>
+              <p className="text-sm font-medium text-kumo-default">
+                {xcityInfo ? 'No models in your list' : 'No AI providers yet'}
+              </p>
               <p className="mt-1 text-[13px] leading-[18px] text-kumo-subtle">
-                Add a provider to start building workspaces with AI.
+                {xcityInfo
+                  ? 'Add a TokenHub model to start building workspaces with AI.'
+                  : 'Add a provider to start building workspaces with AI.'}
               </p>
             </div>
             <button type="button" onClick={() => setSheetOpen(true)} className={PRIMARY_BTN}>
               <Plus size={14} weight="bold" />
-              Add your first provider
+              {xcityInfo ? 'Add a model' : 'Add your first provider'}
             </button>
           </div>
         ) : filtered.length === 0 ? (
@@ -308,7 +458,9 @@ function ProvidersPage() {
                 model={model}
                 isQuick={quickModel === model.id}
                 isBuiltIn={isBuiltIn(model.id)}
+                isTokenhub={isTokenhub(model.id)}
                 onDelete={() => handleDelete(model)}
+                onRemove={() => handleRemove(model)}
                 onSetQuick={() => handleSetQuick(model.id)}
               />
             </div>
@@ -316,17 +468,28 @@ function ProvidersPage() {
         )}
       </div>
 
-      {/* Add model dialog */}
-      <AddModelModal
-        visible={sheetOpen}
-        onCancel={() => setSheetOpen(false)}
-        onSuccess={() => {
-          setSheetOpen(false)
-          fetchAll()
-        }}
-        authenticatedApi={authenticatedApi}
-        aiConfig={aiConfig}
-      />
+      {/* Add model dialog. On Xcity deployments tokenhub is the only model source, so "adding"
+          re-shows hidden catalog models; the BYOK flow stays for everyone else. */}
+      {xcityInfo ? (
+        <XcityAddModelModal
+          visible={sheetOpen}
+          onCancel={() => setSheetOpen(false)}
+          onAdded={fetchAll}
+          authenticatedApi={authenticatedApi}
+          catalog={xcityInfo.catalog}
+        />
+      ) : (
+        <AddModelModal
+          visible={sheetOpen}
+          onCancel={() => setSheetOpen(false)}
+          onSuccess={() => {
+            setSheetOpen(false)
+            fetchAll()
+          }}
+          authenticatedApi={authenticatedApi}
+          aiConfig={aiConfig}
+        />
+      )}
     </div>
   )
 }

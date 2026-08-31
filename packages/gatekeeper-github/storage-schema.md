@@ -125,7 +125,7 @@ Implemented TTL cache families:
 - `cache:issue:<realId>` -> `GitHubIssueDetails`
 - `cache:pull:<realId>` -> `GitHubPullRequestDetails`
 - `cache:list-issues:<encodedQuery>` -> `GitHubIssueSummary[]`
-- `cache:search-issues:<encodedQuery>` -> `GitHubIssueSummary[]`
+- `cache:search-issues-scoped-v1:<encodedQuery>` -> validated source URLs and `GitHubIssueSummary` values
 - `cache:list-pulls:<encodedQuery>` -> `GitHubPullRequestSummary[]`
 - `cache:search-pulls:<encodedQuery>` -> `GitHubPullRequestSummary[]`
 - `cache:discussion-reviews:<realId>:p<page>` -> `GitHubDiscussionEntry[]` review-summary pages for pull discussions

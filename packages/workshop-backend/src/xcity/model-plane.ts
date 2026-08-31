@@ -4,11 +4,20 @@ import type { Model, Api } from "@earendil-works/pi-ai";
 import { createWorkshopLogger } from "../observability.js";
 import type { UserAiModelRecord } from "../user.js";
 import type { XcityConfig } from "./config.js";
+import { fetchWithOneRetry } from "./fetch-retry.js";
 
 const logger = createWorkshopLogger("workshop.xcity.model-plane");
 
 const CATALOG_CACHE_MS = 10 * 60 * 1000;
+// Ceiling for serving a stale catalog: within 24h we serve stale and revalidate in the
+// background; past it (or with no cache at all) the refresh happens inline, blocking the caller.
+const CATALOG_STALE_MAX_MS = 24 * 60 * 60 * 1000;
 export const XCITY_VENDOR_ID = "xcity";
+
+// Single-flight guard for background catalog refreshes, keyed per tokenhub + user. The User DO is
+// effectively single-threaded, but overlapping requests during the stale window would otherwise
+// each kick their own refresh.
+const inflightCatalogRefreshes = new Map<string, Promise<void>>();
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | {
   [key: string]: JsonValue;
@@ -275,6 +284,16 @@ export function pickQuickXcityModelConfig(
   return best?.config;
 }
 
+/**
+ * Awaits (and thereby drains) all in-flight background catalog refreshes, so tests can assert on
+ * their outcome deterministically.
+ */
+export async function flushXcityCatalogRefreshesForTests(): Promise<void> {
+  while (inflightCatalogRefreshes.size > 0) {
+    await Promise.all(inflightCatalogRefreshes.values());
+  }
+}
+
 function makeMemoryStorage(): XcityModelPlaneStorage {
   let value: XcityModelPlaneCache = {};
   return {
@@ -368,23 +387,56 @@ export class XcityModelPlane {
 
   async #loadModels(): Promise<XcityModelCatalogRecord["models"]> {
     let cache = this.#storage.get();
-    if (cache.catalog && cache.key &&
+    // A cached catalog is usable only if it was fetched from the current tokenhub with the
+    // currently-cached key (the model configs embed that key as their apiToken).
+    let cached = cache.catalog && cache.key &&
         cache.catalog.tokenhubUrl === this.#config.tokenhubUrl &&
-        cache.catalog.keyMintedAt === cache.key.mintedAt &&
-        Date.now() - cache.catalog.fetchedAt < CATALOG_CACHE_MS) {
-      return cache.catalog.models;
+        cache.catalog.keyMintedAt === cache.key.mintedAt
+        ? cache.catalog : undefined;
+    let age = cached ? Date.now() - cached.fetchedAt : Number.POSITIVE_INFINITY;
+
+    if (cached && age < CATALOG_CACHE_MS) {
+      return cached.models;
     }
 
+    if (cached && age < CATALOG_STALE_MAX_MS) {
+      // Stale but recent enough: serve immediately and revalidate off the request path.
+      logger.info("serving stale tokenhub model catalog while revalidating", {
+        event: "xcity.tokenhub.models.stale-served", durationMs: age,
+      });
+      this.#refreshInBackground();
+      return cached.models;
+    }
+
+    // No usable cache (or one past the stale ceiling): refresh inline, but on failure still
+    // prefer whatever we had over an empty model list.
+    let models = await this.#refreshModels();
+    if (models) return models;
+    if (cached) {
+      logger.warn("serving stale tokenhub model catalog after refresh failure", {
+        event: "xcity.tokenhub.models.stale-served", durationMs: age,
+      });
+      return cached.models;
+    }
+    return [];
+  }
+
+  /**
+   * Refreshes the catalog from tokenhub (minting/re-minting the per-user key as needed) and
+   * persists it on success. Returns undefined on failure without touching the cached catalog,
+   * except that a key re-mint on 401 invalidates the catalog tied to the old key.
+   */
+  async #refreshModels(): Promise<XcityModelCatalogRecord["models"] | undefined> {
     let key = await this.#ensureKey(false);
-    if (!key) return [];
+    if (!key) return undefined;
 
     let fetched = await this.#fetchCatalog(key.key);
     if (fetched.status === "unauthorized") {
       key = await this.#ensureKey(true);
-      if (!key) return [];
+      if (!key) return undefined;
       fetched = await this.#fetchCatalog(key.key);
     }
-    if (fetched.status !== "ok") return [];
+    if (fetched.status !== "ok") return undefined;
 
     let models = parseTokenhubModelCatalog(fetched.body, {
       tokenhubUrl: this.#config.tokenhubUrl,
@@ -395,10 +447,10 @@ export class XcityModelPlane {
       logger.warn("tokenhub model catalog response was malformed", {
         event: "xcity.tokenhub.models.malformed",
       });
-      return [];
+      return undefined;
     }
 
-    cache = this.#storage.get();
+    let cache = this.#storage.get();
     cache.catalog = {
       tokenhubUrl: this.#config.tokenhubUrl,
       keyMintedAt: key.mintedAt,
@@ -407,6 +459,27 @@ export class XcityModelPlane {
     };
     this.#storage.put(cache);
     return models;
+  }
+
+  // Fire-and-forget catalog revalidation for the stale-serve path. The User DO has no
+  // ExecutionContext at hand here, so this is a detached promise chain; a failed refresh only
+  // logs and leaves the cached catalog in place.
+  #refreshInBackground(): void {
+    let refreshKey = `${this.#config.tokenhubUrl}\n${this.#xcityUserId}`;
+    if (inflightCatalogRefreshes.has(refreshKey)) return;
+    let refresh = this.#refreshModels()
+        .then(models => {
+          if (models) this.#models = models;
+        })
+        .catch(error => {
+          logger.warn("background tokenhub model catalog refresh failed", {
+            event: "xcity.tokenhub.models.refresh.failed", error,
+          });
+        })
+        .finally(() => {
+          inflightCatalogRefreshes.delete(refreshKey);
+        });
+    inflightCatalogRefreshes.set(refreshKey, refresh);
   }
 
   async #ensureKey(forceMint: boolean): Promise<XcityVirtualKeyRecord | undefined> {
@@ -430,7 +503,7 @@ export class XcityModelPlane {
   async #mintKey(): Promise<XcityVirtualKeyRecord | undefined> {
     let response: Response;
     try {
-      response = await fetch(`${this.#config.walletUrl}/v1/keys/for-user`, {
+      response = await fetchWithOneRetry(`${this.#config.walletUrl}/v1/keys/for-user`, () => ({
         method: "POST",
         headers: {
           Authorization: `Bearer ${this.#config.walletServiceToken}`,
@@ -442,7 +515,7 @@ export class XcityModelPlane {
           ...(this.#email ? { email: this.#email } : {}),
         }),
         signal: AbortSignal.timeout(10_000),
-      });
+      }));
     } catch (error) {
       logger.warn("xcity wallet key mint request failed", {
         event: "xcity.wallet.key.mint.failed", error,
@@ -494,13 +567,13 @@ export class XcityModelPlane {
   async #fetchCatalog(apiKey: string): Promise<CatalogFetchResult> {
     let response: Response;
     try {
-      response = await fetch(`${this.#config.tokenhubUrl}/v1/models`, {
+      response = await fetchWithOneRetry(`${this.#config.tokenhubUrl}/v1/models`, () => ({
         headers: {
           Authorization: `Bearer ${apiKey}`,
           Accept: "application/json",
         },
         signal: AbortSignal.timeout(10_000),
-      });
+      }));
     } catch (error) {
       logger.warn("tokenhub model catalog request failed", {
         event: "xcity.tokenhub.models.failed", error,

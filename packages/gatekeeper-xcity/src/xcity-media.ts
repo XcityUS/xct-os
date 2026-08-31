@@ -25,6 +25,9 @@ export type XcityMediaConfig = {
   walletServiceToken: string;
 };
 
+/** The wallet-facing subset of the config, shared by every capability that mints per-user keys. */
+export type XcityWalletConfig = { walletUrl: string; walletServiceToken: string };
+
 export type XcityVirtualKeyRecord = {
   userId: string;
   email?: string;
@@ -114,22 +117,24 @@ const SEEDANCE_MODELS = {
 
 const UPLOADABLE_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 
-function stripTrailingSlashes(value: string): string {
+export function stripTrailingSlashes(value: string): string {
   let end = value.length;
   while (end > 0 && value.charCodeAt(end - 1) === 47) --end;
   return end === value.length ? value : value.slice(0, end);
 }
 
-function envString(env: EnvLike, key: keyof EnvLike): string | undefined {
+export function envString<E extends Record<string, string | undefined>>(
+  env: E, key: keyof E & string,
+): string | undefined {
   const value = env[key];
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function optionalString(value: unknown): string | undefined {
+export function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
@@ -137,7 +142,7 @@ function optionalFiniteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function optionalBoolean(value: unknown): boolean | undefined {
+export function optionalBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
@@ -279,7 +284,7 @@ export function parseWalletKeyResponse(
 }
 
 export async function mintTokenhubKey(
-  config: XcityMediaConfig,
+  config: XcityWalletConfig,
   identity: { sub: string; email?: string },
   fetchImpl: typeof fetch = fetch,
 ): Promise<XcityVirtualKeyRecord | undefined> {
@@ -403,7 +408,7 @@ export function imageCreateBody(options: Required<GenerateImageOptions>): Record
 }
 
 export async function tokenhubRequestJson<T>(
-  config: XcityMediaConfig,
+  config: Pick<XcityMediaConfig, "tokenhubUrl">,
   apiKey: string,
   path: string,
   init: RequestInit,

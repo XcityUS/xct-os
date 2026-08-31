@@ -8,6 +8,14 @@ interface ImportMetaEnv {
   // In this mode, password-based login/signup is disabled and the app authenticates
   // via the CF Access JWT that Access injects into requests before they reach the server.
   readonly VITE_CF_ACCESS_MODE?: string;
+
+  // Build stamp injected by the deployment pipeline (absent in local dev, where the
+  // sidebar version line simply doesn't render). Date is the UTC build date
+  // (YYYY-MM-DD), number is the CI run counter ("local" outside CI), commit is the
+  // short source revision.
+  readonly VITE_BUILD_DATE?: string;
+  readonly VITE_BUILD_NUMBER?: string;
+  readonly VITE_BUILD_COMMIT?: string;
 }
 
 interface ImportMeta {

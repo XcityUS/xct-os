@@ -39,7 +39,7 @@
   },
 
   // Gatekeeper service bindings and the Workers AI binding are dynamically
-  // added by run-dev-server.js (for dev) and generate-wrangler-prod.js (for
+  // added by run-dev-server.ts (for dev) and generate-wrangler-prod.js (for
   // production).
 
   "migrations": [
@@ -94,7 +94,10 @@
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1,
-    "logs": { "invocation_logs": false }
+    "logs": { "invocation_logs": false },
+    // Traces are free during the beta; spans bill against the Logs quota from 2026-10-01,
+    // so revisit the sampling rate before then.
+    "traces": { "enabled": true, "head_sampling_rate": 0.5 }
   }
 
 }

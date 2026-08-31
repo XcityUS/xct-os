@@ -29,19 +29,44 @@ import {
   type XcityMediaConfig,
   type XcityTokenhubVideoJob,
   type XcityVirtualKeyRecord,
+  type XcityWalletConfig,
 } from "./xcity-media";
+import {
+  createContextDocument,
+  deleteContextDocument,
+  getContextDocument,
+  listContextDocuments,
+  normalizeSaveContextOptions,
+  normalizeUpdateContextOptions,
+  pendingContextWrite,
+  readXcityContextConfig,
+  updateContextDocument,
+  withContextKeyRetry,
+  xcityContextResourceUrl,
+  assertContextId,
+  type XcityContextConfig,
+} from "./xcity-context";
 import { VENDOR_ID } from "./vendor.js";
 import type {
   GeneratedMedia,
   GenerateImageOptions,
   GenerateVideoOptions,
+  ListContextDocumentsOptions,
   MediaGenerationCost,
+  SaveContextDocumentOptions,
+  UpdateContextDocumentOptions,
+  XcityContext,
+  XcityContextDocument,
+  XcityContextDocumentList,
+  XcityContextWrite,
   XcityMedia,
 } from "./types";
 import type { XcityMediaConfiguratorRpc } from "./configurator/xcity-media-configurator-types";
+import type { XcityContextConfiguratorRpc } from "./configurator/xcity-context-configurator-types";
 import TYPES_CODE from "./types.txt";
 import XCITY_LOGO_SVG from "./xcity-logo.svg";
 import XCITY_MEDIA_CONFIGURATOR_HTML from "./generated/xcity-media-configurator-ui.txt";
+import XCITY_CONTEXT_CONFIGURATOR_HTML from "./generated/xcity-context-configurator-ui.txt";
 import { obsContext } from "./observability.js";
 
 const logger = obsContext.createLogger({
@@ -56,6 +81,11 @@ type StoredNonce = {
   stage: "initiation" | "oauth";
   verifier?: string;
   scopes?: string[];
+  // While at the "oauth" stage, the still-unexpired initiation link that started this flow. Auth
+  // frontends can bounce the browser back to the initiation URL after their own login step; keeping
+  // this lets that visit restart the authorize redirect instead of dead-ending on the "link
+  // expired" page.
+  initiation?: { value: string; expiresAt: number };
 };
 
 // A cached access token plus its absolute expiry (unix ms).
@@ -131,6 +161,23 @@ function getMediaResource(env: Env): SupportedResource | null {
   };
 }
 
+function getContextResource(env: Env): SupportedResource | null {
+  const config = readXcityContextConfig(env);
+  if (!config) return null;
+  return {
+    urlPattern: xcityContextResourceUrl(config),
+    title: "Xcity Context",
+    description:
+        "Read and write the user's Xcity context documents, shared across all Xcity products.",
+    icon: { url: XCITY_LOGO_URL },
+  };
+}
+
+function getXcityResources(env: Env): SupportedResource[] {
+  return [getMediaResource(env), getContextResource(env)]
+      .filter((resource): resource is SupportedResource => resource !== null);
+}
+
 const SELF_CLOSING_HTML = `<!DOCTYPE html>
 <html lang="en"><body>
 <script type="text/javascript">window.close();</script>
@@ -151,7 +198,7 @@ const NOT_CONFIGURED_HTML = `<!DOCTYPE html>
 <p>Please see the README.md for instructions on configuring an OAuth client ID and secret.</p>
 </body></html>`;
 
-// Main HTTP entrypoint — used only to initiate and complete the OAuth flow.
+/** Main HTTP entrypoint — used only to initiate and complete the OAuth flow. */
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(req.url);
@@ -230,8 +277,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
   }
 
   async getSupportedResources(): Promise<SupportedResource[]> {
-    const mediaResource = getMediaResource(this.env);
-    return mediaResource ? [mediaResource] : [];
+    return getXcityResources(this.env);
   }
 
   async getTypeScriptTypes(): Promise<string> {
@@ -278,12 +324,19 @@ export class UserAccount extends DurableObject<Env> {
     });
   }
 
-  // Verify+consume the initiation nonce; mint a fresh OAuth nonce + PKCE pair. Returns the OAuth
-  // nonce (for the `state`) and the PKCE challenge (for the authorize URL), or null if invalid.
+  /**
+   * Verify the initiation nonce; mint a fresh OAuth nonce + PKCE pair. Returns the OAuth nonce
+   * (for the `state`) and the PKCE challenge (for the authorize URL), or null if invalid. The
+   * initiation link stays usable until it expires or the flow completes, so a browser bounced back
+   * to it mid-flow just restarts the redirect rather than seeing the "link expired" page.
+   */
   async beginOAuthFlow(initiationNonce: string): Promise<{ oauthNonce: string; challenge: string; scopes: string[] } | null> {
     const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
-    if (!stored || stored.stage !== "initiation" ||
-        Date.now() >= stored.expiresAt || !constantTimeEqual(stored.value, initiationNonce)) {
+    const initiation = stored?.stage === "initiation"
+        ? { value: stored.value, expiresAt: stored.expiresAt }
+        : stored?.initiation;
+    if (!initiation || Date.now() >= initiation.expiresAt ||
+        !constantTimeEqual(initiation.value, initiationNonce)) {
       return null;
     }
     const oauthNonce = generateNonce();
@@ -293,6 +346,7 @@ export class UserAccount extends DurableObject<Env> {
       expiresAt: Date.now() + OAUTH_NONCE_LIFETIME_MS,
       stage: "oauth",
       verifier,
+      initiation,
     });
     const scopes = this.ctx.storage.kv.get<string[]>("scopes") ?? FULL_SCOPES;
     return { oauthNonce, challenge, scopes };
@@ -348,8 +402,10 @@ export class UserAccount extends DurableObject<Env> {
     return this.ctx.storage.kv.get<string>("refreshToken") !== undefined;
   }
 
-  // Returns a usable access token (refreshing if needed), or null if the credentials are gone or
-  // can no longer be refreshed (in which case the workshop is notified via credentialsExpired()).
+  /**
+   * Returns a usable access token (refreshing if needed), or null if the credentials are gone or
+   * can no longer be refreshed (in which case the workshop is notified via credentialsExpired()).
+   */
   async getAccessToken(): Promise<string | null> {
     const refreshToken = this.ctx.storage.kv.get<string>("refreshToken");
     if (!refreshToken) return null;
@@ -403,7 +459,7 @@ export class UserAccount extends DurableObject<Env> {
     return identity;
   }
 
-  async getTokenhubKey(config: XcityMediaConfig, forceMint = false): Promise<XcityVirtualKeyRecord | null> {
+  async getTokenhubKey(config: XcityWalletConfig, forceMint = false): Promise<XcityVirtualKeyRecord | null> {
     const identity = await this.getIdentity();
     if (!identity) return null;
 
@@ -457,13 +513,29 @@ class XcityMediaConfiguratorUI extends RpcTarget implements XcityMediaConfigurat
   }
 }
 
-// Deliberately NOT @validateRpc(): the validator's runtime class decorator replaces the exported
-// class, and a durably-stored stub of the replaced class hangs on revival — dispatch never reaches
-// the method and the runtime cancels it ("code had hung"). Config-declared bindings resolve by
-// export name and are unaffected (GatekeeperVendor stays validated), but this class is exactly the
-// one the Workshop stores via allow_irrevocable_stub_storage. Its only caller is the Workshop over
-// typed RPC, so skipping arg validation here is the lesser evil. The Workshop's own undecorated
-// LoginConnectCallbackImpl is the working precedent: stored, revived and called on every sign-in.
+@validateRpc()
+class XcityContextConfiguratorUI extends RpcTarget implements XcityContextConfiguratorRpc {
+  #resourceUrl: string;
+
+  constructor(resourceUrl: string) {
+    super();
+    this.#resourceUrl = resourceUrl;
+  }
+
+  async getResourceUrl(): Promise<string> {
+    return this.#resourceUrl;
+  }
+}
+
+/**
+ * Deliberately NOT @validateRpc(): the validator's runtime class decorator replaces the exported
+ * class, and a durably-stored stub of the replaced class hangs on revival — dispatch never reaches
+ * the method and the runtime cancels it ("code had hung"). Config-declared bindings resolve by
+ * export name and are unaffected (GatekeeperVendor stays validated), but this class is exactly the
+ * one the Workshop stores via allow_irrevocable_stub_storage. Its only caller is the Workshop over
+ * typed RPC, so skipping arg validation here is the lesser evil. The Workshop's own undecorated
+ * LoginConnectCallbackImpl is the working precedent: stored, revived and called on every sign-in.
+ */
 export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImplProps>
                                 implements XcityGatekeeperUser {
   #account() {
@@ -499,25 +571,45 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
   }
 
   async getSupportedResources(): Promise<SupportedResource[]> {
-    const config = readXcityMediaConfig(this.env);
-    const mediaResource = getMediaResource(this.env);
-    if (!config || !mediaResource) return [];
-    const key = await this.#account().getTokenhubKey(config, false);
-    return key ? [mediaResource] : [];
+    const resources = getXcityResources(this.env);
+    if (resources.length === 0) return [];
+    // Every Xcity resource authenticates with the same per-user TokenHub virtual key, so one mint
+    // check gates them all. Both configs carry the same wallet fields; use whichever is present.
+    const keyConfig = readXcityMediaConfig(this.env) ?? readXcityContextConfig(this.env);
+    if (!keyConfig) return [];
+    const key = await this.#account().getTokenhubKey(keyConfig, false);
+    return key ? resources : [];
   }
 
   async getGatekeeperClassFor(url: string): Promise<{
-    class: DurableObjectClass<Gatekeeper<XcityMedia>>;
+    class: DurableObjectClass<Gatekeeper<XcityMedia>> | DurableObjectClass<Gatekeeper<XcityContext>>;
     resource: SupportedResource;
   }> {
+    const requested = stripTrailingSlashes(new URL(url).toString());
+    const matchesResource = (resourceUrl: string) =>
+      requested === resourceUrl || requested.startsWith(`${resourceUrl}/`);
+
+    const contextConfig = readXcityContextConfig(this.env);
+    const contextResource = getContextResource(this.env);
+    if (contextConfig && contextResource && matchesResource(xcityContextResourceUrl(contextConfig))) {
+      const key = await this.#account().getTokenhubKey(contextConfig, false);
+      if (!key) {
+        throw new Error("The Xcity context store is unavailable for this account. Reconnect Xcity and retry.");
+      }
+      return {
+        class: this.ctx.exports.XcityContextGatekeeperImpl({ props: { userObjectId: this.ctx.props.userObjectId } }),
+        resource: contextResource,
+      };
+    }
+
     const config = readXcityMediaConfig(this.env);
     const mediaResource = getMediaResource(this.env);
     if (!config || !mediaResource) {
-      throw new Error("Xcity media generation is not configured on this deployment.");
+      throw new Error(contextResource
+        ? `Unsupported Xcity resource URL: ${url}`
+        : "Xcity media generation is not configured on this deployment.");
     }
-    const requested = stripTrailingSlashes(new URL(url).toString());
-    const mediaUrl = xcityMediaResourceUrl(config);
-    if (requested !== mediaUrl && !requested.startsWith(`${mediaUrl}/`)) {
+    if (!matchesResource(xcityMediaResourceUrl(config))) {
       throw new Error(`Unsupported Xcity resource URL: ${url}`);
     }
     const key = await this.#account().getTokenhubKey(config, false);
@@ -532,13 +624,20 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
 
   async startResourceConfigurator(resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
     const mediaResource = getMediaResource(this.env);
-    if (!mediaResource || resourceUrlPattern !== mediaResource.urlPattern) {
-      throw new Error(`Unsupported Xcity resource configurator type: ${resourceUrlPattern}`);
+    if (mediaResource && resourceUrlPattern === mediaResource.urlPattern) {
+      return {
+        iframeHtml: XCITY_MEDIA_CONFIGURATOR_HTML,
+        ui: new RpcStub(new XcityMediaConfiguratorUI(mediaResource.urlPattern)),
+      };
     }
-    return {
-      iframeHtml: XCITY_MEDIA_CONFIGURATOR_HTML,
-      ui: new RpcStub(new XcityMediaConfiguratorUI(mediaResource.urlPattern)),
-    };
+    const contextResource = getContextResource(this.env);
+    if (contextResource && resourceUrlPattern === contextResource.urlPattern) {
+      return {
+        iframeHtml: XCITY_CONTEXT_CONFIGURATOR_HTML,
+        ui: new RpcStub(new XcityContextConfiguratorUI(contextResource.urlPattern)),
+      };
+    }
+    throw new Error(`Unsupported Xcity resource configurator type: ${resourceUrlPattern}`);
   }
 
   async revoke(): Promise<void> {
@@ -551,8 +650,10 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     return { url: `${getBaseUrl(this.env)}/${this.ctx.props.userObjectId}/${initiationNonce}` };
   }
 
-  // Mint a verifier representing this account. Xcity media uses low-stakes observer handling:
-  // generated URLs are public outputs, and there is no Xcity ACL oracle for generated media.
+  /**
+   * Mint a verifier representing this account. Xcity media uses low-stakes observer handling:
+   * generated URLs are public outputs, and there is no Xcity ACL oracle for generated media.
+   */
   @skipRpcValidation()
   async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
     return this.ctx.exports.XcityVerifier({});
@@ -1033,6 +1134,416 @@ export class XcityMediaGatekeeperImpl extends DurableObject<Env, XcityMediaGatek
     }
     if (stillPolling) this.#setVideoAlarm();
   }
+}
+
+// =======================================================================================
+// Xcity context store resource
+
+type XcityContextGatekeeperProps = { userObjectId: string };
+
+type StoredContextCreateAction = {
+  kind: "create";
+  writeId: string;
+  options: SaveContextDocumentOptions;
+  submittedAt: number;
+};
+
+type StoredContextUpdateAction = {
+  kind: "update";
+  writeId: string;
+  contextId: string;
+  options: UpdateContextDocumentOptions;
+  submittedAt: number;
+};
+
+type StoredContextDeleteAction = {
+  kind: "delete";
+  writeId: string;
+  contextId: string;
+  submittedAt: number;
+};
+
+type StoredContextAction =
+  | StoredContextCreateAction
+  | StoredContextUpdateAction
+  | StoredContextDeleteAction;
+
+// Omit that distributes over the union so each member keeps its own fields (plain Omit would
+// reduce the union to its common keys, dropping contextId/options).
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+
+function contextResultKey(writeId: string): string {
+  return `context:result:${writeId}`;
+}
+
+class PendingContextActionStore {
+  #kv: DurableObjectStorage["kv"];
+
+  constructor(kv: DurableObjectStorage["kv"]) {
+    this.#kv = kv;
+  }
+
+  #actionKey(id: number): string {
+    return `context:pending:action:${id}`;
+  }
+
+  #writeKey(writeId: string): string {
+    return `context:pending:id:${writeId}`;
+  }
+
+  submit(action: DistributiveOmit<StoredContextAction, "writeId">): { actionId: number; writeId: string } {
+    const actionId = this.#kv.get<number>("context:pending:nextActionId") ?? 1;
+    const writeId = `${action.kind}_${actionId}`;
+    const stored = { ...action, writeId } as StoredContextAction;
+    this.#kv.put("context:pending:nextActionId", actionId + 1);
+    this.#kv.put(this.#actionKey(actionId), stored);
+    this.#kv.put(this.#writeKey(writeId), actionId);
+    return { actionId, writeId };
+  }
+
+  get(actionId: number): StoredContextAction | undefined {
+    return this.#kv.get<StoredContextAction>(this.#actionKey(actionId));
+  }
+
+  getByWriteId(writeId: string): StoredContextAction | undefined {
+    const actionId = this.#kv.get<number>(this.#writeKey(writeId));
+    return actionId === undefined ? undefined : this.get(actionId);
+  }
+
+  remove(actionId: number): void {
+    const action = this.get(actionId);
+    this.#kv.delete(this.#actionKey(actionId));
+    if (action) this.#kv.delete(this.#writeKey(action.writeId));
+  }
+}
+
+class XcityContextSessionContext {
+  readonly #approvalQueue: RpcStub<ApprovalQueue>;
+  readonly #pending: PendingContextActionStore;
+  readonly #readWrite: (writeId: string) => XcityContextWrite | undefined;
+  readonly #withKey: <T>(fn: (apiKey: string) => Promise<T>) => Promise<T>;
+  readonly #config: XcityContextConfig;
+
+  constructor(
+    approvalQueue: RpcStub<ApprovalQueue>,
+    pending: PendingContextActionStore,
+    readWrite: (writeId: string) => XcityContextWrite | undefined,
+    withKey: <T>(fn: (apiKey: string) => Promise<T>) => Promise<T>,
+    config: XcityContextConfig,
+  ) {
+    this.#approvalQueue = approvalQueue;
+    this.#pending = pending;
+    this.#readWrite = readWrite;
+    this.#withKey = withKey;
+    this.#config = config;
+  }
+
+  async listDocuments(options?: ListContextDocumentsOptions): Promise<XcityContextDocumentList> {
+    await this.#approvalQueue.authorizeObservation({
+      title: "List Xcity context documents",
+      description:
+          "Read document titles, content previews, and tags from the user's shared Xcity context store.",
+    });
+    return this.#withKey(apiKey => listContextDocuments(this.#config, apiKey, options));
+  }
+
+  async getDocument(contextId: string): Promise<XcityContextDocument> {
+    const id = assertContextId(contextId);
+    await this.#approvalQueue.authorizeObservation({
+      title: "Read Xcity context document",
+      description: `Read the full content of Xcity context document \`${id}\`.`,
+    });
+    return this.#withKey(apiKey => getContextDocument(this.#config, apiKey, id));
+  }
+
+  async #submitWrite(
+    action: DistributiveOmit<StoredContextAction, "writeId">,
+    description: { title: string; description: string; tag: string },
+  ): Promise<XcityContextWrite> {
+    const { actionId, writeId } = this.#pending.submit(action);
+    try {
+      await this.#approvalQueue.submitAction(actionId, {
+        title: description.title,
+        description: description.description,
+        implementsRevert: false,
+        awaitDecision: true,
+        actionKind: { tag: description.tag, label: description.title },
+      });
+    } catch (error) {
+      this.#pending.remove(actionId);
+      throw error;
+    }
+    return pendingContextWrite(
+      action.kind,
+      writeId,
+      action.kind === "create" ? undefined : action.contextId,
+      () => action.submittedAt,
+    );
+  }
+
+  async saveDocument(options: SaveContextDocumentOptions): Promise<XcityContextWrite> {
+    const normalized = normalizeSaveContextOptions(options);
+    return this.#submitWrite(
+      { kind: "create", options: normalized, submittedAt: Date.now() },
+      {
+        title: "Save Xcity context document",
+        description:
+            "Create a new document in the user's shared Xcity context store.\n\n" +
+            `Title: ${normalized.title}\n\n` +
+            (normalized.tags?.length ? `Tags: ${normalized.tags.join(", ")}\n\n` : "") +
+            `Content:\n\n${truncate(normalized.content)}`,
+        tag: "xcity.context.save",
+      },
+    );
+  }
+
+  async updateDocument(
+    contextId: string, options: UpdateContextDocumentOptions,
+  ): Promise<XcityContextWrite> {
+    const id = assertContextId(contextId);
+    const normalized = normalizeUpdateContextOptions(options);
+    return this.#submitWrite(
+      { kind: "update", contextId: id, options: normalized, submittedAt: Date.now() },
+      {
+        title: "Update Xcity context document",
+        description:
+            `Update Xcity context document \`${id}\`.\n\n` +
+            `Changed fields: ${Object.keys(normalized).join(", ")}\n\n` +
+            (normalized.title !== undefined ? `New title: ${normalized.title}\n\n` : "") +
+            (normalized.content !== undefined ? `New content:\n\n${truncate(normalized.content)}` : ""),
+        tag: "xcity.context.update",
+      },
+    );
+  }
+
+  async deleteDocument(contextId: string): Promise<XcityContextWrite> {
+    const id = assertContextId(contextId);
+    return this.#submitWrite(
+      { kind: "delete", contextId: id, submittedAt: Date.now() },
+      {
+        title: "Delete Xcity context document",
+        description: `Permanently delete Xcity context document \`${id}\` from the shared store.`,
+        tag: "xcity.context.delete",
+      },
+    );
+  }
+
+  async getWrite(id: string): Promise<XcityContextWrite> {
+    const write = this.#readWrite(id);
+    if (!write) throw new Error(`Unknown Xcity context write id: ${id}`);
+    await this.#approvalQueue.authorizeObservation({
+      title: "Read Xcity context write status",
+      description: `Read the status and outcome of Xcity context write \`${id}\`.`,
+    });
+    return write;
+  }
+}
+
+@validateRpc()
+class XcityContextSessionImpl extends RpcTarget implements XcityContext {
+  #context: XcityContextSessionContext;
+
+  constructor(context: XcityContextSessionContext) {
+    super();
+    this.#context = context;
+  }
+
+  listDocuments(options?: ListContextDocumentsOptions): Promise<XcityContextDocumentList> {
+    return this.#context.listDocuments(options);
+  }
+
+  getDocument(contextId: string): Promise<XcityContextDocument> {
+    return this.#context.getDocument(contextId);
+  }
+
+  saveDocument(options: SaveContextDocumentOptions): Promise<XcityContextWrite> {
+    return this.#context.saveDocument(options);
+  }
+
+  updateDocument(contextId: string, options: UpdateContextDocumentOptions): Promise<XcityContextWrite> {
+    return this.#context.updateDocument(contextId, options);
+  }
+
+  deleteDocument(contextId: string): Promise<XcityContextWrite> {
+    return this.#context.deleteDocument(contextId);
+  }
+
+  getWrite(id: string): Promise<XcityContextWrite> {
+    return this.#context.getWrite(id);
+  }
+}
+
+@validateRpc()
+export class XcityContextGatekeeperImpl extends DurableObject<Env, XcityContextGatekeeperProps>
+    implements Gatekeeper<XcityContext> {
+  #userAccount() {
+    const ns = userAccountNamespace(this.env, this.ctx.exports);
+    return ns.get(ns.idFromString(this.ctx.props.userObjectId));
+  }
+
+  #contextConfig(): XcityContextConfig {
+    const config = readXcityContextConfig(this.env);
+    if (!config) throw new Error("The Xcity context store is not configured on this deployment.");
+    return config;
+  }
+
+  async #getTokenhubKey(forceMint: boolean): Promise<string> {
+    const record = await this.#userAccount().getTokenhubKey(this.#contextConfig(), forceMint);
+    if (!record) {
+      throw new Error("The Xcity context store is unavailable for this account. Reconnect Xcity and retry.");
+    }
+    const { key } = record;
+    return key;
+  }
+
+  // Shared key mint/refresh with the media path (UserAccount.getTokenhubKey), but retries only on
+  // 401: for the context store, 403 means "not your document" and a fresh key cannot fix it.
+  #withTokenhubKey<T>(fn: (apiKey: string) => Promise<T>): Promise<T> {
+    return withContextKeyRetry(forceMint => this.#getTokenhubKey(forceMint), fn);
+  }
+
+  #pending(): PendingContextActionStore {
+    return new PendingContextActionStore(this.ctx.storage.kv);
+  }
+
+  #storeResult(result: XcityContextWrite): void {
+    this.ctx.storage.kv.put(contextResultKey(result.id), result);
+  }
+
+  #failedWrite(action: StoredContextAction, error: unknown): XcityContextWrite {
+    return {
+      id: action.writeId,
+      kind: action.kind,
+      status: "failed",
+      ...(action.kind !== "create" ? { contextId: action.contextId } : {}),
+      error: error instanceof Error ? error.message : String(error),
+      createdAt: new Date(action.submittedAt),
+      updatedAt: new Date(),
+    };
+  }
+
+  #readWrite(writeId: string): XcityContextWrite | undefined {
+    const result = this.ctx.storage.kv.get<XcityContextWrite>(contextResultKey(writeId));
+    if (result) return result;
+    const action = this.#pending().getByWriteId(writeId);
+    if (action) {
+      return pendingContextWrite(
+        action.kind,
+        writeId,
+        action.kind === "create" ? undefined : action.contextId,
+        () => action.submittedAt,
+      );
+    }
+    return undefined;
+  }
+
+  async #performWrite(action: StoredContextAction): Promise<XcityContextWrite> {
+    const createdAt = new Date(action.submittedAt);
+    switch (action.kind) {
+      case "create": {
+        const document = await this.#withTokenhubKey(apiKey =>
+          createContextDocument(this.#contextConfig(), apiKey, action.options));
+        return {
+          id: action.writeId,
+          kind: "create",
+          status: "completed",
+          contextId: document.contextId,
+          document,
+          createdAt,
+          updatedAt: new Date(),
+        };
+      }
+      case "update": {
+        const document = await this.#withTokenhubKey(apiKey =>
+          updateContextDocument(this.#contextConfig(), apiKey, action.contextId, action.options));
+        return {
+          id: action.writeId,
+          kind: "update",
+          status: "completed",
+          contextId: action.contextId,
+          ...(document ? { document } : {}),
+          createdAt,
+          updatedAt: new Date(),
+        };
+      }
+      case "delete": {
+        await this.#withTokenhubKey(apiKey =>
+          deleteContextDocument(this.#contextConfig(), apiKey, action.contextId));
+        return {
+          id: action.writeId,
+          kind: "delete",
+          status: "completed",
+          contextId: action.contextId,
+          createdAt,
+          updatedAt: new Date(),
+        };
+      }
+    }
+  }
+
+  async describe(): Promise<ResourceDescription> {
+    const config = this.#contextConfig();
+    return {
+      url: xcityContextResourceUrl(config),
+      title: "Xcity Context",
+      snippet: "Read and write the user's shared Xcity context documents (cross-product context store).",
+      suggestedBindingName: "XCITY_CONTEXT",
+      tsType: "XcityContext",
+    };
+  }
+
+  async getTypeScriptTypes(): Promise<string> {
+    return TYPES_CODE;
+  }
+
+  async getAutoApprovableActions() {
+    return [];
+  }
+
+  async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<XcityContext> {
+    return new XcityContextSessionImpl(new XcityContextSessionContext(
+      approvalQueue.dup(),
+      this.#pending(),
+      writeId => this.#readWrite(writeId),
+      fn => this.#withTokenhubKey(fn),
+      this.#contextConfig(),
+    ));
+  }
+
+  async applyAction(actionId: number): Promise<void> {
+    const pending = this.#pending();
+    const action = pending.get(actionId);
+    if (!action) throw new Error(`Unknown pending Xcity context action: ${actionId}`);
+    try {
+      this.#storeResult(await this.#performWrite(action));
+    } catch (error) {
+      // Store the failure as the write's outcome so the agent's getWrite() sees a clean message,
+      // mirroring the media image path.
+      this.#storeResult(this.#failedWrite(action, error));
+    }
+    pending.remove(actionId);
+  }
+
+  async rejectAction(actionId: number): Promise<void> {
+    this.#pending().remove(actionId);
+  }
+
+  async revertAction(_action: number): Promise<{ message: string }> {
+    return {
+      message:
+          "Xcity context writes cannot be reverted automatically. Edit or restore the document " +
+          "through another update if the change must be undone.",
+    };
+  }
+
+  /**
+   * Context documents read into a shared gadget are already visible to its collaborators, and
+   * tokenhub scopes documents to the connected user/team with no finer per-collaborator ACL to
+   * consult, so this mirrors the media resource's low-stakes observer handling.
+   */
+  async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {}
+
+  async removeObserver(_id: string): Promise<void> {}
 }
 
 // Xcity media output URLs are public once generated, and there is no per-collaborator Xcity ACL to

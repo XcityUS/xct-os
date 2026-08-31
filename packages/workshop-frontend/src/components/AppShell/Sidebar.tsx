@@ -3,7 +3,6 @@ import {
   Blueprint,
   BookOpen,
   Compass,
-  Hexagon,
   House,
   MagnifyingGlass,
   SidebarSimple,
@@ -12,6 +11,7 @@ import {
 } from '@phosphor-icons/react'
 import { useSiteName } from '../../ServerConfigContext'
 import SiteLogo from '../SiteLogo'
+import XcityMark from '../XcityMark'
 import { useGatekeeperApps } from '../../useGatekeeperApps'
 import { openCommandPalette } from './commandPaletteBus'
 import SidebarItem from './SidebarItem'
@@ -21,17 +21,20 @@ import {
   SidebarWorkspacesLists,
 } from './SidebarWorkspaces'
 import SidebarUtilityStrip from './SidebarUtilityStrip'
+import SidebarBuildVersion from './SidebarBuildVersion'
 
-// The persistent left rail. Three pinned regions sandwich a single scrolling region of lists, so
-// the user can always reach Search, primary nav, and the bottom utility strip no matter how many
-// workspaces they have.
-//
-// Layout (top → bottom):
-//   • brand row                            pinned
-//   • primary nav (Home, Workspaces, …)    pinned
-//   • workspace tools (⌘K search)          pinned
-//   • Favorites / Recent workspaces        SCROLLS
-//   • utility strip (plug, avatar)         pinned
+/**
+ * The persistent left rail. Three pinned regions sandwich a single scrolling region of lists, so
+ * the user can always reach Search, primary nav, and the bottom utility strip no matter how many
+ * workspaces they have.
+ *
+ * Layout (top → bottom):
+ *   • brand row                            pinned
+ *   • primary nav (Home, Workspaces, …)    pinned
+ *   • workspace tools (⌘K search)          pinned
+ *   • Favorites / Recent workspaces        SCROLLS
+ *   • utility strip (plug, avatar)         pinned
+ */
 export default function Sidebar({
   collapsed,
   onToggleCollapsed,
@@ -51,8 +54,8 @@ export default function Sidebar({
       className={[
         // Sidebar is the app chrome: a hair greyer than the (lighter) content canvas so the two
         // surfaces read as distinct without a heavy divider.
-        'flex h-screen flex-col border-r border-kumo-line bg-kumo-elevated',
-        collapsed ? 'w-[56px]' : 'w-[260px]',
+        'flex h-full flex-col border-r border-kumo-line bg-kumo-elevated',
+        collapsed ? 'w-[56px]' : 'w-[min(320px,100vw)] md:w-[260px]',
         'shrink-0 transition-[width] duration-200 ease-out',
       ].join(' ')}
     >
@@ -65,7 +68,7 @@ export default function Sidebar({
       >
         <Link to="/" aria-label={siteName} className="flex min-w-0 items-center gap-2">
           <SiteLogo size={20} className="shrink-0">
-            <Hexagon size={20} weight="bold" className="text-kumo-brand shrink-0" />
+            <XcityMark size={20} className="shrink-0" />
           </SiteLogo>
           {!collapsed && (
             <span className="truncate text-[14px] leading-5 font-semibold tracking-[-0.25px] text-kumo-default">
@@ -198,6 +201,7 @@ export default function Sidebar({
       </SidebarWorkspacesProvider>
 
       <SidebarUtilityStrip collapsed={collapsed} />
+      <SidebarBuildVersion collapsed={collapsed} />
     </aside>
   )
 }

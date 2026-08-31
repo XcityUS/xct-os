@@ -139,7 +139,7 @@ const SELF_CLOSING_HTML = `<!DOCTYPE html>
 <html lang="en">
   <body>
     <script type="text/javascript">window.close();</script>
-    <p>Authorization complete. You may close this tab and return to Cloudflare OS.</p>
+    <p>Authorization complete. You may close this tab and return to Xcity OS.</p>
   </body>
 </html>`;
 
@@ -149,7 +149,7 @@ const INVALID_LINK_HTML = `<!DOCTYPE html>
   <body style="font-family: system-ui, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #f5f5f5;">
     <div style="max-width: 520px; padding: 2rem; background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center;">
       <h1 style="color: #b45309; font-size: 1.5rem;">Authorization Link Expired</h1>
-      <p style="color: #555; line-height: 1.6;">This authorization link is invalid or has expired. Please return to Cloudflare OS and try again.</p>
+      <p style="color: #555; line-height: 1.6;">This authorization link is invalid or has expired. Please return to Xcity OS and try again.</p>
     </div>
   </body>
 </html>`;
@@ -299,7 +299,7 @@ export default {
     if (relPath === "/oauth") {
       const error = url.searchParams.get("error");
       if (error) {
-        return new Response("Supabase authorization failed. Please restart the connection flow from Cloudflare OS.", {
+        return new Response("Supabase authorization failed. Please restart the connection flow from Xcity OS.", {
           status: 400,
           headers: { "Content-Type": "text/plain; charset=utf-8" },
         });
@@ -346,7 +346,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
       color: "#f0fdf4",
       tagline: "Query Postgres, inspect schema, and manage projects",
       description:
-          "Connect your Supabase account so Cloudflare OS can run SQL against your project databases, " +
+          "Connect your Supabase account so Xcity OS can run SQL against your project databases, " +
           "explore schema, and inspect edge functions and storage for the projects you choose.",
     };
   }
@@ -399,7 +399,7 @@ export class UserAccount extends DurableObject<Env> {
     });
   }
 
-  // Verify the initiation nonce and mint a one-time OAuth `state` nonce. Returns null if invalid.
+  /** Verify the initiation nonce and mint a one-time OAuth `state` nonce. Returns null if invalid. */
   async beginOAuthFlow(initiationNonce: string): Promise<string | null> {
     const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
     if (!stored || stored.stage !== "initiation" || Date.now() >= stored.expiresAt
@@ -465,7 +465,7 @@ export class UserAccount extends DurableObject<Env> {
     this.ctx.storage.kv.put<number>("accessTokenExpiresAt", Date.now() + expiresIn * 1000);
   }
 
-  // Returns a valid access token (and its expiry), transparently refreshing when close to expiry.
+  /** Returns a valid access token (and its expiry), transparently refreshing when close to expiry. */
   async getAccessToken(): Promise<StoredToken> {
     const accessToken = this.ctx.storage.kv.get<string>("accessToken");
     const refreshToken = this.ctx.storage.kv.get<string>("refreshToken");
@@ -658,10 +658,12 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     return { url: `${getBaseUrl(this.env)}/${this.ctx.props.userObjectId}/${initiationNonce}` };
   }
 
-  // Mint a verifier representing this account, used by SupabaseGatekeeperImpl.addObserver to confirm
-  // a prospective observer may read a bound project (and, for org bindings, the org and each
-  // accessed project). The verifier carries this user's own account id, so the access checks run
-  // against the observer's *own* Supabase token.
+  /**
+   * Mint a verifier representing this account, used by SupabaseGatekeeperImpl.addObserver to confirm
+   * a prospective observer may read a bound project (and, for org bindings, the org and each
+   * accessed project). The verifier carries this user's own account id, so the access checks run
+   * against the observer's *own* Supabase token.
+   */
   @skipRpcValidation()
   async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
     const props: SupabaseVerifierProps = { userObjectId: this.ctx.props.userObjectId };
@@ -685,8 +687,10 @@ type SupabaseVerifierProps = {
   userObjectId: string;
 };
 
-// The non-standard methods the Supabase gatekeeper calls on its own verifier (see addObserver). Not
-// part of the generic GatekeeperUserVerifier contract.
+/**
+ * The non-standard methods the Supabase gatekeeper calls on its own verifier (see addObserver). Not
+ * part of the generic GatekeeperUserVerifier contract.
+ */
 export interface SupabaseVerifierApi extends GatekeeperUserVerifier {
   hasProjectAccess(refs: string[]): Promise<boolean[]>;
   hasOrgAccess(slug: string): Promise<boolean>;
@@ -1079,8 +1083,10 @@ export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeepe
     return new SupabaseOrganizationImpl(context, this.#requireSlug());
   }
 
-  // Approved: run the queued SQL statement for real, then drop it and invalidate cached schema
-  // metadata (the database may have changed).
+  /**
+   * Approved: run the queued SQL statement for real, then drop it and invalidate cached schema
+   * metadata (the database may have changed).
+   */
   async applyAction(actionId: number): Promise<void> {
     const pending = new PendingActionStore(this.ctx.storage.kv);
     const action = pending.get(actionId);
@@ -1102,13 +1108,15 @@ export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeepe
     new SupabaseCache(this.ctx.storage.kv).bumpGeneration();
   }
 
-  // Rejected: discard the queued statement. There is no simulation state to roll back.
+  /** Rejected: discard the queued statement. There is no simulation state to roll back. */
   async rejectAction(actionId: number): Promise<void> {
     new PendingActionStore(this.ctx.storage.kv).remove(actionId);
   }
 
-  // Arbitrary SQL changes can't be reliably undone, so we don't offer automatic revert
-  // (submitAction sets implementsRevert: false, so this is not normally reached).
+  /**
+   * Arbitrary SQL changes can't be reliably undone, so we don't offer automatic revert
+   * (submitAction sets implementsRevert: false, so this is not normally reached).
+   */
   async revertAction(_action: number): Promise<void | { message?: string; canRetry?: boolean }> {
     return {
       message:
@@ -1117,22 +1125,24 @@ export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeepe
     };
   }
 
-  // Observer tracking. Strategy depends on the binding's granularity:
-  //
-  // - Project binding — "ACL check (single unit)". Arbitrary read-only SQL can read anything in the
-  //   project's database, so the project is the atomic unit. We just confirm the observer can access
-  //   the project (their own `/v1/projects` lists it). Nothing read later could be outside that unit,
-  //   so no observers are tracked and removeObserver is a no-op.
-  //
-  // - Organization binding — "data-set tracking (by project)". Org members may have access to
-  //   different projects, so we track which projects' data the Gadget has actually observed and
-  //   verify each observer against them. addObserver requires org membership (so org-level metadata
-  //   like the project list is fine to show) plus access to every already-observed project; later,
-  //   the first observation of a *new* project excludes any observer lacking it (see
-  //   #prepareProjectObservation). Verified observers are remembered (their verifier stored) so that
-  //   forward-exclusion check can run.
-  //
-  // The overseer re-runs addObserver on every open, catching loss of access promptly.
+  /**
+   * Observer tracking. Strategy depends on the binding's granularity:
+   *
+   * - Project binding — "ACL check (single unit)". Arbitrary read-only SQL can read anything in the
+   *   project's database, so the project is the atomic unit. We just confirm the observer can access
+   *   the project (their own `/v1/projects` lists it). Nothing read later could be outside that unit,
+   *   so no observers are tracked and removeObserver is a no-op.
+   *
+   * - Organization binding — "data-set tracking (by project)". Org members may have access to
+   *   different projects, so we track which projects' data the Gadget has actually observed and
+   *   verify each observer against them. addObserver requires org membership (so org-level metadata
+   *   like the project list is fine to show) plus access to every already-observed project; later,
+   *   the first observation of a *new* project excludes any observer lacking it (see
+   *   #prepareProjectObservation). Verified observers are remembered (their verifier stored) so that
+   *   forward-exclusion check can run.
+   *
+   * The overseer re-runs addObserver on every open, catching loss of access promptly.
+   */
   async addObserver(id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
     const verifier = user as unknown as Fetcher<SupabaseVerifierApi>;
 

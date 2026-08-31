@@ -1,6 +1,7 @@
 import { createWorkshopLogger } from "../observability.js";
 import type { XcityConfig } from "./config.js";
 import { isSafeXcityAgentSlug } from "./agent-catalog.js";
+import { fetchWithOneRetry } from "./fetch-retry.js";
 import {
   XcityModelPlane,
   type XcityModelPlaneStorage,
@@ -16,9 +17,19 @@ const SKILL_INDEX_PAGE_SIZE = 200;
 // Backstop against an unbounded cursor walk if the gateway ever stops advancing.
 const SKILL_INDEX_MAX_PAGES = 25;
 
+/**
+ * What tokenhub knows about a marketplace persona: the system prompt text (null when the skill
+ * exists but no prompt was imported) and, when the skill is priced, the per-use price in KWH.
+ */
+export type XcityAgentPersonaDetails = {
+  persona: string | null;
+  /** Per-use price in KWH (`pricing.kwh_per_use`); undefined when the skill is free or unpriced. */
+  kwhPerUse?: number;
+};
+
 type PersonaCacheEntry = {
   fetchedAt: number;
-  persona: string | null;
+  details: XcityAgentPersonaDetails;
 };
 
 // slug -> skill_id for every persona the importer has published.
@@ -42,10 +53,21 @@ function cacheKey(config: XcityConfig, slug: string): string {
   return `${config.tokenhubUrl}\n${slug}`;
 }
 
-function parsePersona(body: unknown): string | null {
+function parsePositiveNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function parsePersona(body: unknown): XcityAgentPersonaDetails {
   let record = isRecord(body) && isRecord(body.data) ? body.data : body;
-  if (!isRecord(record)) return null;
-  return optionalString(record.system_prompt_template)?.trim() ?? null;
+  if (!isRecord(record)) return { persona: null };
+
+  let persona = optionalString(record.system_prompt_template)?.trim() ?? null;
+  let pricing = isRecord(record.pricing) ? record.pricing : undefined;
+  let kwhPerUse = parsePositiveNumber(pricing?.kwh_per_use);
+  return {
+    persona,
+    ...(kwhPerUse !== undefined ? { kwhPerUse } : {}),
+  };
 }
 
 // Build slug -> skill_id from the gateway's skill listing.
@@ -66,10 +88,10 @@ async function fetchSkillIndex(apiKey: string, config: XcityConfig): Promise<Map
 
     let response: Response;
     try {
-      response = await fetch(url, {
+      response = await fetchWithOneRetry(url, () => ({
         headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
         signal: AbortSignal.timeout(15_000),
-      });
+      }));
     } catch (error) {
       logger.warn("xcity skill index request failed", {
         event: "xcity.agent.persona.index.failed", error,
@@ -131,7 +153,7 @@ async function resolveSkillId(apiKey: string, config: XcityConfig, slug: string)
 
 async function fetchPersona(apiKey: string, config: XcityConfig, slug: string): Promise<{
   status: "ok";
-  persona: string | null;
+  details: XcityAgentPersonaDetails;
 } | {
   status: "unauthorized";
 } | {
@@ -142,13 +164,14 @@ async function fetchPersona(apiKey: string, config: XcityConfig, slug: string): 
 
   let response: Response;
   try {
-    response = await fetch(`${config.tokenhubUrl}/v1/xct-skills/${encodeURIComponent(skillId)}`, {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        Accept: "application/json",
-      },
-      signal: AbortSignal.timeout(10_000),
-    });
+    response = await fetchWithOneRetry(
+        `${config.tokenhubUrl}/v1/xct-skills/${encodeURIComponent(skillId)}`, () => ({
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            Accept: "application/json",
+          },
+          signal: AbortSignal.timeout(10_000),
+        }));
   } catch (error) {
     logger.warn("xcity agent persona request failed", {
       event: "xcity.agent.persona.failed", agentSlug: slug, error,
@@ -165,7 +188,7 @@ async function fetchPersona(apiKey: string, config: XcityConfig, slug: string): 
       event: "xcity.agent.persona.unavailable", agentSlug: slug, status: response.status,
     });
     response.body?.cancel();
-    return { status: "ok", persona: null };
+    return { status: "ok", details: { persona: null } };
   }
   if (!response.ok) {
     logger.warn("xcity agent persona request failed", {
@@ -188,28 +211,34 @@ async function fetchPersona(apiKey: string, config: XcityConfig, slug: string): 
     return { status: "failed" };
   }
 
-  let persona = parsePersona(body);
-  if (!persona) {
+  let details = parsePersona(body);
+  if (!details.persona) {
     logger.info("xcity agent persona is unavailable", {
       event: "xcity.agent.persona.unavailable", agentSlug: slug,
     });
   }
-  return { status: "ok", persona };
+  return { status: "ok", details };
 }
 
-export async function getXcityAgentPersona(
+/**
+ * Fetch the marketplace persona for `slug` through the user's own tokenhub virtual key, along
+ * with its per-use pricing. Cached in-isolate for 30 minutes. Returns null when the slug is
+ * unsafe, no key could be minted, or tokenhub failed; `{ persona: null }` records a valid skill
+ * without an imported prompt.
+ */
+export async function getXcityAgentPersonaDetails(
     env: Cloudflare.Env,
     config: XcityConfig,
     storage: XcityModelPlaneStorage,
     identity: XcityUserIdentity,
     slug: string,
-    email?: string): Promise<string | null> {
+    email?: string): Promise<XcityAgentPersonaDetails | null> {
   if (!isSafeXcityAgentSlug(slug)) return null;
 
   let key = cacheKey(config, slug);
   let cached = personaCache.get(key);
   if (cached && Date.now() - cached.fetchedAt < PERSONA_CACHE_MS) {
-    return cached.persona;
+    return cached.details;
   }
 
   let tokenhubKey = await XcityModelPlane.getUserTokenhubKey(
@@ -227,9 +256,24 @@ export async function getXcityAgentPersona(
 
   personaCache.set(key, {
     fetchedAt: Date.now(),
-    persona: fetched.persona,
+    details: fetched.details,
   });
-  return fetched.persona;
+  return fetched.details;
+}
+
+/**
+ * Fetch just the persona prompt for `slug` (see getXcityAgentPersonaDetails). Kept for callers
+ * that only inject the prompt and don't care about pricing.
+ */
+export async function getXcityAgentPersona(
+    env: Cloudflare.Env,
+    config: XcityConfig,
+    storage: XcityModelPlaneStorage,
+    identity: XcityUserIdentity,
+    slug: string,
+    email?: string): Promise<string | null> {
+  let details = await getXcityAgentPersonaDetails(env, config, storage, identity, slug, email);
+  return details?.persona ?? null;
 }
 
 export function clearXcityAgentPersonaCacheForTests(): void {

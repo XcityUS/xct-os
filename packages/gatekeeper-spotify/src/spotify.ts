@@ -133,7 +133,7 @@ const SELF_CLOSING_HTML = `<!DOCTYPE html>
 <html lang="en">
   <body>
     <script type="text/javascript">window.close();</script>
-    <p>Authorization complete. You may close this tab and return to Cloudflare OS.</p>
+    <p>Authorization complete. You may close this tab and return to Xcity OS.</p>
   </body>
 </html>`;
 
@@ -143,7 +143,7 @@ const INVALID_LINK_HTML = `<!DOCTYPE html>
   <body style="font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #f5f5f5;">
     <div style="max-width: 520px; padding: 2rem; background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center;">
       <h1 style="color: #1DB954; font-size: 1.5rem; margin: 0 0 1rem 0;">Authorization Link Expired</h1>
-      <p style="color: #555; line-height: 1.6; margin: 0 0 1.5rem 0;">This authorization link is invalid or has expired. Please return to Cloudflare OS and try again.</p>
+      <p style="color: #555; line-height: 1.6; margin: 0 0 1.5rem 0;">This authorization link is invalid or has expired. Please return to Xcity OS and try again.</p>
       <button onclick="window.close()" style="padding: 0.5rem 1.5rem; background: #1DB954; color: white; border: none; border-radius: 4px; font-size: 1rem; cursor: pointer;">Close</button>
     </div>
   </body>
@@ -421,7 +421,7 @@ export default {
     if (relPath === "/oauth") {
       const error = url.searchParams.get("error");
       if (error) {
-        return new Response("Spotify authorization failed or was denied. Please restart the connection flow from Cloudflare OS.", {
+        return new Response("Spotify authorization failed or was denied. Please restart the connection flow from Xcity OS.", {
           status: 400,
           headers: { "Content-Type": "text/plain; charset=utf-8" },
         });
@@ -465,7 +465,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
       color: "#1DB954",
       tagline: "Manage playlists, your library, and playback",
       description:
-        "Connect your Spotify account so Cloudflare OS can search the catalog, read and edit your " +
+        "Connect your Spotify account so Xcity OS can search the catalog, read and edit your " +
         "library and playlists, and control playback on your devices. Grant whole-account access " +
         "or scope a Gadget to a single playlist.",
     };
@@ -664,7 +664,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     });
   }
 
-  // Spotify is not offered as a sign-in identity provider (no verified-email flag exposed).
+  /** Spotify is not offered as a sign-in identity provider (no verified-email flag exposed). */
   async getAuthenticatedEmail(): Promise<string | null> {
     return null;
   }
@@ -727,11 +727,13 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     return { url: `${getBaseUrl(this.env)}/${this.ctx.props.userObjectId}/${initiationNonce}` };
   }
 
-  // Mint a verifier representing this account. Spotify uses the "low-stakes" observer strategy (see
-  // SpotifyGatekeeperImpl.addObserver): a personal Spotify account is not the kind of restricted
-  // corporate data the information-flow model is designed to protect, so any collaborator may
-  // observe. The verifier therefore carries no identity and is never consulted — but the overseer
-  // mints one on every open, so it must exist and not throw.
+  /**
+   * Mint a verifier representing this account. Spotify uses the "low-stakes" observer strategy (see
+   * SpotifyGatekeeperImpl.addObserver): a personal Spotify account is not the kind of restricted
+   * corporate data the information-flow model is designed to protect, so any collaborator may
+   * observe. The verifier therefore carries no identity and is never consulted — but the overseer
+   * mints one on every open, so it must exist and not throw.
+   */
   @skipRpcValidation()
   async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
     return this.ctx.exports.SpotifyVerifier({});
@@ -1037,11 +1039,13 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     return new SpotifyAccountSessionImpl(this, queue);
   }
 
-  // Observer tracking: Spotify uses the "low-stakes" strategy. A personal Spotify account (profile,
-  // library, playlists, playback) is not the kind of restricted, access-controlled corporate data
-  // the information-flow model exists to protect — if you share a Gadget that can read your
-  // playlists, that is your call. So any collaborator may observe: addObserver/removeObserver are
-  // no-ops and we never set excludeObservers on observations.
+  /**
+   * Observer tracking: Spotify uses the "low-stakes" strategy. A personal Spotify account (profile,
+   * library, playlists, playback) is not the kind of restricted, access-controlled corporate data
+   * the information-flow model exists to protect — if you share a Gadget that can read your
+   * playlists, that is your call. So any collaborator may observe: addObserver/removeObserver are
+   * no-ops and we never set excludeObservers on observations.
+   */
   async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {}
   async removeObserver(_id: string): Promise<void> {}
 
@@ -1214,9 +1218,11 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     return entries;
   }
 
-  // Verify the connected user may edit this playlist (owns it, or it's collaborative) before
-  // queueing a content edit, and return the current (simulated) track count for bounds checks.
-  // Provisional (not-yet-created) playlists are always owned by the user.
+  /**
+   * Verify the connected user may edit this playlist (owns it, or it's collaborative) before
+   * queueing a content edit, and return the current (simulated) track count for bounds checks.
+   * Provisional (not-yet-created) playlists are always owned by the user.
+   */
   async assertEditablePlaylist(logicalId: string): Promise<{ trackCount: number }> {
     const realId = this.#resolveRealPlaylistId(logicalId);
     if (!realId) {

@@ -1,6 +1,6 @@
 import { WorkerEntrypoint, DurableObject, RpcTarget, RpcStub } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
-import { GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, ResourceDescription, ApprovalQueue, ObservationDescription, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription, SupportedResource, ResourceConfiguratorFrame, Cursor, ActionKind, stripTrailingSlashes } from '@gadgets/workshop-shared/gatekeeper';
+import { GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, ResourceDescription, ApprovalQueue, ObservationDescription, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription, SupportedResource, ResourceConfiguratorFrame, Cursor, ActionKind } from '@gadgets/workshop-shared/gatekeeper';
 import { exchangeAuthCode, getAccessToken, getGoogleAccountDescription, getGoogleVerifiedEmail, GmailApi, GmailMessageRaw, GmailOutboundMessage, GoogleAccessToken, normalizeEmailRecipients, revokeGoogleToken } from "./google-api";
 import {
   GmailSession, GmailThread, GmailMessage,
@@ -13,6 +13,10 @@ import type {
   GoogleSpreadsheetSession, SpreadsheetInfo, SpreadsheetRange, SpreadsheetValueMode,
 } from "./sheets-types";
 import { docToMarkdown, markdownToDocRequests, computeReplaceOperations, DocSnapshot } from "./markdown-converter";
+import { DriveApi } from "./drive-api";
+import { driveObserverTracker } from "./drive-observers";
+import { DriveSessionCore, type DriveBindingScope } from "./drive-session";
+import type { DriveEntry, DriveListOptions, DriveSearchQuery, GoogleDriveSession } from "./drive-types";
 import { BigQueryApi, DEFAULT_MAX_BYTES_BILLED } from "./bigquery-api";
 import {
   BigQueryDataset, BigQueryDryRunResult, BigQueryField, BigQueryProject,
@@ -32,21 +36,62 @@ import DOCS_TYPES_CODE from "./docs-types.txt";
 import BIGQUERY_TYPES_CODE from "./bigquery-types.txt";
 import CALENDAR_TYPES_CODE from "./calendar-types.txt";
 import SHEETS_TYPES_CODE from "./sheets-types.txt";
+import DRIVE_TYPES_CODE from "./drive-types.txt";
 import {
   BigQueryConfiguratorUI,
   CalendarConfiguratorUI,
   GmailConfiguratorUI,
   GoogleDocConfiguratorUI,
   GoogleSheetsConfiguratorUI,
+  DriveAccountConfiguratorUI,
+  DriveFileConfiguratorUI,
+  SharedDriveConfiguratorUI,
 } from "./google-configurators";
 import BIGQUERY_CONFIGURATOR_HTML from "./generated/bigquery-configurator-ui.txt";
 import CALENDAR_CONFIGURATOR_HTML from "./generated/calendar-configurator-ui.txt";
 import GMAIL_CONFIGURATOR_HTML from "./generated/gmail-configurator-ui.txt";
 import GOOGLE_DOC_CONFIGURATOR_HTML from "./generated/google-doc-configurator-ui.txt";
 import GOOGLE_SHEETS_CONFIGURATOR_HTML from "./generated/google-sheets-configurator-ui.txt";
+import DRIVE_ACCOUNT_CONFIGURATOR_HTML from "./generated/drive-account-configurator-ui.txt";
+import DRIVE_FILE_CONFIGURATOR_HTML from "./generated/drive-file-configurator-ui.txt";
+import SHARED_DRIVE_CONFIGURATOR_HTML from "./generated/shared-drive-configurator-ui.txt";
 import GOOGLE_LOGO_SVG from "./google-logo.svg";
 import { obsContext } from "./observability.js";
 import { AccessTokenCache, AccessTokenRequest, ACCESS_TOKEN_EXPIRY_SAFETY_MS } from "./auth-retry";
+import {
+  MAX_GMAIL_VISIBLE_THREAD_MESSAGES, validateGmailAddress, validateGmailBody,
+  validateGmailQueryForGrouping, validateGmailRecipientCount, validateOutboundInput,
+} from "./gmail-validate";
+import {
+  BIGQUERY_HOST, BIGQUERY_RESOURCE, GMAIL_RESOURCE, GOOGLE_CALENDAR_RESOURCE,
+  GOOGLE_DOC_RESOURCE, GOOGLE_DRIVE_FILE_RESOURCE, GOOGLE_DRIVE_RESOURCE,
+  GOOGLE_SHARED_DRIVE_RESOURCE, GOOGLE_SHEETS_RESOURCE, LEGACY_GRANTED_RESOURCE_URL_PATTERNS,
+  RESOURCE_BY_KIND, SCOPE_DERIVED_RESOURCE_URL_PATTERNS, SUPPORTED_RESOURCES,
+  hasDriveResourceGrant, parseResourceUrl, resourcesCoveredByScopes,
+} from "./resources";
+import {
+  beginStoredOAuthFlow, claimStoredOAuthFlow, mergeGrantedResources, prepareOAuthFlow,
+  shouldDeleteCredentialsOnAlarm, type OAuthFlowMode,
+} from "./oauth-flow";
+import { type ObserverBatchResult, type ObserverCheck, ObserverTracker } from "./observers";
+import { CursorPager, Pager } from "./cursor";
+import {
+  decodeGoogleOAuthState,
+  decodeLegacyGoogleOAuthState,
+  encodeGoogleOAuthState,
+  encodeLegacyGoogleOAuthState,
+  getBasePath,
+  getBaseUrl,
+  getDynamicGoogleOAuthReturnUrl,
+  getRegisteredGoogleOAuthRedirectUri,
+  isCurrentGoogleOAuthCallback,
+  isGoogleOAuthPreviewRedirectEnabled,
+  isSignedGoogleOAuthState,
+  redirectToGoogleOAuthReturnUrl,
+  validateGoogleOAuthReturnUrl,
+  type GoogleOAuthEnv,
+  type GoogleOAuthState,
+} from "./oauth";
 
 // Vendor id = GATEKEEPER_<NAME> binding suffix (lowercased).
 const VENDOR_ID = "google";
@@ -54,17 +99,7 @@ const logger = obsContext.createLogger({
   component: "gatekeeper.google", vendorId: VENDOR_ID,
 });
 
-// A nonce stored in UserAccount KV to protect the OAuth flow. Only one nonce is active at a time;
-// the `stage` field tracks where we are in the flow.
-type StoredNonce = {
-  value: string;
-  expiresAt: number;
-  stage: "initiation" | "oauth";
-};
-
 const NONCE_BYTES = 32;
-const INITIATION_NONCE_LIFETIME_MS = 10 * 60 * 1000;  // 10 minutes
-const OAUTH_NONCE_LIFETIME_MS = 10 * 60 * 1000;    // 10 minutes
 
 // Ceilings on the OAuth round trips that run while holding the credential mutex. Each must be
 // bounded: an unbounded hang keeps the mutex, and every caller waiting for a token then queues
@@ -87,19 +122,12 @@ function generateNonce(): string {
   return hexEncode(crypto.getRandomValues(new Uint8Array(NONCE_BYTES)));
 }
 
-function constantTimeEqual(a: string, b: string): boolean {
-  let encoder = new TextEncoder();
-  let bufA = encoder.encode(a);
-  let bufB = encoder.encode(b);
-  if (bufA.byteLength !== bufB.byteLength) return false;
-  return crypto.subtle.timingSafeEqual(bufA, bufB);
-}
 
 // Declare optional environment variables here since they may be omitted from wrangler.jsonc.
-type Env = Cloudflare.Env & {
-  // Base URL (protocol+host+optional path) at which the default fetch handler is served. Should
-  // NOT include a trailing slash. Omit for localhost dev server.
-  BASE_URL?: string,
+type Env = Cloudflare.Env & GoogleOAuthEnv & {
+  // OAuth app credentials (wrangler secrets / .dev.vars); not in wrangler.jsonc.
+  CLIENT_ID?: string;
+  CLIENT_SECRET?: string;
 }
 
 // Well-known Gmail system label IDs — derived from GmailSystemLabel so the
@@ -125,54 +153,13 @@ function toLabelObjects(labelIds: string[], labelMap: Map<string, string>): Gmai
   });
 }
 
-function validateGmailQueryForGrouping(query: string): void {
-  if (new TextEncoder().encode(query).byteLength > MAX_GMAIL_QUERY_BYTES) {
-    throw new Error(`Gmail search query must be at most ${MAX_GMAIL_QUERY_BYTES} bytes.`);
-  }
-  const stack: string[] = [];
-  let quote: string | undefined;
-  let escaped = false;
-  for (const char of query) {
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (char === '\\') {
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = undefined;
-      continue;
-    }
-    if (char === '"' || char === "'") {
-      quote = char;
-    } else if (char === '(' || char === '{') {
-      stack.push(char);
-    } else if (char === ')' || char === '}') {
-      const expected = char === ')' ? '(' : '{';
-      if (stack.pop() !== expected) throw new Error("Gmail query has mismatched grouping delimiters.");
-    }
-  }
-  if (quote || stack.length > 0) throw new Error("Gmail query has unterminated grouping or quotes.");
-}
-
-function getBaseUrl(env: Env) {
-  return stripTrailingSlashes(env.BASE_URL || "http://localhost:8787/gatekeeper/google");
-}
-
-function getBasePath(env: Env) {
-  const path = new URL(getBaseUrl(env)).pathname;
-  return path === "/" ? "" : path;
-}
-
 // =======================================================================================
 
 const SELF_CLOSING_HTML = `<!DOCTYPE html>
 <html lang="en">
   <body>
     <script type="text/javascript">window.close();</script>
-    <p>Authorization complete. You may close this tab and return to Cloudflare OS.
+    <p>Authorization complete. You may close this tab and return to Xcity OS.
   </body>
 </html>`;
 
@@ -186,7 +173,7 @@ const INVALID_LINK_HTML = `<!DOCTYPE html>
   <body style="font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #f5f5f5;">
     <div style="max-width: 520px; padding: 2rem; background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center;">
       <h1 style="color: #d97706; font-size: 1.5rem; margin: 0 0 1rem 0;">Authorization Link Expired</h1>
-      <p style="color: #555; line-height: 1.6; margin: 0 0 1.5rem 0;">This authorization link is invalid or has expired. Please return to Cloudflare OS and try again.</p>
+      <p style="color: #555; line-height: 1.6; margin: 0 0 1.5rem 0;">This authorization link is invalid or has expired. Please return to Xcity OS and try again.</p>
       <button onclick="window.close()" style="padding: 0.5rem 1.5rem; background: #d97706; color: white; border: none; border-radius: 4px; font-size: 1rem; cursor: pointer;">Close</button>
     </div>
   </body>
@@ -202,148 +189,14 @@ const NOT_CONFIGURED_HTML = `<!DOCTYPE html>
   <body style="font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #f5f5f5;">
     <div style="max-width: 520px; padding: 2rem; background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center;">
       <h1 style="color: #d97706; font-size: 1.5rem; margin: 0 0 1rem 0;">Google Gatekeeper Not Configured</h1>
-      <p style="color: #555; line-height: 1.6; margin: 0;">Please see the README.md for instructions on configuring an OAuth client ID and secret so that this Cloudflare OS instance can access Google APIs.</p>
+      <p style="color: #555; line-height: 1.6; margin: 0;">Please see the README.md for instructions on configuring an OAuth client ID and secret so that this Xcity OS instance can access Google APIs.</p>
     </div>
   </body>
 </html>`;
 
-// OAuth scopes we always request, used to identify the account (name, email, avatar). Not tied to
-// any resource type.
-const IDENTITY_SCOPES = [
-  "openid",
-  "https://www.googleapis.com/auth/userinfo.profile",
-  "https://www.googleapis.com/auth/userinfo.email",
-];
-
-// Minimal scopes for sign-in only (verify the user's email). Used when connecting in "auth" mode;
-// the resulting grant is transient. (Same as IDENTITY_SCOPES — sign-in needs no resource scopes.)
-const AUTH_SCOPES = IDENTITY_SCOPES;
-
-const BIGQUERY_HOST = "bigquery.googleapis.com";
-
-const GMAIL_RESOURCE: SupportedResource = {
-  urlPattern: "https://mail.google.com/*",
-  title: "Gmail Mailbox",
-  description: "Read emails and apply labels.",
-  grantable: true,
-};
-
-const GOOGLE_DOC_RESOURCE: SupportedResource = {
-  urlPattern: "https://docs.google.com/document/d/:docId/*",
-  title: "Google Doc",
-  description:
-      "Read and edit documents you choose.",
-  grantable: true,
-};
-
-const GOOGLE_SHEETS_RESOURCE: SupportedResource = {
-  urlPattern: "https://docs.google.com/spreadsheets/d/:spreadsheetId/*",
-  title: "Google Spreadsheet",
-  description: "Read values from a spreadsheet you choose.",
-  grantable: true,
-};
-
-const GOOGLE_CALENDAR_RESOURCE: SupportedResource = {
-  urlPattern: "https://calendar.google.com/calendar/:calendarId/*",
-  title: "Google Calendar",
-  description:
-      "Read and manage a Google Calendar.",
-  grantable: true,
-};
-
-const BIGQUERY_RESOURCE: SupportedResource = {
-  urlPattern: `https://${BIGQUERY_HOST}/:projectId/*`,
-  title: "BigQuery",
-  description: "Choose a Google Cloud project, then optionally narrow access to a dataset or table.",
-  grantable: true,
-};
-
-// Accounts connected before per-resource scope tracking received scopes for exactly these
-// resources.
-const LEGACY_GRANTED_RESOURCE_URL_PATTERNS = [
-  GMAIL_RESOURCE.urlPattern,
-  GOOGLE_DOC_RESOURCE.urlPattern,
-  BIGQUERY_RESOURCE.urlPattern,
-];
-
-const RESOURCE_SCOPES: {resource: SupportedResource, scopes: string[]}[] = [
-  {
-    resource: GMAIL_RESOURCE,
-    scopes: [
-      "https://www.googleapis.com/auth/gmail.labels",
-      "https://www.googleapis.com/auth/gmail.modify",
-    ],
-  },
-  {
-    resource: GOOGLE_DOC_RESOURCE,
-    scopes: [
-      "https://www.googleapis.com/auth/documents",
-      // Read-only Drive file metadata, used to power the doc picker when connecting a Google Doc.
-      "https://www.googleapis.com/auth/drive.metadata.readonly",
-    ],
-  },
-  {
-    resource: GOOGLE_SHEETS_RESOURCE,
-    scopes: [
-      "https://www.googleapis.com/auth/spreadsheets.readonly",
-      // Read-only Drive file metadata, used to power the spreadsheet picker.
-      "https://www.googleapis.com/auth/drive.metadata.readonly",
-    ],
-  },
-  {
-    resource: GOOGLE_CALENDAR_RESOURCE,
-    scopes: [
-      // Read-only calendar list, used to power the calendar picker when connecting a calendar.
-      "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
-      "https://www.googleapis.com/auth/calendar.events",
-    ],
-  },
-  {
-    resource: BIGQUERY_RESOURCE,
-    scopes: [
-      // `bigquery` (not `bigquery.readonly`): dry-runs go through `jobs.insert` for scope
-      // enforcement, which `readonly` doesn't permit. Read-only is enforced at the API layer.
-      "https://www.googleapis.com/auth/bigquery",
-    ],
-  },
-];
-
-const SUPPORTED_RESOURCES: SupportedResource[] = RESOURCE_SCOPES.map(entry => entry.resource);
-
-function validateResourceUrlPatterns(resourceUrlPatterns?: string[]): void {
-  if (resourceUrlPatterns === undefined) return;
-
-  let knownPatterns = new Set(RESOURCE_SCOPES.map(entry => entry.resource.urlPattern));
-  let unknownPatterns = resourceUrlPatterns.filter(pattern => !knownPatterns.has(pattern));
-  if (unknownPatterns.length > 0) {
-    throw new Error(`Unknown grantable resource URL pattern(s): ${unknownPatterns.join(", ")}`);
-  }
-}
-
-// The OAuth scopes to request for the given grantable resource `urlPattern`s.
-function resourceUrlPatternsToOAuthScopes(resourceUrlPatterns?: string[]): string[] {
-  validateResourceUrlPatterns(resourceUrlPatterns);
-
-  let scopes = new Set<string>(IDENTITY_SCOPES);
-  for (let entry of RESOURCE_SCOPES) {
-    if (resourceUrlPatterns === undefined ||
-        resourceUrlPatterns.includes(entry.resource.urlPattern)) {
-      for (let scope of entry.scopes) scopes.add(scope);
-    }
-  }
-  return [...scopes];
-}
-
-function grantedResourcesFromScopes(grantedOAuthScopes: string[]): string[] {
-  let granted = new Set(grantedOAuthScopes);
-  return RESOURCE_SCOPES
-      .filter(entry => entry.scopes.every(scope => granted.has(scope)))
-      .map(entry => entry.resource.urlPattern);
-}
-
 const GOOGLE_LOGO_URL = `data:image/svg+xml,${encodeURIComponent(GOOGLE_LOGO_SVG)}`;
 
-// Main HTTP UI entrypoint. We only use this to initiate and complete OAuth requests to Google.
+/** Main HTTP UI entrypoint. We only use this to initiate and complete OAuth requests to Google. */
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext) {
     let url = new URL(req.url);
@@ -366,7 +219,21 @@ export default {
       let doId = path[0];
       let initiationNonce = path[1];
       let stub = ctx.exports.UserAccount.get(ctx.exports.UserAccount.idFromString(doId));
-      let begun = await stub.beginOAuthFlow(initiationNonce);
+      let oauthRedirectUri: string;
+      let returnUrl: string | undefined;
+      try {
+        oauthRedirectUri = getRegisteredGoogleOAuthRedirectUri(env);
+        returnUrl = getDynamicGoogleOAuthReturnUrl(env);
+        if (returnUrl && !env.OAUTH_STATE_SIGNING_SECRET) {
+          throw new Error("Google OAuth state signing secret is not configured.");
+        }
+      } catch (error) {
+        return new Response(
+          error instanceof Error ? error.message : "Google OAuth callback is not configured.",
+          { status: 503 },
+        );
+      }
+      const begun = await stub.beginOAuthFlow(initiationNonce, oauthRedirectUri);
       if (begun === null) {
         return new Response(INVALID_LINK_HTML, {
           headers: { "Content-Type": "text/html; charset=utf-8" }
@@ -375,37 +242,89 @@ export default {
 
       let newUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
       newUrl.searchParams.set("client_id", env.CLIENT_ID);
-      newUrl.searchParams.set("redirect_uri", getBaseUrl(env) + "/oauth");
+      newUrl.searchParams.set("redirect_uri", oauthRedirectUri);
       newUrl.searchParams.set("response_type", "code");
       newUrl.searchParams.set("scope", begun.scopes.join(" "));
       newUrl.searchParams.set("access_type", "offline");
       newUrl.searchParams.set("prompt", "consent");
       // Add newly-requested scopes to any the user already granted, rather than replacing them.
       newUrl.searchParams.set("include_granted_scopes", "true");
-      newUrl.searchParams.set("state", `${doId}:${begun.oauthNonce}`);
+      let oauthState: GoogleOAuthState = {
+        userObjectId: doId,
+        oauthNonce: begun.oauthNonce,
+        ...(returnUrl ? { returnUrl } : {}),
+      };
+      let encodedState = encodeLegacyGoogleOAuthState(oauthState);
+      if (returnUrl) {
+        let signingSecret = env.OAUTH_STATE_SIGNING_SECRET;
+        if (!signingSecret) throw new Error("Google OAuth state signing secret is not configured.");
+        encodedState = await encodeGoogleOAuthState(oauthState, signingSecret);
+      }
+      newUrl.searchParams.set("state", encodedState);
 
       return Response.redirect(newUrl.toString(), 302);
     } else if (relPath === "/oauth") {
       // Completion redirect.
 
-      let error = url.searchParams.get("error");
-      if (error) {
-        return new Response(`${error}: ${url.searchParams.get("error_description")}`);
+      let state = url.searchParams.get("state");
+      if (!state) return new Response("Error: no 'state' provided", { status: 400 });
+
+      let oauthState: GoogleOAuthState;
+      try {
+        if (isSignedGoogleOAuthState(state)) {
+          if (!env.OAUTH_STATE_SIGNING_SECRET) {
+            return new Response("Google OAuth state signing secret is not configured.", { status: 500 });
+          }
+          oauthState = await decodeGoogleOAuthState(state, env.OAUTH_STATE_SIGNING_SECRET);
+        } else {
+          oauthState = decodeLegacyGoogleOAuthState(state);
+        }
+      } catch (error) {
+        return new Response(error instanceof Error ? error.message : "Invalid Google OAuth state", {
+          status: 400,
+        });
       }
 
-      let state = url.searchParams.get("state");
-      if (!state) return new Response("Error: no 'state' provided");
-      let colonIdx = state.indexOf(":");
-      if (colonIdx < 0) return new Response("Error: malformed state");
-      let doId = state.slice(0, colonIdx);
-      let oauthNonce = state.slice(colonIdx + 1);
+      if (oauthState.returnUrl) {
+        if (!isGoogleOAuthPreviewRedirectEnabled(env)) {
+          return new Response("Google OAuth return URLs are not allowed.", { status: 400 });
+        }
+        let returnUrl: URL;
+        try {
+          returnUrl = validateGoogleOAuthReturnUrl(oauthState.returnUrl, env);
+        } catch (error) {
+          return new Response(
+            error instanceof Error ? error.message : "Invalid Google OAuth return URL",
+            { status: 400 },
+          );
+        }
+        if (!isCurrentGoogleOAuthCallback(returnUrl, env)) {
+          return redirectToGoogleOAuthReturnUrl(returnUrl, url, state);
+        }
+      }
+
+      let userObjectId;
+      try {
+        userObjectId = ctx.exports.UserAccount.idFromString(oauthState.userObjectId);
+      } catch {
+        return new Response("Error: malformed state", { status: 400 });
+      }
+      let stub: DurableObjectStub<UserAccount> = ctx.exports.UserAccount.get(userObjectId);
+
+      let error = url.searchParams.get("error");
+      if (error) {
+        if (!await stub.consumeOAuthNonce(oauthState.oauthNonce)) {
+          return new Response(INVALID_LINK_HTML, {
+            headers: { "Content-Type": "text/html; charset=utf-8" }
+          });
+        }
+        return new Response("Google authorization was not completed.", { status: 400 });
+      }
 
       let code = url.searchParams.get("code");
-      if (!code) return new Response("Error: no 'code' provided");
+      if (!code) return new Response("Error: no 'code' provided", { status: 400 });
 
-      let userObjectId = ctx.exports.UserAccount.idFromString(doId);
-      let stub: DurableObjectStub<UserAccount> = ctx.exports.UserAccount.get(userObjectId);
-      if (!await stub.acceptAuthCode(code, oauthNonce)) {
+      if (!await stub.acceptAuthCode(code, oauthState.oauthNonce)) {
         return new Response(INVALID_LINK_HTML, {
           headers: { "Content-Type": "text/html; charset=utf-8" }
         });
@@ -436,12 +355,12 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
       url: "https://google.com",
       logo: { url: GOOGLE_LOGO_URL },
       color: "#e8f0fe",
-      tagline: "Draft replies, edit docs, read sheets, manage calendars, and analyze data",
+      tagline: "Draft replies, edit docs, read sheets, search Drive, manage calendars, analyze data",
       description:
-          "Connect your Google account to give Cloudflare OS access to Gmail, Google Docs, Google " +
-          "Sheets, Google Calendar, and BigQuery. Build agents that triage email, draft and edit " +
-          "documents, read spreadsheets, find focus time, schedule meetings, or run analytics " +
-          "queries on your data.",
+          "Connect your Google account to give Xcity OS access to Gmail, Google Docs, Google " +
+          "Sheets, Google Drive, Google Calendar, and BigQuery. Build agents that triage email, " +
+          "draft and edit documents, read spreadsheets, find files by metadata, find focus time, " +
+          "schedule meetings, or run analytics queries on your data.",
       providesAuth: true,
     };
   }
@@ -452,11 +371,12 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
     let initiationNonce = generateNonce();
 
     let authOnly = options?.scopes === "auth";
-    let requestedScopes = authOnly
-        ? AUTH_SCOPES
-        : resourceUrlPatternsToOAuthScopes(options?.resourceUrlPatterns);
+    let requestedResources = authOnly
+        ? []
+        : options?.resourceUrlPatterns ?? SUPPORTED_RESOURCES.map(resource => resource.urlPattern);
+    let mode: OAuthFlowMode = authOnly ? "auth" : "connect";
     await this.ctx.exports.UserAccount.get(userObjectId)
-        .setCallback(callback, initiationNonce, requestedScopes, authOnly);
+        .setCallback(callback, initiationNonce, requestedResources, mode);
 
     return {
       url: `${getBaseUrl(this.env)}/${userObjectId.toString()}/${initiationNonce}`
@@ -476,6 +396,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
   async getTypeScriptTypes(): Promise<string> {
     return [
       TYPES_CODE, DOCS_TYPES_CODE, SHEETS_TYPES_CODE, CALENDAR_TYPES_CODE, BIGQUERY_TYPES_CODE,
+      DRIVE_TYPES_CODE,
     ].join("\n");
   }
 }
@@ -508,85 +429,60 @@ export class UserAccount extends DurableObject<Env> {
 
   async setCallback(
       callback: Fetcher<GatekeeperConnectCallback>, initiationNonce: string,
-      requestedScopes: string[], ephemeral?: boolean) {
-    // If we have no API key in 1 hour, delete this object.
+      requestedResources: string[], mode: OAuthFlowMode) {
     if (!this.ctx.storage.kv.get<string>("refreshToken")) {
       this.ctx.storage.setAlarm(Date.now() + 3600 * 1000);
     }
 
     this.ctx.storage.kv.put("callback", callback);
-    this.ctx.storage.kv.put<string[]>("requestedScopes", requestedScopes);
-    // Auth-only sign-in grants are transient: dropped shortly after the email is read.
-    this.ctx.storage.kv.put<boolean>("ephemeral", ephemeral ?? false);
-    this.ctx.storage.kv.put<StoredNonce>("nonce", {
-      value: initiationNonce,
-      expiresAt: Date.now() + INITIATION_NONCE_LIFETIME_MS,
-      stage: "initiation",
-    });
+    prepareOAuthFlow(this.ctx.storage.kv, initiationNonce, requestedResources, mode, Date.now());
   }
 
-  // Prepare this account for a reconnect flow. The next acceptAuthCode() call will replace the
-  // existing refresh token and notify via credentialsRestored() instead of complete().
-  //
-  // `requestedScopes` is the full set of OAuth scopes to request on the reauthorization. For a
-  // plain reconnect this is the previously-granted set; for a scope expansion it's the union of
-  // the granted scopes and the newly-needed ones.
-  async prepareReconnect(initiationNonce: string, requestedScopes: string[]) {
-    this.ctx.storage.kv.put<boolean>("reconnecting", true);
-    this.ctx.storage.kv.put<string[]>("requestedScopes", requestedScopes);
-    this.ctx.storage.kv.put<StoredNonce>("nonce", {
-      value: initiationNonce,
-      expiresAt: Date.now() + INITIATION_NONCE_LIFETIME_MS,
-      stage: "initiation",
-    });
+  /** Prepare a reconnect or scope-expansion attempt for this account. */
+  async prepareReconnect(initiationNonce: string, requestedResources: string[]) {
+    prepareOAuthFlow(
+      this.ctx.storage.kv, initiationNonce, requestedResources, "reconnect", Date.now());
   }
 
-  // The grantable resource `urlPattern`s currently granted on this account. Used to decide
-  // whether ensureResources() needs to expand.
-  //
-  // Legacy accounts connected before granular scope tracking have no recorded granted scopes.
-  // Report only the resources included in that historical grant, so newer resources correctly
-  // trigger OAuth scope expansion.
+  /**
+   * The grantable resource `urlPattern`s currently granted on this account. Used to decide
+   * whether ensureResources() needs to expand.
+   *
+   * Three generations of account, newest first. An account that consented since grants became
+   * recorded reports exactly what it consented to, re-checked against the scopes Google actually
+   * returned so a declined or later-narrowed scope retracts the grant it backed. An account that
+   * recorded scopes but not resources falls back to inference, confined to the resources that
+   * predate recording — see {@link SCOPE_DERIVED_RESOURCE_URL_PATTERNS} for why it cannot be
+   * extended. An account from before scope tracking reports only its historical grant, so newer
+   * resources correctly trigger an OAuth expansion.
+   */
   async getGrantedResourceUrlPatterns(): Promise<string[]> {
-    let granted = this.ctx.storage.kv.get<string[]>("grantedScopes");
-    if (granted === undefined) {
+    let grantedScopes = this.ctx.storage.kv.get<string[]>("grantedScopes");
+    if (grantedScopes === undefined) {
       return [...LEGACY_GRANTED_RESOURCE_URL_PATTERNS];
     }
-    return grantedResourcesFromScopes(granted);
+    let grantedResources = this.ctx.storage.kv.get<string[]>("grantedResources");
+    return resourcesCoveredByScopes(
+        grantedResources ?? SCOPE_DERIVED_RESOURCE_URL_PATTERNS, grantedScopes);
   }
 
-  // Called by the fetch handler when the user visits the initiation URL. Verifies the initiation
-  // nonce, consumes it, and returns a fresh OAuth nonce plus the scopes to request. Returns null if
-  // the nonce is invalid or expired.
-  async beginOAuthFlow(initiationNonce: string): Promise<{oauthNonce: string, scopes: string[]} | null> {
-    let stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
-    if (!stored || stored.stage !== "initiation" ||
-        Date.now() >= stored.expiresAt || !constantTimeEqual(stored.value, initiationNonce)) {
-      return null;
-    }
-
-    // Replace the consumed initiation nonce with a fresh OAuth nonce.
+  /** Begin the stored consent attempt, or return null when its initiation nonce is invalid. */
+  async beginOAuthFlow(initiationNonce: string, oauthRedirectUri: string): Promise<{
+    oauthNonce: string,
+    scopes: string[],
+  } | null> {
     let oauthNonce = generateNonce();
-    this.ctx.storage.kv.put<StoredNonce>("nonce", {
-      value: oauthNonce,
-      expiresAt: Date.now() + OAUTH_NONCE_LIFETIME_MS,
-      stage: "oauth",
-    });
-    // Fall back to all scopes for legacy flows that didn't record a requested set.
-    let scopes = this.ctx.storage.kv.get<string[]>("requestedScopes")
-        ?? resourceUrlPatternsToOAuthScopes();
-    return {oauthNonce, scopes};
+    return beginStoredOAuthFlow(
+        this.ctx.storage.kv, initiationNonce, oauthNonce, oauthRedirectUri, Date.now());
   }
 
-  // Returns false if the OAuth nonce is invalid or expired.
+  consumeOAuthNonce(oauthNonce: string): boolean {
+    return claimStoredOAuthFlow(this.ctx.storage.kv, oauthNonce, Date.now()) !== null;
+  }
+  /** Returns false if the OAuth nonce is invalid or expired. */
   async acceptAuthCode(code: string, oauthNonce: string): Promise<boolean> {
-    // Verify and consume the OAuth nonce.
-    let stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
-    if (!stored || stored.stage !== "oauth" ||
-        Date.now() >= stored.expiresAt || !constantTimeEqual(stored.value, oauthNonce)) {
-      return false;
-    }
-    this.ctx.storage.kv.delete("nonce");
+    let flow = claimStoredOAuthFlow(this.ctx.storage.kv, oauthNonce, Date.now());
+    if (!flow) return false;
 
     let { CLIENT_ID: clientId, CLIENT_SECRET: clientSecret } = this.env;
     if (!clientId || !clientSecret) {
@@ -605,7 +501,7 @@ export class UserAccount extends DurableObject<Env> {
       }
 
       let response = await exchangeAuthCode(
-          code, clientId, clientSecret, getBaseUrl(this.env) + "/oauth",
+          code, clientId, clientSecret, flow.oauthRedirectUri,
           AbortSignal.timeout(AUTH_CODE_EXCHANGE_TIMEOUT_MS));
 
       if (!response.refreshToken) {
@@ -616,21 +512,15 @@ export class UserAccount extends DurableObject<Env> {
       this.ctx.storage.kv.put<GoogleAccessToken>("accessToken", response.accessToken);
       // These credentials are new, so any recorded permanent failure no longer applies
       this.#mintFailure = undefined;
-      // Record what Google actually granted (the user may have declined some requested scopes).
       this.ctx.storage.kv.put<string[]>("grantedScopes", response.grantedScopes);
-      this.ctx.storage.kv.delete("requestedScopes");
-
-      let reconnecting = this.ctx.storage.kv.get<boolean>("reconnecting");
-      if (reconnecting) this.ctx.storage.kv.delete("reconnecting");
-      return { callback, reconnecting: !!reconnecting };
+      mergeGrantedResources(this.ctx.storage.kv, flow.requestedResources);
+      return { callback, mode: flow.mode };
     });
 
     let callback = completion.callback;
-    if (completion.reconnecting) {
-      // Reconnect flow: credentials replaced above, notify restoration.
+    if (completion.mode === "reconnect") {
       await callback.credentialsRestored();
     } else {
-      // Initial connect flow: create the user entrypoint and notify completion.
       try {
         let props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
         await callback.complete(this.ctx.exports.GatekeeperUserImpl({props}));
@@ -638,19 +528,16 @@ export class UserAccount extends DurableObject<Env> {
         this.ctx.storage.kv.delete("refreshToken");
         throw err;
       }
-      // Auth-only sign-in grants are transient: the caller has read the email via complete(), so
-      // schedule a prompt self-destruct. We do NOT call the provider's revoke endpoint (that could
-      // invalidate the user's other grants for this OAuth client); we just drop our local copy.
-      if (this.ctx.storage.kv.get<boolean>("ephemeral")) {
+
+      if (completion.mode === "auth") {
+        this.ctx.storage.kv.put("deleteCredentialsOnAlarm", true);
         this.ctx.storage.setAlarm(Date.now() + 2 * 60 * 1000);
+      } else {
+        this.ctx.storage.deleteAlarm();
       }
     }
 
     return true;
-  }
-
-  hasRefreshToken() {
-    return this.ctx.storage.kv.get<string>("refreshToken") !== undefined;
   }
 
   /**
@@ -765,12 +652,9 @@ export class UserAccount extends DurableObject<Env> {
     });
   }
 
-  async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
-    // Drop the account if the flow never completed, or if this was a transient auth-only sign-in
-    // grant (used once to read the email for login). Serialized so the wipe cannot land in the
-    // middle of a mint, leaving a freshly minted token behind on a deleted account.
+  async alarm(_alarmInfo?: AlarmInvocationInfo): Promise<void> {
     await this.#updateCredentials(async () => {
-      if (!this.hasRefreshToken() || this.ctx.storage.kv.get<boolean>("ephemeral")) {
+      if (shouldDeleteCredentialsOnAlarm(this.ctx.storage.kv)) {
         this.ctx.storage.deleteAll();
       }
     });
@@ -830,134 +714,65 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     class: DurableObjectClass<Gatekeeper<any>>;
     resource: SupportedResource;
   }> {
-    let parsed = new URL(url);
+    let target = parseResourceUrl(url);
+    let resource = RESOURCE_BY_KIND[target.kind];
+    let userObjectId = this.ctx.props.userObjectId;
 
-    if (parsed.hostname === "docs.google.com" &&
-        parsed.pathname.startsWith("/document/d/")) {
-      // Extract document ID from URL path: /document/d/{documentId}/...
-      let documentId = parsed.pathname.split("/")[3];
-      if (!documentId) {
-        throw new Error("Invalid Google Docs URL: no document ID found");
+    switch (target.kind) {
+      case "gmail": {
+        let props: GmailGatekeeperImplProps = {
+          userObjectId, searchQuery: target.searchQuery, labelName: target.labelName,
+        };
+        return {class: this.ctx.exports.GmailGatekeeperImpl({props}), resource};
       }
-      let props: GoogleDocGatekeeperImplProps = {
-        userObjectId: this.ctx.props.userObjectId,
-        documentId,
-      };
-      return {class: this.ctx.exports.GoogleDocGatekeeperImpl({props}), resource: GOOGLE_DOC_RESOURCE};
+      case "doc": {
+        let props: GoogleDocGatekeeperImplProps = {userObjectId, documentId: target.documentId};
+        return {class: this.ctx.exports.GoogleDocGatekeeperImpl({props}), resource};
+      }
+      case "sheets": {
+        let props: GoogleSheetsGatekeeperImplProps = {
+          userObjectId, spreadsheetId: target.spreadsheetId,
+        };
+        return {class: this.ctx.exports.GoogleSheetsGatekeeperImpl({props}), resource};
+      }
+      case "calendar": {
+        let props: GoogleCalendarGatekeeperImplProps = {
+          userObjectId, calendarId: target.calendarId, availabilityMode: target.availabilityMode,
+        };
+        return {class: this.ctx.exports.GoogleCalendarGatekeeperImpl({props}), resource};
+      }
+      case "bigquery": {
+        let props: BigQueryGatekeeperImplProps = {
+          userObjectId,
+          scopedProjectId: target.projectId,
+          scopedDatasetId: target.datasetId,
+          scopedTableId: target.tableId,
+        };
+        return {class: this.ctx.exports.BigQueryGatekeeperImpl({props}), resource};
+      }
+      case "driveAccount":
+      case "sharedDrive":
+      case "driveFile": {
+        let scope: DriveBindingScope;
+        if (target.kind === "driveAccount") {
+          scope = { kind: "account" };
+        } else if (target.kind === "sharedDrive") {
+          scope = { kind: "sharedDrive", driveId: target.driveId };
+        } else {
+          scope = { kind: "file", fileId: target.fileId };
+        }
+        let props: GoogleDriveGatekeeperImplProps = { userObjectId, scope };
+        return { class: this.ctx.exports.GoogleDriveGatekeeperImpl({ props }), resource };
+      }
     }
-
-    if (parsed.hostname === "docs.google.com" &&
-        parsed.pathname.startsWith("/spreadsheets/d/")) {
-      let spreadsheetId = parsed.pathname.split("/")[3];
-      if (!spreadsheetId) {
-        throw new Error("Invalid Google Sheets URL: no spreadsheet ID found");
-      }
-      let props: GoogleSheetsGatekeeperImplProps = {
-        userObjectId: this.ctx.props.userObjectId,
-        spreadsheetId,
-      };
-      return {
-        class: this.ctx.exports.GoogleSheetsGatekeeperImpl({ props }),
-        resource: GOOGLE_SHEETS_RESOURCE,
-      };
-    }
-
-    if (parsed.hostname === "calendar.google.com" && parsed.pathname.startsWith("/calendar/")) {
-      let calendarId = decodeURIComponent(parsed.pathname.split("/")[2] ?? "");
-      if (!calendarId) {
-        throw new Error("Invalid Google Calendar URL: no calendar ID found");
-      }
-      if (calendarId === "primary") {
-        throw new Error(
-          "Google Calendar bindings must use a stable calendar ID, not the account-relative " +
-          "\"primary\" alias.");
-      }
-      // Default to the least-privilege scope unless the URL explicitly opts into all calendars.
-      let availabilityMode: CalendarAvailabilityMode =
-          parsed.searchParams.get("availability") === "allVisible" ? "allVisible" : "thisCalendar";
-      let props: GoogleCalendarGatekeeperImplProps = {
-        userObjectId: this.ctx.props.userObjectId,
-        calendarId,
-        availabilityMode,
-      };
-      return {
-        class: this.ctx.exports.GoogleCalendarGatekeeperImpl({props}),
-        resource: GOOGLE_CALENDAR_RESOURCE,
-      };
-    }
-
-    if (parsed.hostname === BIGQUERY_HOST) {
-      if (parsed.protocol !== "https:") {
-        throw new Error(`BigQuery resource URLs must use https: ${url}`);
-      }
-      if (parsed.search || parsed.hash) {
-        throw new Error("BigQuery resource URLs must not include query strings or fragments.");
-      }
-
-      // Synthetic path: /<projectId>/<datasetId>/<tableId> (each segment optional after the first).
-      let segments = parsed.pathname.replace(/^\/+|\/+$/g, "").split("/").filter(Boolean)
-          .map(segment => decodeURIComponent(segment));
-      if (segments.length > 3) {
-        throw new Error(
-            "BigQuery resource URLs must be /<projectId>, /<projectId>/<datasetId>, " +
-            "or /<projectId>/<datasetId>/<tableId>.");
-      }
-      let projectId = segments[0] || undefined;
-      let datasetId = segments[1] || undefined;
-      let tableId = segments[2] || undefined;
-      if (!projectId) {
-        throw new Error("BigQuery resource URLs must include a project ID.");
-      }
-      if (tableId && !datasetId) {
-        throw new Error("Cannot scope to a table without specifying a dataset.");
-      }
-
-      let props: BigQueryGatekeeperImplProps = {
-        userObjectId: this.ctx.props.userObjectId,
-        scopedProjectId: projectId,
-        scopedDatasetId: datasetId,
-        scopedTableId: tableId,
-      };
-      return {
-        class: this.ctx.exports.BigQueryGatekeeperImpl({props}),
-        resource: BIGQUERY_RESOURCE,
-      };
-    }
-
-    // Default: Gmail
-    let props: GmailGatekeeperImplProps = {...this.ctx.props};
-
-    // Parse the URL hash to extract a search or label scope. Keep labels as
-    // opaque names; startSession resolves them to Gmail label IDs so label text
-    // can never be interpreted as search syntax.
-    let hash = parsed.hash;
-    if (hash.startsWith("#search/")) {
-      // Gmail's own UI encodes spaces in hash searches as `+`, while
-      // decodeURIComponent() only decodes `%20`. Normalize both forms.
-      const encodedQuery = hash.slice("#search/".length).replace(/\+/g, " ");
-      const query = decodeURIComponent(encodedQuery);
-      validateGmailQueryForGrouping(query);
-      props.searchQuery = query;
-    } else if (hash.startsWith("#label/")) {
-      const labelName = decodeURIComponent(hash.slice("#label/".length));
-      if (!labelName || new TextEncoder().encode(labelName).byteLength > 320) {
-        throw new Error("Gmail label name must be between 1 and 320 bytes.");
-      }
-      props.labelName = labelName;
-    } else if (hash && hash !== "#inbox") {
-      throw new Error(
-        "Unsupported Gmail view. Connect the inbox, an explicit search, or an explicit label.");
-    }
-
-    return {class: this.ctx.exports.GmailGatekeeperImpl({props}), resource: GMAIL_RESOURCE};
   }
 
   async startResourceConfigurator(
       resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
-    let getToken = async () => {
+    let getToken = async (opts?: AccessTokenRequest) => {
       let id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
       let obj = this.ctx.exports.UserAccount.get(id);
-      return await obj.getAccessToken();
+      return await obj.getAccessToken(opts);
     };
 
     if (resourceUrlPattern === BIGQUERY_RESOURCE.urlPattern) {
@@ -995,6 +810,27 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
       };
     }
 
+    if (resourceUrlPattern === GOOGLE_DRIVE_RESOURCE.urlPattern) {
+      return {
+        iframeHtml: DRIVE_ACCOUNT_CONFIGURATOR_HTML,
+        ui: new RpcStub(new DriveAccountConfiguratorUI()),
+      };
+    }
+
+    if (resourceUrlPattern === GOOGLE_SHARED_DRIVE_RESOURCE.urlPattern) {
+      return {
+        iframeHtml: SHARED_DRIVE_CONFIGURATOR_HTML,
+        ui: new RpcStub(new SharedDriveConfiguratorUI(getToken)),
+      };
+    }
+
+    if (resourceUrlPattern === GOOGLE_DRIVE_FILE_RESOURCE.urlPattern) {
+      return {
+        iframeHtml: DRIVE_FILE_CONFIGURATOR_HTML,
+        ui: new RpcStub(new DriveFileConfiguratorUI(getToken)),
+      };
+    }
+
     throw new Error(`Unsupported resource configurator type: ${resourceUrlPattern}`);
   }
 
@@ -1008,9 +844,8 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     let id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
     let obj = this.ctx.exports.UserAccount.get(id);
     let initiationNonce = generateNonce();
-    // Re-request the scopes already granted so a plain reconnect doesn't narrow access.
-    let requestedScopes = resourceUrlPatternsToOAuthScopes(await obj.getGrantedResourceUrlPatterns());
-    await obj.prepareReconnect(initiationNonce, requestedScopes);
+    let grantedResources = await obj.getGrantedResourceUrlPatterns();
+    await obj.prepareReconnect(initiationNonce, grantedResources);
     return { url: `${getBaseUrl(this.env)}/${this.ctx.props.userObjectId}/${initiationNonce}` };
   }
 
@@ -1022,20 +857,19 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
       return {};
     }
 
-    // Request the union of what's already granted and what's newly needed, so the expansion never
-    // drops existing access.
-    let unionPatterns = new Set([...granted, ...resourceUrlPatterns]);
-    let requestedScopes = resourceUrlPatternsToOAuthScopes([...unionPatterns]);
+    let unionPatterns = [...new Set([...granted, ...resourceUrlPatterns])];
     let initiationNonce = generateNonce();
-    await obj.prepareReconnect(initiationNonce, requestedScopes);
+    await obj.prepareReconnect(initiationNonce, unionPatterns);
     return { url: `${getBaseUrl(this.env)}/${this.ctx.props.userObjectId}/${initiationNonce}` };
   }
 
-  // Mint a verifier representing this account, used by the Google gatekeepers' addObserver to confirm
-  // a prospective observer may read a bound resource. The verifier carries this user's own account
-  // id, so the access checks run against the observer's *own* Google token. (The Gmail gatekeeper
-  // uses strategy A — it never consults the verifier — but getVerifier must still exist because the
-  // overseer mints one on every open.)
+  /**
+   * Mint a verifier representing this account, used by the Google gatekeepers' addObserver to confirm
+   * a prospective observer may read a bound resource. The verifier carries this user's own account
+   * id, so the access checks run against the observer's *own* Google token. (The Gmail gatekeeper
+   * uses strategy A — it never consults the verifier — but getVerifier must still exist because the
+   * overseer mints one on every open.)
+   */
   @skipRpcValidation()
   async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
     let props: GoogleVerifierProps = { userObjectId: this.ctx.props.userObjectId };
@@ -1078,23 +912,18 @@ function isNoAccessStatus(status: number | undefined): boolean {
   return status === 401 || status === 403 || status === 404;
 }
 
-// The non-standard methods the Google gatekeepers call on their own verifier (see addObserver). Not
-// part of the generic GatekeeperUserVerifier contract.
+/**
+ * The non-standard methods the Google gatekeepers call on their own verifier (see addObserver). Not
+ * part of the generic GatekeeperUserVerifier contract.
+ */
 export interface GoogleVerifierApi extends GatekeeperUserVerifier {
   hasDocAccess(documentId: string): Promise<boolean>;
   hasSpreadsheetAccess(spreadsheetId: string): Promise<boolean>;
   hasCalendarWriterAccess(calendarId: string): Promise<boolean>;
   hasCalendarFreeBusyAccess(calendarId: string): Promise<boolean>;
   hasDatasetAccess(projectId: string, datasetId: string): Promise<boolean>;
+  verifyDriveFiles(fileIds: string[]): Promise<ObserverBatchResult>;
 }
-
-type ObserverCheck<T> = {
-  excludeObservers?: string[];
-  pendingSets: T[];
-  commit(): void;
-};
-
-type ObservedSetState = true | "pending" | "observed";
 
 @validateRpc()
 export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
@@ -1157,6 +986,17 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
       if (isNoAccessStatus(httpStatusFromError(error))) return false;
       throw error;
     }
+  }
+
+  async verifyDriveFiles(fileIds: string[]): Promise<ObserverBatchResult> {
+    let account = this.ctx.exports.UserAccount.get(
+      this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
+    let granted = await account.getGrantedResourceUrlPatterns();
+    let baselineAllowed = hasDriveResourceGrant(granted);
+    if (!baselineAllowed) return { baselineAllowed, allowed: fileIds.map(() => false) };
+
+    let api = new DriveApi(opts => this.#getToken(opts));
+    return { baselineAllowed, allowed: await api.checkFileAccess(fileIds) };
   }
 }
 
@@ -1255,29 +1095,6 @@ type GmailSessionContext = {
 
 // ── GmailSessionImpl ────────────────────────────────────────────────
 
-const MAX_GMAIL_RECIPIENTS = 100;
-const MAX_GMAIL_SUBJECT_BYTES = 998;
-const MAX_GMAIL_BODY_BYTES = 64 * 1024;
-const MAX_GMAIL_QUERY_BYTES = 4096;
-const MAX_GMAIL_ADDRESS_BYTES = 320;
-const MAX_GMAIL_VISIBLE_THREAD_MESSAGES = 100;
-
-function validateOutboundInput(to: string[], subject: string, body: string): void {
-  if (to.length === 0 || to.length > MAX_GMAIL_RECIPIENTS) {
-    throw new Error(`Email must have between 1 and ${MAX_GMAIL_RECIPIENTS} recipients.`);
-  }
-  if (to.some(address => address.length === 0 ||
-      new TextEncoder().encode(address).byteLength > MAX_GMAIL_ADDRESS_BYTES)) {
-    throw new Error("Invalid recipient address length.");
-  }
-  if (new TextEncoder().encode(subject).byteLength > MAX_GMAIL_SUBJECT_BYTES) {
-    throw new Error(`Email subject must be at most ${MAX_GMAIL_SUBJECT_BYTES} UTF-8 bytes.`);
-  }
-  if (new TextEncoder().encode(body).byteLength > MAX_GMAIL_BODY_BYTES) {
-    throw new Error(`Email body must be at most ${MAX_GMAIL_BODY_BYTES} bytes.`);
-  }
-}
-
 @validateRpc()
 class GmailSessionImpl extends RpcTarget implements GmailSession {
   #ctx: GmailSessionContext;
@@ -1311,7 +1128,7 @@ class GmailSessionImpl extends RpcTarget implements GmailSession {
     const labelIds = this.#ctx.labelId
       ? [this.#ctx.labelId]
       : (!this.#ctx.searchQuery ? ["INBOX"] : undefined);
-    return new GmailThreadCursorImpl(this.#ctx, this.#ctx.searchQuery, labelIds);
+    return gmailThreadCursor(this.#ctx, this.#ctx.searchQuery, labelIds);
   }
 
   async search(query: string): Promise<Cursor<GmailThreadEntry>> {
@@ -1338,7 +1155,7 @@ class GmailSessionImpl extends RpcTarget implements GmailSession {
     // A full-mailbox binding may search all mail. Only an explicit label scope
     // attenuates search results; listThreads() separately defaults to INBOX.
     const labelIds = this.#ctx.labelId ? [this.#ctx.labelId] : undefined;
-    return new GmailThreadCursorImpl(this.#ctx, effectiveQuery, labelIds);
+    return gmailThreadCursor(this.#ctx, effectiveQuery, labelIds);
   }
 
   async send(to: string[], subject: string, body: string): Promise<void> {
@@ -1408,89 +1225,67 @@ async function submitGmailAction(
   }
 }
 
-// ── GmailThreadCursorImpl ───────────────────────────────────────────
-// Lazily fetches pages from the Gmail API as the gadget calls next().
-// Each next() returns a batch of GmailThreadEntry objects (thread info +
-// capability), or null when exhausted. Pages are fetched in batches of 20.
-//
-// The cursor itself is a capability. The initial listThreads()/search() call
-// authorizes creation; each next() separately authorizes the page it returns.
+// ── Cursors ─────────────────────────────────────────────────────────
+// A cursor is a capability. The listThreads()/search() call authorizes its creation; CursorPager
+// separately authorizes each page before disclosing it. See cursor.ts.
 
 @validateRpc()
-class GmailThreadCursorImpl extends RpcTarget implements Cursor<GmailThreadEntry> {
-  #ctx: GmailSessionContext;
-  #query: string | undefined;
-  #labelIds: string[] | undefined;
-  #pageToken: string | undefined;
-  #exhausted = false;
-  #tail: Promise<void> = Promise.resolve();
+class RpcCursor<Entry> extends RpcTarget implements Cursor<Entry> {
+  #pager: Pager<Entry>;
 
-  constructor(ctx: GmailSessionContext, query: string | undefined, labelIds?: string[]) {
+  constructor(pager: Pager<Entry>) {
     super();
-    this.#ctx = ctx;
-    this.#query = query;
-    this.#labelIds = labelIds;
+    this.#pager = pager;
   }
 
-  next(): Promise<GmailThreadEntry[] | null> {
-    const result = this.#tail.then(() => this.#nextPage());
-    this.#tail = result.then(() => undefined, () => undefined);
-    return result;
+  // `next()` takes no arguments, so there is no argument surface to validate.
+  @skipRpcValidation()
+  next(): Promise<Entry[] | null> {
+    return this.#pager.next();
   }
+}
 
-  async #nextPage(): Promise<GmailThreadEntry[] | null> {
-    if (this.#exhausted) return null;
+type GmailThreadRef = { id: string; snippet?: string };
 
-    let result: {threads: Array<{id: string; snippet?: string}>; nextPageToken?: string};
-    let pageToken = this.#pageToken;
-    let exhausted = false;
-    let skippedPages = 0;
-    do {
-      const previousToken = pageToken;
-      result = await this.#ctx.gmailApi.listThreads(
-        20, this.#query, pageToken, this.#labelIds);
-      pageToken = result.nextPageToken;
-      exhausted = !result.nextPageToken;
-      if (result.nextPageToken && result.nextPageToken === previousToken) {
-        throw new Error("Gmail returned a repeated thread page token.");
+/** Threads matching the scope, 20 at a time, each enriched with its metadata. */
+function gmailThreadCursor(
+    ctx: GmailSessionContext, query: string | undefined, labelIds?: string[],
+): Cursor<GmailThreadEntry> {
+  return new RpcCursor(new CursorPager<GmailThreadRef, GmailThreadEntry>({
+    provider: "Gmail",
+
+    async fetchPage(pageToken) {
+      let { threads, nextPageToken } =
+          await ctx.gmailApi.listThreads(20, query, pageToken, labelIds);
+      return { items: threads, nextPageToken };
+    },
+
+    async buildEntries(threads) {
+      // Stay below the Workers six-outgoing-connection limit while enriching the page.
+      let entries: GmailThreadEntry[] = [];
+      for (let i = 0; i < threads.length; i += 5) {
+        entries.push(...await Promise.all(threads.slice(i, i + 5).map(async thread => {
+          let metadata = await ctx.gmailApi.getThreadInfo(thread.id);
+          let info: GmailThreadInfo = {
+            ...metadata,
+            ...(thread.snippet !== undefined ? { snippet: thread.snippet } : {}),
+          };
+          return { info, thread: new GmailThreadStub(ctx, thread.id, info) };
+        })));
       }
-      skippedPages++;
-    } while (result.threads.length === 0 && !exhausted && skippedPages < 20);
+      return entries;
+    },
 
-    if (result.threads.length === 0) {
-      if (!exhausted) throw new Error("Gmail returned too many empty thread pages.");
-      this.#pageToken = pageToken;
-      this.#exhausted = true;
-      return null;
-    }
-
-    // Stay below the Workers six-outgoing-connection limit while enriching the
-    // page with metadata.
-    const entries: GmailThreadEntry[] = [];
-    for (let i = 0; i < result.threads.length; i += 5) {
-      const batch = await Promise.all(result.threads.slice(i, i + 5).map(async thread => {
-        const metadata = await this.#ctx.gmailApi.getThreadInfo(thread.id);
-        const info: GmailThreadInfo = {
-          ...metadata,
-          ...(thread.snippet !== undefined ? {snippet: thread.snippet} : {}),
-        };
-        const stub = new GmailThreadStub(this.#ctx, thread.id, info);
-        return { info, thread: stub };
-      }));
-      entries.push(...batch);
-    }
-
-    await this.#ctx.approvalQueue.authorizeObservation({
-      title: `Read ${entries.length} Gmail threads`,
-      description:
-        `Fetch the next page of Gmail threads.\n\n` +
-        formatApprovalField("Subjects", entries.map(entry => entry.info.subject).join("\n")),
-    });
-
-    this.#pageToken = pageToken;
-    this.#exhausted = exhausted;
-    return entries;
-  }
+    authorize: async entries => {
+      if (entries.length === 0) return;
+      await ctx.approvalQueue.authorizeObservation({
+        title: `Read ${entries.length} Gmail threads`,
+        description:
+          "Fetch the next page of Gmail threads.\n\n" +
+          formatApprovalField("Subjects", entries.map(entry => entry.info.subject).join("\n")),
+      });
+    },
+  }));
 }
 
 // ── GmailThreadStub ─────────────────────────────────────────────────
@@ -1540,9 +1335,7 @@ class GmailThreadStub extends RpcTarget implements GmailThread {
   }
 
   async messagesVisibleTo(address: string): Promise<GmailMessage[]> {
-    if (new TextEncoder().encode(address).byteLength > MAX_GMAIL_ADDRESS_BYTES) {
-      throw new Error(`Email address must be at most ${MAX_GMAIL_ADDRESS_BYTES} bytes.`);
-    }
+    validateGmailAddress(address);
     const [normalizedAddress] = normalizeEmailRecipients([address]);
     const thread = await this.#ctx.gmailApi.getThread(this.#threadId);
 
@@ -1690,9 +1483,7 @@ class GmailMessageStub extends RpcTarget implements GmailMessage {
   }
 
   async reply(body: string): Promise<void> {
-    if (new TextEncoder().encode(body).byteLength > MAX_GMAIL_BODY_BYTES) {
-      throw new Error(`Email body must be at most ${MAX_GMAIL_BODY_BYTES} bytes.`);
-    }
+    validateGmailBody(body);
     const original = await this.#getRaw();
     await this.#ctx.approvalQueue.authorizeObservation({
       title: "Read message headers to prepare reply",
@@ -1717,9 +1508,7 @@ class GmailMessageStub extends RpcTarget implements GmailMessage {
   }
 
   async replyAll(body: string): Promise<void> {
-    if (new TextEncoder().encode(body).byteLength > MAX_GMAIL_BODY_BYTES) {
-      throw new Error(`Email body must be at most ${MAX_GMAIL_BODY_BYTES} bytes.`);
-    }
+    validateGmailBody(body);
     const original = await this.#getRaw();
     await this.#ctx.approvalQueue.authorizeObservation({
       title: "Read message headers to prepare reply-all",
@@ -1745,12 +1534,8 @@ class GmailMessageStub extends RpcTarget implements GmailMessage {
 
   async forward(to: string[], body?: string): Promise<void> {
     const normalizedTo = normalizeEmailRecipients(to);
-    if (normalizedTo.length === 0 || normalizedTo.length > MAX_GMAIL_RECIPIENTS) {
-      throw new Error(`Email must have between 1 and ${MAX_GMAIL_RECIPIENTS} recipients.`);
-    }
-    if (new TextEncoder().encode(body ?? '').byteLength > MAX_GMAIL_BODY_BYTES) {
-      throw new Error(`Email body must be at most ${MAX_GMAIL_BODY_BYTES} bytes.`);
-    }
+    validateGmailRecipientCount(normalizedTo);
+    validateGmailBody(body ?? '');
     const original = await this.#getRaw();
     await this.#ctx.approvalQueue.authorizeObservation({
       title: "Read message to prepare forward",
@@ -1884,7 +1669,7 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
     return new GmailSessionImpl(ctx);
   }
 
-  // ---------------------------------------------------------------------------
+  /** --------------------------------------------------------------------------- */
   async applyAction(actionId: number): Promise<void> {
     const pendingActions = new PendingActionStore<GmailAction>(this.ctx.storage.kv);
     const action = pendingActions.get(actionId);
@@ -1945,12 +1730,14 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
     throw new Error("revert is not implemented");
   }
 
-  // Observer tracking — strategy A (private-only). Full access to a mailbox/label/search is too
-  // personal to extend to any non-owner observer (a Gmail mailbox has no per-recipient ACL we could
-  // verify an observer against — the mailing-list decomposition discussed in the plan is explicitly
-  // out of scope). So no non-owner observer may ever observe Gmail data: addObserver always throws.
-  // (This is enforced here in addition to any prohibitAllSharing usage, so the lockdown holds even
-  // when sharing is otherwise permitted.) removeObserver is a no-op since none is ever recorded.
+  /**
+   * Observer tracking — strategy A (private-only). Full access to a mailbox/label/search is too
+   * personal to extend to any non-owner observer (a Gmail mailbox has no per-recipient ACL we could
+   * verify an observer against — the mailing-list decomposition discussed in the plan is explicitly
+   * out of scope). So no non-owner observer may ever observe Gmail data: addObserver always throws.
+   * (This is enforced here in addition to any prohibitAllSharing usage, so the lockdown holds even
+   * when sharing is otherwise permitted.) removeObserver is a no-op since none is ever recorded.
+   */
   async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
     throw new Error(
       "Gmail data cannot be shared with other users: this workspace reads a personal Gmail mailbox, " +
@@ -2303,11 +2090,13 @@ export class GoogleDocGatekeeperImpl
     throw new Error("revert is not implemented");
   }
 
-  // Observer tracking — strategy B (ACL check, single unit). The binding is one document, so we just
-  // confirm the observer can open it with their own token (hasDocAccess, via the Drive/Docs ACL).
-  // The document is the atomic unit (everything read through this binding is that one doc), so no
-  // observers are tracked and removeObserver is a no-op. The overseer re-runs addObserver on every
-  // open, catching loss of access promptly.
+  /**
+   * Observer tracking — strategy B (ACL check, single unit). The binding is one document, so we just
+   * confirm the observer can open it with their own token (hasDocAccess, via the Drive/Docs ACL).
+   * The document is the atomic unit (everything read through this binding is that one doc), so no
+   * observers are tracked and removeObserver is a no-op. The overseer re-runs addObserver on every
+   * open, catching loss of access promptly.
+   */
   async addObserver(_id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
     let verifier = user as unknown as Fetcher<GoogleVerifierApi>;
     if (!(await verifier.hasDocAccess(this.ctx.props.documentId))) {
@@ -2558,7 +2347,7 @@ export class GoogleSheetsGatekeeperImpl
     );
   }
 
-  // Read-only — no side-effecting actions.
+  /** Read-only — no side-effecting actions. */
   async applyAction(_action: number): Promise<void> {
     throw new Error("Google Sheets is read-only and implements no actions.");
   }
@@ -2569,9 +2358,11 @@ export class GoogleSheetsGatekeeperImpl
     throw new Error("Google Sheets is read-only and implements no actions.");
   }
 
-  // Observer tracking — strategy B (ACL check, single unit). Google applies sharing permissions at
-  // spreadsheet granularity, so an observer must be able to open this spreadsheet with their own
-  // account. The overseer re-runs this check on every open, catching revoked access.
+  /**
+   * Observer tracking — strategy B (ACL check, single unit). Google applies sharing permissions at
+   * spreadsheet granularity, so an observer must be able to open this spreadsheet with their own
+   * account. The overseer re-runs this check on every open, catching revoked access.
+   */
   async addObserver(_id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
     let verifier = user as unknown as Fetcher<GoogleVerifierApi>;
     if (!(await verifier.hasSpreadsheetAccess(this.ctx.props.spreadsheetId))) {
@@ -2877,7 +2668,7 @@ export class GoogleCalendarGatekeeperImpl
       this.ctx.props.availabilityMode,
       approvalQueue.dup(),
       pendingActions,
-      calendarIds => this.#prepareAvailabilityCalendarObservation(calendarIds),
+      calendarIds => this.#observers.prepareObservation(calendarIds),
     );
   }
 
@@ -2968,60 +2759,19 @@ export class GoogleCalendarGatekeeperImpl
   // TODO: Let the binding owner choose whether private events are included. A public-only mode
   // could admit readers instead of requiring writer access from every collaborator.
 
-  #observerKey(id: string): string { return `observer:${id}`; }
-  #availabilityCalendarKey(calendarId: string): string {
-    return `observedAvailabilityCalendar:${encodeURIComponent(calendarId)}`;
-  }
-
-  #isAvailabilityCalendarObserved(calendarId: string): boolean {
-    let state = this.ctx.storage.kv.get<ObservedSetState>(this.#availabilityCalendarKey(calendarId));
-    return state === true || state === "observed";
-  }
-
-  #listTrackedAvailabilityCalendars(): string[] {
-    let prefix = "observedAvailabilityCalendar:";
-    return [...this.ctx.storage.kv.list<ObservedSetState>({prefix})]
-        .map(([key]) => decodeURIComponent(key.slice(prefix.length)));
-  }
-
-  *#listObservers(): IterableIterator<[string, Fetcher<GoogleVerifierApi>]> {
-    let prefix = "observer:";
-    for (let [key, verifier] of this.ctx.storage.kv.list<Fetcher<GoogleVerifierApi>>({prefix})) {
-      yield [key.slice(prefix.length), verifier];
-    }
-  }
-
-  async #prepareAvailabilityCalendarObservation(
-    calendarIds: string[],
-  ): Promise<ObserverCheck<string>> {
-    let pendingCalendarIds = [...new Set(calendarIds)]
-        .filter(calendarId => !this.#isAvailabilityCalendarObserved(calendarId));
-    if (pendingCalendarIds.length === 0) return {pendingSets: pendingCalendarIds, commit() {}};
-
-    for (let calendarId of pendingCalendarIds) {
-      let key = this.#availabilityCalendarKey(calendarId);
-      if (this.ctx.storage.kv.get<ObservedSetState>(key) === undefined) {
-        this.ctx.storage.kv.put(key, "pending");
-      }
-    }
-
-    let observerAccess = await Promise.all([...this.#listObservers()].map(async ([id, verifier]) => {
-      let access = await Promise.all(pendingCalendarIds.map(
-        calendarId => verifier.hasCalendarFreeBusyAccess(calendarId),
-      ));
-      return [id, access.every(hasAccess => hasAccess)] as const;
-    }));
-    let excluded = observerAccess.filter(([, hasAccess]) => !hasAccess).map(([id]) => id);
-
-    return {
-      excludeObservers: excluded.length > 0 ? excluded : undefined,
-      pendingSets: pendingCalendarIds,
-      commit: () => {
-        for (let calendarId of pendingCalendarIds) {
-          this.ctx.storage.kv.put(this.#availabilityCalendarKey(calendarId), "observed");
-        }
-      },
-    };
+  get #observers(): ObserverTracker<string, Fetcher<GoogleVerifierApi>> {
+    return new ObserverTracker(this.ctx.storage.kv, {
+      setPrefix: "observedAvailabilityCalendar:",
+      encode: calendarId => encodeURIComponent(calendarId),
+      decode: encoded => decodeURIComponent(encoded),
+      hasAccess: (verifier, calendarId) => verifier.hasCalendarFreeBusyAccess(calendarId),
+      deniedMessage: calendarId =>
+        `This collaborator cannot see free/busy availability for ${calendarId}, whose ` +
+        "availability this workspace has read, so they cannot be allowed to observe it.",
+      // In thisCalendar mode no foreign calendar is ever read, so there is never anyone to
+      // forward-exclude and nothing to remember an observer for.
+      recordObservers: this.ctx.props.availabilityMode === "allVisible",
+    });
   }
 
   async addObserver(id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
@@ -3031,31 +2781,11 @@ export class GoogleCalendarGatekeeperImpl
         "This collaborator does not have writer access to the bound Google Calendar, so they " +
         "cannot be allowed to observe its event details.");
     }
-    let checked = new Set<string>();
-    while (true) {
-      let calendarIds = this.#listTrackedAvailabilityCalendars()
-          .filter(calendarId => !checked.has(calendarId));
-      if (calendarIds.length === 0) {
-        if (this.ctx.props.availabilityMode === "allVisible") {
-          this.ctx.storage.kv.put(this.#observerKey(id), verifier);
-        }
-        return;
-      }
-      let availabilityAccess = await Promise.all(
-        calendarIds.map(calendarId => verifier.hasCalendarFreeBusyAccess(calendarId)));
-      for (let [index, calendarId] of calendarIds.entries()) {
-        if (!availabilityAccess[index]) {
-          throw new Error(
-            `This collaborator cannot see free/busy availability for ${calendarId}, whose ` +
-            "availability this workspace has read, so they cannot be allowed to observe it.");
-        }
-      }
-      for (let calendarId of calendarIds) checked.add(calendarId);
-    }
+    await this.#observers.addObserver(id, verifier);
   }
 
   async removeObserver(id: string): Promise<void> {
-    this.ctx.storage.kv.delete(this.#observerKey(id));
+    this.#observers.removeObserver(id);
   }
 }
 
@@ -3234,6 +2964,140 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
 }
 
 // =======================================================================================
+// Google Drive Gatekeeper
+// =======================================================================================
+
+type GoogleDriveGatekeeperImplProps = {
+  userObjectId: string;
+  scope: DriveBindingScope;
+};
+
+@validateRpc()
+export class GoogleDriveGatekeeperImpl
+    extends DurableObject<Env, GoogleDriveGatekeeperImplProps>
+    implements Gatekeeper<GoogleDriveSession> {
+  #tokens = new AccessTokenCache(opts => {
+    let account = this.ctx.exports.UserAccount.get(
+      this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
+    return account.getAccessToken(opts);
+  });
+
+  #getAccessToken(opts?: AccessTokenRequest): Promise<string> {
+    return this.#tokens.get(opts);
+  }
+
+  async describe(): Promise<ResourceDescription> {
+    let { scope } = this.ctx.props;
+    if (scope.kind === "account") {
+      return {
+        url: GOOGLE_DRIVE_RESOURCE.urlPattern,
+        title: "Google Drive Account",
+        snippet: GOOGLE_DRIVE_RESOURCE.description,
+        suggestedBindingName: "GOOGLE_DRIVE",
+        tsType: "GoogleDriveSession",
+      };
+    }
+    let api = new DriveApi(opts => this.#getAccessToken(opts));
+    if (scope.kind === "sharedDrive") {
+      let drive = await api.getDrive(scope.driveId);
+      return {
+        url: `https://drive.google.com/drive/folders/${encodeURIComponent(scope.driveId)}`,
+        title: drive.name,
+        snippet: `Find files and folders in organization-owned shared drive "${drive.name}" (metadata only)`,
+        suggestedBindingName: "GOOGLE_SHARED_DRIVE",
+        tsType: "GoogleDriveSession",
+      };
+    }
+    let file = await api.getFile(scope.fileId);
+    return {
+      url: `https://drive.google.com/file/d/${encodeURIComponent(scope.fileId)}/view`,
+      title: file.name,
+      snippet: `Read metadata for Drive file "${file.name}"`,
+      suggestedBindingName: "GOOGLE_DRIVE_FILE",
+      tsType: "GoogleDriveSession",
+    };
+  }
+
+  async getTypeScriptTypes(): Promise<string> {
+    return DRIVE_TYPES_CODE;
+  }
+
+  async getAutoApprovableActions() {
+    return [];
+  }
+
+  async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<GoogleDriveSession> {
+    let observerTracker = this.#observerTracker();
+    return new GoogleDriveSessionImpl(
+      new DriveApi(opts => this.#getAccessToken(opts)),
+      this.ctx.props.scope,
+      approvalQueue.dup(),
+      fileIds => observerTracker.prepareObservation(fileIds),
+      () => [...observerTracker.observers()].map(([id]) => id),
+    );
+  }
+
+  /** Read-only — no side-effecting actions. */
+  async applyAction(_action: number): Promise<void> {}
+  async rejectAction(_action: number): Promise<void> {}
+  revertAction(_action: number): Promise<void> {
+    throw new Error("Google Drive gatekeeper has no writable actions to revert");
+  }
+
+  #observerTracker(): ObserverTracker<string, Fetcher<GoogleVerifierApi>> {
+    return driveObserverTracker<Fetcher<GoogleVerifierApi>>(
+      this.ctx.storage.kv, this.ctx.props.scope,
+      (verifier, fileIds) => verifier.verifyDriveFiles([...fileIds]));
+  }
+
+  async addObserver(id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
+    await this.#observerTracker().addObserver(id, user as unknown as Fetcher<GoogleVerifierApi>);
+  }
+
+  async removeObserver(id: string): Promise<void> {
+    this.#observerTracker().removeObserver(id);
+  }
+}
+
+@validateRpc()
+class GoogleDriveSessionImpl extends RpcTarget implements GoogleDriveSession {
+  #core: DriveSessionCore;
+
+  constructor(
+    api: DriveApi,
+    scope: DriveBindingScope,
+    approvalQueue: RpcStub<ApprovalQueue>,
+    prepareObservation: (fileIds: string[]) => Promise<ObserverCheck<string>>,
+    observerIds: () => string[],
+  ) {
+    super();
+    this.#core = new DriveSessionCore({
+      api,
+      scope,
+      prepareObservation,
+      observerIds,
+      authorize: description => approvalQueue.authorizeObservation(description),
+    });
+  }
+
+  getScope() {
+    return this.#core.getScope();
+  }
+
+  async list(options?: DriveListOptions): Promise<Cursor<DriveEntry>> {
+    return new RpcCursor(await this.#core.list(options));
+  }
+
+  async search(query: DriveSearchQuery): Promise<Cursor<DriveEntry>> {
+    return new RpcCursor(await this.#core.search(query));
+  }
+
+  getEntry(fileId: string): Promise<DriveEntry> {
+    return this.#core.getEntry(fileId);
+  }
+}
+
+// =======================================================================================
 // BigQuery Gatekeeper
 // =======================================================================================
 //
@@ -3242,6 +3106,9 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
 // scope. The dry-run also gives us the bytesProcessed estimate, which we cross-check against
 // `maximumBytesBilled` before actually executing — defense in depth, since BigQuery will also
 // enforce maximumBytesBilled server-side.
+
+/** One BigQuery dataset, the unit at which observer access is tracked. */
+type BigQueryDatasetRef = { projectId: string; datasetId: string };
 
 type BigQueryGatekeeperImplProps = {
   userObjectId: string;
@@ -3300,11 +3167,11 @@ export class BigQueryGatekeeperImpl
       this.ctx.props.scopedProjectId,
       this.ctx.props.scopedDatasetId,
       this.ctx.props.scopedTableId,
-      datasets => this.#prepareDatasetObservation(datasets),
+      datasets => this.#observers.prepareObservation(datasets),
     );
   }
 
-  // Read-only — no side-effecting actions.
+  /** Read-only — no side-effecting actions. */
   async applyAction(_action: number): Promise<void> {}
   async rejectAction(_action: number): Promise<void> {}
   revertAction(_action: number): Promise<void> {
@@ -3312,107 +3179,34 @@ export class BigQueryGatekeeperImpl
   }
 
   // -------------------------------------------------------------------------
-  // Observer tracking — strategy C (data-set tracking by dataset). Even a project- or table-scoped
-  // binding is tracked at dataset granularity: users may have IAM access to different datasets, so we
-  // record which datasets' data the Gadget has actually observed and verify each observer against
-  // them. addObserver requires access to every already-observed dataset; later, the first observation
-  // of a *new* dataset excludes any observer lacking it (see #prepareDatasetObservation). Verified
-  // observers are remembered (their verifier stored) so that forward-exclusion re-check can run. The
-  // overseer re-runs addObserver on every open, catching loss of access promptly.
+  // Observer tracking — strategy C, by dataset. Even a project- or table-scoped binding is tracked
+  // at dataset granularity: users may have IAM access to different datasets, so we record which
+  // datasets' data the gadget has actually read and verify each observer against them.
 
-  #observerKey(id: string): string { return `observer:${id}`; }
-  // A dataset is identified by project + dataset id; "/" cannot appear in either, so it is an
-  // unambiguous separator.
-  #datasetKey(projectId: string, datasetId: string): string {
-    return `observedDataset:${projectId}/${datasetId}`;
-  }
-
-  #isDatasetObserved(projectId: string, datasetId: string): boolean {
-    let state = this.ctx.storage.kv.get<ObservedSetState>(this.#datasetKey(projectId, datasetId));
-    return state === true || state === "observed";
-  }
-
-  #listTrackedDatasets(): { projectId: string; datasetId: string }[] {
-    let prefix = "observedDataset:";
-    return [...this.ctx.storage.kv.list<ObservedSetState>({ prefix })].map(([key]) => {
-      let rest = key.slice(prefix.length);
-      let slash = rest.indexOf("/");
-      return { projectId: rest.slice(0, slash), datasetId: rest.slice(slash + 1) };
-    });
-  }
-
-  *#listObservers(): IterableIterator<[string, Fetcher<GoogleVerifierApi>]> {
-    let prefix = "observer:";
-    for (let [key, verifier] of this.ctx.storage.kv.list<Fetcher<GoogleVerifierApi>>({ prefix })) {
-      yield [key.slice(prefix.length), verifier];
-    }
-  }
-
-  // Marks unknown datasets pending and returns current observers who cannot access any pending
-  // dataset in this attempt. Authorization promotes them; failed attempts remain pending and are
-  // rechecked on retry.
-  async #prepareDatasetObservation(
-    datasets: { projectId: string; datasetId: string }[],
-  ): Promise<ObserverCheck<{ projectId: string; datasetId: string }>> {
-    let seen = new Set<string>();
-    let pendingDatasets = datasets.filter(d => {
-      let key = `${d.projectId}/${d.datasetId}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return !this.#isDatasetObserved(d.projectId, d.datasetId);
-    });
-    if (pendingDatasets.length === 0) return {pendingSets: pendingDatasets, commit() {}};
-    for (let d of pendingDatasets) {
-      let key = this.#datasetKey(d.projectId, d.datasetId);
-      if (this.ctx.storage.kv.get<ObservedSetState>(key) === undefined) {
-        this.ctx.storage.kv.put(key, "pending");
-      }
-    }
-    let observerAccess = await Promise.all([...this.#listObservers()].map(async ([id, verifier]) => {
-      let access = await Promise.all(pendingDatasets.map(
-        d => verifier.hasDatasetAccess(d.projectId, d.datasetId),
-      ));
-      return [id, access.every(hasAccess => hasAccess)] as const;
-    }));
-    let excluded = observerAccess.filter(([, hasAccess]) => !hasAccess).map(([id]) => id);
-    return {
-      excludeObservers: excluded.length > 0 ? excluded : undefined,
-      pendingSets: pendingDatasets,
-      commit: () => {
-        for (let d of pendingDatasets) {
-          this.ctx.storage.kv.put(this.#datasetKey(d.projectId, d.datasetId), "observed");
-        }
+  get #observers(): ObserverTracker<BigQueryDatasetRef, Fetcher<GoogleVerifierApi>> {
+    return new ObserverTracker(this.ctx.storage.kv, {
+      setPrefix: "observedDataset:",
+      // "/" cannot appear in either id, so it is an unambiguous separator.
+      encode: ({ projectId, datasetId }) => `${projectId}/${datasetId}`,
+      decode: encoded => {
+        let slash = encoded.indexOf("/");
+        return { projectId: encoded.slice(0, slash), datasetId: encoded.slice(slash + 1) };
       },
-    };
+      hasAccess: (verifier, { projectId, datasetId }) =>
+        verifier.hasDatasetAccess(projectId, datasetId),
+      deniedMessage: ({ projectId, datasetId }) =>
+        "This collaborator does not have access to the BigQuery dataset " +
+        `\`${projectId}.${datasetId}\`, whose data this workspace has read, so they cannot be ` +
+        "allowed to observe it.",
+    });
   }
 
   async addObserver(id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
-    let verifier = user as unknown as Fetcher<GoogleVerifierApi>;
-    let checked = new Set<string>();
-    while (true) {
-      let datasets = this.#listTrackedDatasets()
-          .filter(d => !checked.has(`${d.projectId}/${d.datasetId}`));
-      if (datasets.length === 0) {
-        this.ctx.storage.kv.put(this.#observerKey(id), verifier);
-        return;
-      }
-      let access = await Promise.all(datasets.map(
-        d => verifier.hasDatasetAccess(d.projectId, d.datasetId),
-      ));
-      for (let [index, d] of datasets.entries()) {
-        if (!access[index]) {
-          throw new Error(
-            `This collaborator does not have access to the BigQuery dataset ` +
-            `\`${d.projectId}.${d.datasetId}\`, whose data this workspace has read, so they cannot be ` +
-            `allowed to observe it.`);
-        }
-        checked.add(`${d.projectId}/${d.datasetId}`);
-      }
-    }
+    await this.#observers.addObserver(id, user as unknown as Fetcher<GoogleVerifierApi>);
   }
 
   async removeObserver(id: string): Promise<void> {
-    this.ctx.storage.kv.delete(this.#observerKey(id));
+    this.#observers.removeObserver(id);
   }
 }
 
@@ -3423,10 +3217,8 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
   #scopedProjectId?: string;
   #scopedDatasetId?: string;
   #scopedTableId?: string;
-  // Records the datasets an observation reveals and returns observers to exclude (see
-  // BigQueryGatekeeperImpl.#prepareDatasetObservation).
-  #observe: (datasets: { projectId: string; datasetId: string }[]) =>
-    Promise<ObserverCheck<{ projectId: string; datasetId: string }>>;
+  // Records the datasets an observation reveals and returns observers to exclude.
+  #observe: (datasets: BigQueryDatasetRef[]) => Promise<ObserverCheck<BigQueryDatasetRef>>;
 
   constructor(
     api: BigQueryApi,
@@ -3434,8 +3226,7 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
     scopedProjectId: string | undefined,
     scopedDatasetId: string | undefined,
     scopedTableId: string | undefined,
-    observe: (datasets: { projectId: string; datasetId: string }[]) =>
-      Promise<ObserverCheck<{ projectId: string; datasetId: string }>>,
+    observe: (datasets: BigQueryDatasetRef[]) => Promise<ObserverCheck<BigQueryDatasetRef>>,
   ) {
     super();
     this.#api = api;

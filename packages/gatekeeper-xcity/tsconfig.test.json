@@ -1,6 +1,0 @@
-// Type-checks tests without changing the package build output.
-{
-  "extends": "./tsconfig.json",
-  "compilerOptions": { "noEmit": true, "declaration": false },
-  "include": ["src", "__tests__"]
-}

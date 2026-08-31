@@ -209,7 +209,7 @@ const CONNECT_FORM_HTML = (params: { actionUrl: string; error?: string }) => `<!
 <body>
   <div class="card">
     <h1>Connect Home Assistant</h1>
-    <p>Provide the URL of your Home Assistant instance and a long-lived access token. Cloudflare OS will use these to read entity states and control devices.</p>
+    <p>Provide the URL of your Home Assistant instance and a long-lived access token. Xcity OS will use these to read entity states and control devices.</p>
     ${params.error ? `<div class="error">${escapeHtml(params.error)}</div>` : ""}
     <form method="POST" action="${escapeAttr(params.actionUrl)}">
       <label for="baseUrl">Home Assistant URL</label>
@@ -227,7 +227,7 @@ const CONNECT_FORM_HTML = (params: { actionUrl: string; error?: string }) => `<!
           <li>Click your username in the bottom-left corner.</li>
           <li>Select the <b>Security</b> tab.</li>
           <li>Scroll to the bottom and click <b>Create Token</b> under "Long-lived access tokens".</li>
-          <li>Give it a name like "Cloudflare OS", then copy the token and paste it above.</li>
+          <li>Give it a name like "Xcity OS", then copy the token and paste it above.</li>
         </ol>
       </details>
 
@@ -243,7 +243,7 @@ const SELF_CLOSING_HTML = `<!DOCTYPE html>
 <body style="font-family: system-ui, sans-serif; padding: 2rem; text-align: center;">
   <script>window.close();</script>
   <h2 style="color: #03a9f4;">Connected!</h2>
-  <p>Home Assistant has been linked to Cloudflare OS. You may close this tab.</p>
+  <p>Home Assistant has been linked to Xcity OS. You may close this tab.</p>
 </body>
 </html>`;
 
@@ -252,7 +252,7 @@ const INVALID_LINK_HTML = `<!DOCTYPE html>
 <head><meta charset="UTF-8"><title>Link Expired</title></head>
 <body style="font-family: system-ui, sans-serif; padding: 2rem; text-align: center;">
   <h2 style="color: #d97706;">Authorization Link Expired</h2>
-  <p>This connection link is invalid or has expired. Please return to Cloudflare OS and start over.</p>
+  <p>This connection link is invalid or has expired. Please return to Xcity OS and start over.</p>
 </body>
 </html>`;
 
@@ -361,7 +361,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
       logo: HOMEASSISTANT_ICON,
       tagline: "Control your smart home, read sensor state, and edit Lovelace dashboards.",
       description:
-          "Connect your Home Assistant instance so Cloudflare OS can read entity state, call services " +
+          "Connect your Home Assistant instance so Xcity OS can read entity state, call services " +
           "to control devices, edit dashboards, and render templates. Build agents that automate " +
           "your home, alert on sensor changes, or generate custom dashboards.",
     };
@@ -559,7 +559,7 @@ export class HomeAssistantUserImpl
     };
   }
 
-  // This gatekeeper does not provide sign-in.
+  /** This gatekeeper does not provide sign-in. */
   async getAuthenticatedEmail(): Promise<string | null> {
     return null;
   }
@@ -686,12 +686,14 @@ export class HomeAssistantUserImpl
     return {};
   }
 
-  // Mint a verifier representing this account. Home Assistant uses the "low-stakes" observer
-  // strategy (see HomeAssistantGatekeeperImpl.addObserver): it is a self-hosted personal system,
-  // and its long-lived access token is all-or-nothing (HA exposes no per-user/per-entity ACL we
-  // could verify an observer against), so there is nothing meaningful to check. The verifier
-  // carries no identity and is never consulted — but the overseer mints one on every open, so it
-  // must exist and not throw.
+  /**
+   * Mint a verifier representing this account. Home Assistant uses the "low-stakes" observer
+   * strategy (see HomeAssistantGatekeeperImpl.addObserver): it is a self-hosted personal system,
+   * and its long-lived access token is all-or-nothing (HA exposes no per-user/per-entity ACL we
+   * could verify an observer against), so there is nothing meaningful to check. The verifier
+   * carries no identity and is never consulted — but the overseer mints one on every open, so it
+   * must exist and not throw.
+   */
   @skipRpcValidation()
   async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
     return this.ctx.exports.HomeAssistantVerifier({});
@@ -951,7 +953,7 @@ type HomeAssistantGatekeeperImplProps = {
   resourceId?: string;
 };
 
-// HA service-call target as accepted by HA itself (snake_case fields).
+/** HA service-call target as accepted by HA itself (snake_case fields). */
 export type HATarget = {
   entity_id?: string | string[];
   device_id?: string | string[];
@@ -960,8 +962,10 @@ export type HATarget = {
   floor_id?: string | string[];
 };
 
-// "Where the write came from" — used to author meaningful action descriptions and (later)
-// to drive simulation overlays. The receiving session may be whole-instance or scoped.
+/**
+ * "Where the write came from" — used to author meaningful action descriptions and (later)
+ * to drive simulation overlays. The receiving session may be whole-instance or scoped.
+ */
 export type ActionOrigin =
   | { kind: "session" }
   | { kind: "entity"; entityId: string }
@@ -970,7 +974,7 @@ export type ActionOrigin =
   | { kind: "device"; deviceId: string }
   | { kind: "dashboard"; urlPath: string };
 
-// All side-effecting actions go through the approval queue as one of these.
+/** All side-effecting actions go through the approval queue as one of these. */
 export type HomeAssistantAction =
   | {
       id: number;
@@ -997,7 +1001,7 @@ export type HomeAssistantAction =
       origin: ActionOrigin;
     };
 
-// Captured at apply time so we can later restore the prior state via revertAction().
+/** Captured at apply time so we can later restore the prior state via revertAction(). */
 export type HomeAssistantRevertInfo =
   | {
       type: "stateSnapshot";
@@ -1233,11 +1237,13 @@ export class HomeAssistantGatekeeperImpl
     }
   }
 
-  // Observer tracking: Home Assistant uses the "low-stakes" strategy. It is a self-hosted personal
-  // system, and the connection is a long-lived access token that grants the same all-or-nothing
-  // access as the HA user who created it — HA has no per-user/per-entity ACL oracle we could verify
-  // an observer against. So any collaborator may observe: addObserver/removeObserver are no-ops and
-  // we never set excludeObservers on observations.
+  /**
+   * Observer tracking: Home Assistant uses the "low-stakes" strategy. It is a self-hosted personal
+   * system, and the connection is a long-lived access token that grants the same all-or-nothing
+   * access as the HA user who created it — HA has no per-user/per-entity ACL oracle we could verify
+   * an observer against. So any collaborator may observe: addObserver/removeObserver are no-ops and
+   * we never set excludeObservers on observations.
+   */
   async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {}
   async removeObserver(_id: string): Promise<void> {}
 

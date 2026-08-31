@@ -57,6 +57,9 @@ function constantTimeEqual(a: string, b: string): boolean {
 type Env = Cloudflare.Env & {
   // Public worker URL without a trailing slash; defaults to the local dev route.
   BASE_URL?: string;
+  // OAuth app credentials (wrangler secrets / .dev.vars); not in wrangler.jsonc.
+  CLIENT_ID?: string;
+  CLIENT_SECRET?: string;
 };
 
 function getBaseUrl(env: Env) {
@@ -184,7 +187,7 @@ const SELF_CLOSING_HTML = `<!DOCTYPE html>
 <html lang="en">
   <body>
     <script type="text/javascript">window.close();</script>
-    <p>Authorization complete. You may close this tab and return to Cloudflare OS.
+    <p>Authorization complete. You may close this tab and return to Xcity OS.
   </body>
 </html>`;
 
@@ -194,7 +197,7 @@ const INVALID_LINK_HTML = `<!DOCTYPE html>
   <body style="font-family: system-ui, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #f5f5f5;">
     <div style="max-width: 520px; padding: 2rem; background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center;">
       <h1 style="color: #d97706; font-size: 1.5rem; margin: 0 0 1rem 0;">Authorization Link Expired</h1>
-      <p style="color: #555; line-height: 1.6; margin: 0 0 1.5rem 0;">This authorization link is invalid or has expired. Please return to Cloudflare OS and try again.</p>
+      <p style="color: #555; line-height: 1.6; margin: 0 0 1.5rem 0;">This authorization link is invalid or has expired. Please return to Xcity OS and try again.</p>
       <button onclick="window.close()" style="padding: 0.5rem 1.5rem; background: #d97706; color: white; border: none; border-radius: 4px; font-size: 1rem; cursor: pointer;">Close</button>
     </div>
   </body>
@@ -284,7 +287,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
       color: "#f4ede4",
       tagline: "Read channels, DMs, and threads",
       description:
-          "Connect your Slack account to give Cloudflare OS read-only access to the workspaces, " +
+          "Connect your Slack account to give Xcity OS read-only access to the workspaces, " +
           "channels, direct messages, and threads you can see. Build agents that summarize " +
           "conversations, monitor channels, or search across your Slack history.",
     };
@@ -343,8 +346,10 @@ export class UserAccount extends DurableObject<Env> {
     });
   }
 
-  // Prepare for a reconnect/expansion flow: the next acceptAuthCode() replaces credentials and
-  // notifies via credentialsRestored() instead of complete().
+  /**
+   * Prepare for a reconnect/expansion flow: the next acceptAuthCode() replaces credentials and
+   * notifies via credentialsRestored() instead of complete().
+   */
   async prepareReconnect(initiationNonce: string, requestedScopes: string[]) {
     this.ctx.storage.kv.put<boolean>("reconnecting", true);
     this.ctx.storage.kv.put<string[]>("requestedScopes", requestedScopes);
@@ -444,7 +449,7 @@ export class UserAccount extends DurableObject<Env> {
     return this.ctx.storage.kv.get<string>("teamId") ?? "";
   }
 
-  // Refresh rotating tokens shortly before expiry.
+  /** Refresh rotating tokens shortly before expiry. */
   async getAccessToken(): Promise<SlackAccessToken> {
     return this.#updateCredentials(() => this.#getAccessTokenLocked());
   }
@@ -535,8 +540,10 @@ export class SlackUserImpl extends WorkerEntrypoint<Env, SlackUserImplProps>
   async describe(): Promise<AccountDescription> {
     let account = this.#account();
     let userIdPromise = account.getUserId();
+    let teamIdPromise = account.getTeamId();
     let grantedPromise = account.getGrantedResourceUrlPatterns();
-    let description = await this.#api().getAccountDescription(await userIdPromise);
+    let description = await this.#api().getAccountDescription(
+        await userIdPromise, await teamIdPromise);
     description.grantedResourceUrlPatterns = await grantedPromise;
     return description;
   }
@@ -645,10 +652,12 @@ export class SlackUserImpl extends WorkerEntrypoint<Env, SlackUserImplProps>
     await this.#account().revoke();
   }
 
-  // Mint a verifier representing this account, used by the Slack gatekeepers' addObserver to confirm
-  // a prospective observer may read a bound conversation (and, for workspace bindings, the workspace
-  // and each observed conversation). The verifier carries this user's own account id, so the access
-  // checks run against the observer's *own* Slack token.
+  /**
+   * Mint a verifier representing this account, used by the Slack gatekeepers' addObserver to confirm
+   * a prospective observer may read a bound conversation (and, for workspace bindings, the workspace
+   * and each observed conversation). The verifier carries this user's own account id, so the access
+   * checks run against the observer's *own* Slack token.
+   */
   @skipRpcValidation()
   async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
     let props: SlackVerifierProps = { userObjectId: this.ctx.props.userObjectId };
@@ -674,8 +683,10 @@ type SlackVerifierProps = {
   userObjectId: string;
 };
 
-// The non-standard methods the Slack gatekeepers call on their own verifier (see addObserver). Not
-// part of the generic GatekeeperUserVerifier contract.
+/**
+ * The non-standard methods the Slack gatekeepers call on their own verifier (see addObserver). Not
+ * part of the generic GatekeeperUserVerifier contract.
+ */
 export interface SlackVerifierApi extends GatekeeperUserVerifier {
   getTeamId(): Promise<string | null>;
   hasConversationAccess(conversationId: string): Promise<boolean>;
@@ -690,9 +701,11 @@ export class SlackVerifier extends WorkerEntrypoint<Env, SlackVerifierProps>
     return new SlackApi(createAccessTokenGetter(() => account));
   }
 
-  // The observer's workspace team id, or null if their token is broken/expired (a token that can't
-  // demonstrate access is treated as "no access" rather than failing the whole open; the observer is
-  // re-checked on their next open).
+  /**
+   * The observer's workspace team id, or null if their token is broken/expired (a token that can't
+   * demonstrate access is treated as "no access" rather than failing the whole open; the observer is
+   * re-checked on their next open).
+   */
   async getTeamId(): Promise<string | null> {
     try {
       return (await this.#api().authedTeamId()) || null;
@@ -948,9 +961,11 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
     };
   }
 
-  // Routes a conversation-scoped observation through data-set tracking (see the class comment).
-  // Called in-process by the workspace session and its child capabilities via
-  // authorizeConversationObservation.
+  /**
+   * Routes a conversation-scoped observation through data-set tracking (see the class comment).
+   * Called in-process by the workspace session and its child capabilities via
+   * authorizeConversationObservation.
+   */
   async authorizeConversationObservation(
       queue: RpcStub<ApprovalQueue>, conversationIds: string[],
       description: ObservationDescription): Promise<void> {
@@ -1046,11 +1061,13 @@ export class SlackConversationGatekeeperImpl
         this.ctx.props.conversationId);
   }
 
-  // Observer tracking: "ACL check (single unit)". The binding is one conversation, so we simply
-  // confirm the observer can read it with their own token (see SlackVerifier). Nothing read later
-  // could be outside that conversation, so no observers are tracked, no excludeObservers is set, and
-  // removeObserver is an idempotent no-op. The overseer re-runs addObserver on every open, catching
-  // loss of access promptly.
+  /**
+   * Observer tracking: "ACL check (single unit)". The binding is one conversation, so we simply
+   * confirm the observer can read it with their own token (see SlackVerifier). Nothing read later
+   * could be outside that conversation, so no observers are tracked, no excludeObservers is set, and
+   * removeObserver is an idempotent no-op. The overseer re-runs addObserver on every open, catching
+   * loss of access promptly.
+   */
   async addObserver(_id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
     let verifier = user as unknown as Fetcher<SlackVerifierApi>;
     if (!(await verifier.hasConversationAccess(this.ctx.props.conversationId))) {
@@ -1120,10 +1137,12 @@ export class SlackThreadGatekeeperImpl extends DurableObject<Env, SlackThreadGat
         this.ctx.props.conversationId, this.ctx.props.threadTs);
   }
 
-  // Observer tracking: "ACL check (single unit)". A thread inherits its conversation's ACL, so we
-  // confirm the observer can read that conversation with their own token (see SlackVerifier). Nothing
-  // read later could be outside it, so no observers are tracked and removeObserver is an idempotent
-  // no-op. The overseer re-runs addObserver on every open, catching loss of access promptly.
+  /**
+   * Observer tracking: "ACL check (single unit)". A thread inherits its conversation's ACL, so we
+   * confirm the observer can read that conversation with their own token (see SlackVerifier). Nothing
+   * read later could be outside it, so no observers are tracked and removeObserver is an idempotent
+   * no-op. The overseer re-runs addObserver on every open, catching loss of access promptly.
+   */
   async addObserver(_id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
     let verifier = user as unknown as Fetcher<SlackVerifierApi>;
     if (!(await verifier.hasConversationAccess(this.ctx.props.conversationId))) {

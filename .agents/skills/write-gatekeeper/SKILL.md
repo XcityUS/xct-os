@@ -118,8 +118,15 @@ If you use this:
 - UI modules live in `src/configurator/*-ui.tsx`.
 - `resourceUrl()` returns the selected resource URL.
 - `src/configurator/*-types.d.ts` describes the iframe-facing `ui` API.
-- `scripts/build-gatekeeper-configurator.mjs` generates `src/generated/*.txt`.
-- Package `build` / `deploy` scripts should run `pnpm run build:configurator`.
+- `scripts/build-gatekeeper-configurator.ts` generates `src/generated/*.txt`.
+- Nothing invokes `build-gatekeeper-configurator.ts` by hand. `vite.config.ts` re-exports the
+  shared `build` and `build:configurator` Vite+ tasks from
+  `scripts/gatekeeper-configurator-vite-config.ts`; `build` is just `tsc` and depends on
+  `build:configurator`, which carries `VITE_FRONTEND_ERROR_REPORTING` in its fingerprint, and
+  `deploy` runs `vp run --no-cache build:configurator && wrangler deploy` — deploys never replay a
+  cached artifact. There is no `build` script
+  and no direct builder call, because a script running the builder gets vp's stripped environment
+  and bakes the wrong flag into the shipped HTML.
 
 ##### Pre-filling the form from a known resource URL
 

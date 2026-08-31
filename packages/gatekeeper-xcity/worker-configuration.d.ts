@@ -6,7 +6,7 @@ interface __BaseEnv_Env {
 declare namespace Cloudflare {
 	interface GlobalProps {
 		mainModule: typeof import("./src/xcity");
-		durableNamespaces: "UserAccount" | "XcityMediaGatekeeperImpl";
+		durableNamespaces: "UserAccount" | "XcityMediaGatekeeperImpl" | "XcityContextGatekeeperImpl";
 	}
 	interface Env extends __BaseEnv_Env {}
 }

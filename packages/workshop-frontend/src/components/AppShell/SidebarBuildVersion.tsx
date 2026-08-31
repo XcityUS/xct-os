@@ -1,6 +1,8 @@
-// Build stamp under the sidebar's utility strip: the UTC build date and the CI build counter,
-// with the source revision in the hover title. The deployment pipeline injects the values at
-// build time; local dev builds carry none, so the line renders nothing there.
+/**
+ * Build stamp under the sidebar's utility strip: the UTC build date and the CI build counter,
+ * with the source revision in the hover title. The deployment pipeline injects the values at
+ * build time; local dev builds carry none, so the line renders nothing there.
+ */
 export default function SidebarBuildVersion({ collapsed }: { collapsed: boolean }) {
   const date = import.meta.env.VITE_BUILD_DATE
   const build = import.meta.env.VITE_BUILD_NUMBER

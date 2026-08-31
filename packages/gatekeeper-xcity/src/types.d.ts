@@ -94,6 +94,127 @@ export type GeneratedMedia = {
   updatedAt: Date;
 };
 
+/**
+ * Xcity shared context store API for Gadgets.
+ *
+ * A connection represents the connected user's slice of the cross-product Xcity context store:
+ * documents shared by all Xcity products under the same account. Reads return live data. Writes
+ * (save/update/delete) are staged for user approval and return a pending `XcityContextWrite`
+ * receipt; call `getWrite(id)` after approval to see the outcome and the created document's id.
+ */
+
+/** The kind of a staged context-store write. */
+export type XcityContextWriteKind = "create" | "update" | "delete";
+
+/** One document in the user's Xcity context store, as listed. Content is previewed only. */
+export type XcityContextDocumentSummary = {
+  /** Stable document id. Pass to getDocument(), updateDocument(), or deleteDocument(). */
+  contextId: string;
+  /** Document title. */
+  title: string;
+  /** Leading excerpt of the content. Call getDocument() for the full content. */
+  contentPreview: string;
+  /** Labels attached to the document, when any. */
+  tags?: string[];
+  /** Whether the document is shared beyond its owner. */
+  isPublic: boolean;
+  /** Creation time, when the store reported one. */
+  createdAt?: Date;
+  /** Last update time, when the store reported one. */
+  updatedAt?: Date;
+};
+
+/** Full document returned by getDocument(). Content is at most 256 KB of UTF-8 text. */
+export type XcityContextDocument = XcityContextDocumentSummary & {
+  /** Complete document content. */
+  content: string;
+};
+
+/** One page of context documents. */
+export type XcityContextDocumentList = {
+  /** Documents on this page, newest first. */
+  documents: XcityContextDocumentSummary[];
+  /** True when more documents exist beyond this page. */
+  hasMore: boolean;
+  /** Opaque cursor for the next page; pass as `listDocuments({ cursor })`. */
+  nextCursor?: string;
+};
+
+/** Options for listDocuments(). */
+export type ListContextDocumentsOptions = {
+  /** Maximum documents per page, 1-100. Defaults to 50. */
+  limit?: number;
+  /** Cursor from a previous page's `nextCursor`. */
+  cursor?: string;
+  /** Text query to filter documents. */
+  query?: string;
+};
+
+/** Options for saveDocument(). */
+export type SaveContextDocumentOptions = {
+  /** Document title. Required and non-empty. */
+  title: string;
+  /** Document content; at most 256 KB of UTF-8 text. */
+  content: string;
+  /** Labels to attach to the document. */
+  tags?: string[];
+  /** Whether the document should be shared beyond its owner. Defaults to false. */
+  isPublic?: boolean;
+};
+
+/** Options for updateDocument(). At least one field must be present. */
+export type UpdateContextDocumentOptions = {
+  title?: string;
+  /** Replacement content; at most 256 KB of UTF-8 text. */
+  content?: string;
+  tags?: string[];
+  isPublic?: boolean;
+};
+
+/** Status receipt for a staged context-store write. */
+export type XcityContextWrite = {
+  /** Stable id returned by saveDocument(), updateDocument(), or deleteDocument(). */
+  id: string;
+  /** What this write does. */
+  kind: XcityContextWriteKind;
+  /** Write lifecycle state. `pending` until the user approves and the write applies. */
+  status: "pending" | "completed" | "failed";
+  /** The target document id; for creates, set once the write has completed. */
+  contextId?: string;
+  /** The stored document after a completed create or update, when the store returned it. */
+  document?: XcityContextDocument;
+  /** Failure detail when `status` is `failed`. */
+  error?: string;
+  /** Time this write was requested. */
+  createdAt: Date;
+  /** Time this status was last updated. */
+  updatedAt: Date;
+};
+
+/** Xcity shared context store session. */
+export interface XcityContext {
+  /** Lists the user's context documents (title, preview, tags), cursor-paged, 50 per page by default. */
+  listDocuments(options?: ListContextDocumentsOptions): Promise<XcityContextDocumentList>;
+
+  /** Reads one document, including its full content, by an id from listDocuments(). */
+  getDocument(contextId: string): Promise<XcityContextDocument>;
+
+  /**
+   * Stages creation of a new document and returns a pending write receipt immediately. After the
+   * user approves, call `getWrite()` with the receipt id to get the created document's contextId.
+   */
+  saveDocument(options: SaveContextDocumentOptions): Promise<XcityContextWrite>;
+
+  /** Stages a partial update of an existing document. Track the outcome via `getWrite()`. */
+  updateDocument(contextId: string, options: UpdateContextDocumentOptions): Promise<XcityContextWrite>;
+
+  /** Stages deletion of a document. Track the outcome via `getWrite()`. */
+  deleteDocument(contextId: string): Promise<XcityContextWrite>;
+
+  /** Reads the current status or final outcome for a write receipt id. */
+  getWrite(id: string): Promise<XcityContextWrite>;
+}
+
 /** Xcity media generation session. */
 export interface XcityMedia {
   /**

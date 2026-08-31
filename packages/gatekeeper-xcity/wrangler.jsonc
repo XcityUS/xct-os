@@ -28,6 +28,10 @@
     {
       "tag": "v1",
       "new_sqlite_classes": [ "XcityMediaGatekeeperImpl" ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [ "XcityContextGatekeeperImpl" ]
     }
   ],
   "observability": {

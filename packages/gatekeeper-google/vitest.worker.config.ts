@@ -2,27 +2,29 @@ import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import capnwebValidate from "capnweb-validate/vite";
 import { defineConfig } from "vitest/config";
 
-/** Workerd coverage for nested Drive sessions and the Google Doc Durable Object. */
+/** Workerd coverage for Gmail sessions and the Gmail Durable Object. */
 export default defineConfig({
   plugins: [
     capnwebValidate(),
     cloudflareTest({
-      main: "./__tests__/worker.ts",
+      main: "./__tests__/workerd/worker.ts",
       miniflare: {
-        // Kept in step with wrangler.jsonc; drift here tests a runtime we do not deploy.
         compatibilityDate: "2026-02-02",
         compatibilityFlags: ["allow_irrevocable_stub_storage", "nodejs_als"],
-        // Facets and loopback namespaces need test-only registrations in this test pool.
+        bindings: {CLIENT_ID: "test-client", CLIENT_SECRET: "test-secret"},
         durableObjects: {
-          GOOGLE_DOC_GATEKEEPER: { className: "GoogleDocGatekeeperImpl", useSQLite: true },
-          TEST_HOOKS: { className: "TestHooks", useSQLite: true },
-          USER_ACCOUNT: { className: "UserAccount", useSQLite: true },
+          GmailGatekeeperImpl: {className: "GmailGatekeeperImpl", useSQLite: true},
+          TestHooks: {className: "TestHooks", useSQLite: true},
+          UserAccount: {className: "UserAccount", useSQLite: true},
         },
       },
     }),
   ],
   test: {
-    include: ["__tests__/workerd/*.test.ts"],
+    include: [
+      "__tests__/workerd/gmail-actions.test.ts",
+      "__tests__/workerd/gmail-state.test.ts",
+    ],
     setupFiles: ["../../scripts/assert-workerd.ts"],
   },
 });

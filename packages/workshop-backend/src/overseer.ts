@@ -100,7 +100,8 @@ export default class extends WorkerEntrypoint {
         }
       }
     }
-    await agent(self, env, this.ctx);
+    let result = await agent(self, env, this.ctx);
+    if (result !== undefined) console.log("Return value:", result);
   }
 }
 `;
@@ -7347,8 +7348,10 @@ class OverseerImpl implements AgentHooks {
         }).join(" ");
       }).join("\n");
 
-      if (error) {
+      if (error !== undefined) {
         log += `\n\nUncaught exception: ${error}`;
+      } else if (log === "") {
+        log = "(function succeeded with no output)";
       }
 
       return log;

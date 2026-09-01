@@ -428,6 +428,10 @@ const SHARED_GATEKEEPER_CREDS: Record<string, { id: string; secret: string }> = 
 // `.dev.vars` is gitignored, so it cannot leave the machine. Secrets travel the same way
 // `CLIENT_SECRET` already does, via SHARED_GATEKEEPER_CREDS above.
 const PASSTHROUGH_GATEKEEPER_VARS: Record<string, string[]> = {
+  "gatekeeper-xcity": [
+    "XCITY_AUTH_URL", "XCITY_TOKENHUB_URL", "XCITY_MEDIA_WORKER_URL",
+    "XCITY_WALLET_URL", "WALLET_SERVICE_TOKEN",
+  ],
   "gatekeeper-mcp-portal": [
     "MCP_PORTAL_URL", "MCP_PORTAL_NAME", "MCP_PORTAL_AUTH", "MCP_PORTAL_TOKEN",
     "MCP_PORTAL_TRUST_ANNOTATIONS", "MCP_PORTAL_HIDDEN_SERVER_IDS", "MCP_ALLOW_INSECURE",
@@ -490,6 +494,10 @@ for (const gk of gatekeepers) {
     // needs the token even when the binding is present.
     "CF_AI_GATEWAY", "CF_AI_GATEWAY_PROVIDERS", "CF_AI_GATEWAY_ACCOUNT_ID",
     "CF_AI_GATEWAY_API_TOKEN", "CF_AI_GATEWAY_USE_BINDING",
+    // Xcity model plane - lets Xcity sign-in users receive a per-user TokenHub key from wallet and
+    // list TokenHub models automatically, matching the production config path.
+    "XCITY_TOKENHUB_URL", "XCITY_WALLET_URL", "XCITY_HOME_URL",
+    "WALLET_SERVICE_TOKEN", "XCITY_QUICK_MODEL",
   ];
   // OAuth app credentials (GOOGLE_/GITHUB_/CLOUDFLARE_OAUTH_*) are NOT passed to the backend anymore;
   // they are injected into the gatekeeper Workers (see SHARED_GATEKEEPER_CREDS below).

@@ -1,4 +1,8 @@
-import type { AiChatAuthorInfo, AiModelConfig } from "@gadgets/workshop-shared/api";
+import type {
+  AiChatAuthorInfo,
+  AiModelConfig,
+  XcityProviderDiagnostics,
+} from "@gadgets/workshop-shared/api";
 import type { Singleton } from "@gadgets/typed-storage";
 import type { Model, Api } from "@earendil-works/pi-ai";
 import { createWorkshopLogger } from "../observability.js";
@@ -99,8 +103,26 @@ type CatalogFetchResult =
   | { status: "unauthorized" }
   | { status: "failed" };
 
+/**
+ * A blank diagnostics record for one model-plane call. `identity` starts true because reaching
+ * the plane at all means an Xcity identity was resolved; callers with no identity build their
+ * own record with `identity: false`.
+ */
+export function newXcityProviderDiagnostics(): XcityProviderDiagnostics {
+  return { identity: true, keyPresent: false };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Classify a thrown fetch into a short, user-safe string. Raw errors (and any upstream detail
+ * they carry) never leave the worker.
+ */
+function classifyFetchError(error: unknown): string {
+  let name = isRecord(error) && typeof error.name === "string" ? error.name : "";
+  return name === "TimeoutError" || name === "AbortError" ? "timeout" : "network-error";
 }
 
 function isJsonValue(value: unknown): value is JsonValue {
@@ -310,6 +332,9 @@ export class XcityModelPlane {
   #xcityUserId: string;
   #email?: string;
   #models: XcityModelCatalogRecord["models"];
+  // Outcome of the load that built THIS instance. Background refreshes get their own record, so
+  // nothing here is overwritten after forUser() resolves.
+  #diagnostics: XcityProviderDiagnostics = newXcityProviderDiagnostics();
 
   private constructor(
       _env: Cloudflare.Env,
@@ -357,7 +382,7 @@ export class XcityModelPlane {
     }
 
     let plane = new XcityModelPlane(env, config, storage, xcityUserId, email, []);
-    plane.#models = await plane.#loadModels();
+    plane.#models = await plane.#loadModels(plane.#diagnostics);
     return plane;
   }
 
@@ -370,11 +395,25 @@ export class XcityModelPlane {
       forceMint = false,
   ): Promise<XcityVirtualKeyRecord | undefined> {
     let plane = new XcityModelPlane(env, config, storage, xcityUserId, email, []);
-    return plane.#ensureKey(forceMint);
+    return plane.#ensureKey(forceMint, plane.#diagnostics);
   }
 
   getModelList(): AiChatAuthorInfo[] {
     return this.#models.map(record => record.profile);
+  }
+
+  /**
+   * Per-hop outcome of the load that produced this instance's model list: identity, wallet key
+   * mint, tokenhub catalog. Returned as a copy, so later background refreshes can't mutate it.
+   */
+  getDiagnostics(): XcityProviderDiagnostics {
+    let diagnostics = this.#diagnostics;
+    return {
+      identity: diagnostics.identity,
+      keyPresent: diagnostics.keyPresent,
+      ...(diagnostics.keyMint ? { keyMint: { ...diagnostics.keyMint } } : {}),
+      ...(diagnostics.catalog ? { catalog: { ...diagnostics.catalog } } : {}),
+    };
   }
 
   resolveModel(modelId: string): UserAiModelRecord | undefined {
@@ -385,7 +424,8 @@ export class XcityModelPlane {
     return pickQuickXcityModelConfig(this.#models, this.#config.quickModel);
   }
 
-  async #loadModels(): Promise<XcityModelCatalogRecord["models"]> {
+  async #loadModels(diagnostics: XcityProviderDiagnostics):
+      Promise<XcityModelCatalogRecord["models"]> {
     let cache = this.#storage.get();
     // A cached catalog is usable only if it was fetched from the current tokenhub with the
     // currently-cached key (the model configs embed that key as their apiToken).
@@ -395,7 +435,13 @@ export class XcityModelPlane {
         ? cache.catalog : undefined;
     let age = cached ? Date.now() - cached.fetchedAt : Number.POSITIVE_INFINITY;
 
+    // A cached key for this user and wallet counts as present even when no mint runs below.
+    diagnostics.keyPresent = !!(cache.key &&
+        cache.key.walletUrl === this.#config.walletUrl &&
+        cache.key.userId === this.#xcityUserId);
+
     if (cached && age < CATALOG_CACHE_MS) {
+      diagnostics.catalog = { modelCount: cached.models.length };
       return cached.models;
     }
 
@@ -405,17 +451,24 @@ export class XcityModelPlane {
         event: "xcity.tokenhub.models.stale-served", durationMs: age,
       });
       this.#refreshInBackground();
+      diagnostics.catalog = { modelCount: cached.models.length, servedStale: true };
       return cached.models;
     }
 
     // No usable cache (or one past the stale ceiling): refresh inline, but on failure still
     // prefer whatever we had over an empty model list.
-    let models = await this.#refreshModels();
+    let models = await this.#refreshModels(diagnostics);
     if (models) return models;
     if (cached) {
       logger.warn("serving stale tokenhub model catalog after refresh failure", {
         event: "xcity.tokenhub.models.stale-served", durationMs: age,
       });
+      // Keep the inline refresh's failure detail alongside what we ended up serving.
+      diagnostics.catalog = {
+        ...diagnostics.catalog,
+        modelCount: cached.models.length,
+        servedStale: true,
+      };
       return cached.models;
     }
     return [];
@@ -425,16 +478,20 @@ export class XcityModelPlane {
    * Refreshes the catalog from tokenhub (minting/re-minting the per-user key as needed) and
    * persists it on success. Returns undefined on failure without touching the cached catalog,
    * except that a key re-mint on 401 invalidates the catalog tied to the old key.
+   *
+   * `diagnostics` collects this refresh's per-hop outcome; background refreshes pass their own
+   * record so they never overwrite what a completed forUser() call reported.
    */
-  async #refreshModels(): Promise<XcityModelCatalogRecord["models"] | undefined> {
-    let key = await this.#ensureKey(false);
+  async #refreshModels(diagnostics: XcityProviderDiagnostics):
+      Promise<XcityModelCatalogRecord["models"] | undefined> {
+    let key = await this.#ensureKey(false, diagnostics);
     if (!key) return undefined;
 
-    let fetched = await this.#fetchCatalog(key.key);
+    let fetched = await this.#fetchCatalog(key.key, diagnostics);
     if (fetched.status === "unauthorized") {
-      key = await this.#ensureKey(true);
+      key = await this.#ensureKey(true, diagnostics);
       if (!key) return undefined;
-      fetched = await this.#fetchCatalog(key.key);
+      fetched = await this.#fetchCatalog(key.key, diagnostics);
     }
     if (fetched.status !== "ok") return undefined;
 
@@ -447,8 +504,10 @@ export class XcityModelPlane {
       logger.warn("tokenhub model catalog response was malformed", {
         event: "xcity.tokenhub.models.malformed",
       });
+      diagnostics.catalog = { ...diagnostics.catalog, error: "malformed-response" };
       return undefined;
     }
+    diagnostics.catalog = { ...diagnostics.catalog, modelCount: models.length };
 
     let cache = this.#storage.get();
     cache.catalog = {
@@ -467,7 +526,7 @@ export class XcityModelPlane {
   #refreshInBackground(): void {
     let refreshKey = `${this.#config.tokenhubUrl}\n${this.#xcityUserId}`;
     if (inflightCatalogRefreshes.has(refreshKey)) return;
-    let refresh = this.#refreshModels()
+    let refresh = this.#refreshModels(newXcityProviderDiagnostics())
         .then(models => {
           if (models) this.#models = models;
         })
@@ -482,16 +541,22 @@ export class XcityModelPlane {
     inflightCatalogRefreshes.set(refreshKey, refresh);
   }
 
-  async #ensureKey(forceMint: boolean): Promise<XcityVirtualKeyRecord | undefined> {
+  async #ensureKey(forceMint: boolean, diagnostics: XcityProviderDiagnostics):
+      Promise<XcityVirtualKeyRecord | undefined> {
     let cache = this.#storage.get();
     if (!forceMint && cache.key &&
         cache.key.walletUrl === this.#config.walletUrl &&
         cache.key.userId === this.#xcityUserId) {
+      diagnostics.keyPresent = true;
       return cache.key;
     }
 
-    let minted = await this.#mintKey();
-    if (!minted) return undefined;
+    let minted = await this.#mintKey(diagnostics);
+    if (!minted) {
+      diagnostics.keyPresent = false;
+      return undefined;
+    }
+    diagnostics.keyPresent = true;
 
     cache = this.#storage.get();
     cache.key = minted;
@@ -500,7 +565,8 @@ export class XcityModelPlane {
     return minted;
   }
 
-  async #mintKey(): Promise<XcityVirtualKeyRecord | undefined> {
+  async #mintKey(diagnostics: XcityProviderDiagnostics):
+      Promise<XcityVirtualKeyRecord | undefined> {
     let response: Response;
     try {
       response = await fetchWithOneRetry(`${this.#config.walletUrl}/v1/keys/for-user`, () => ({
@@ -520,6 +586,7 @@ export class XcityModelPlane {
       logger.warn("xcity wallet key mint request failed", {
         event: "xcity.wallet.key.mint.failed", error,
       });
+      diagnostics.keyMint = { attempted: true, error: classifyFetchError(error) };
       return undefined;
     }
 
@@ -529,9 +596,11 @@ export class XcityModelPlane {
         status: response.status,
         statusText: response.statusText,
       });
+      diagnostics.keyMint = { attempted: true, status: response.status };
       response.body?.cancel();
       return undefined;
     }
+    diagnostics.keyMint = { attempted: true, status: response.status };
 
     let body: unknown;
     try {
@@ -540,6 +609,9 @@ export class XcityModelPlane {
       logger.warn("xcity wallet key mint response could not be read", {
         event: "xcity.wallet.key.mint.malformed", error,
       });
+      diagnostics.keyMint = {
+        attempted: true, status: response.status, error: "malformed-response",
+      };
       return undefined;
     }
 
@@ -548,6 +620,9 @@ export class XcityModelPlane {
       logger.warn("xcity wallet key mint response was malformed", {
         event: "xcity.wallet.key.mint.malformed",
       });
+      diagnostics.keyMint = {
+        attempted: true, status: response.status, error: "malformed-response",
+      };
       return undefined;
     }
 
@@ -564,7 +639,8 @@ export class XcityModelPlane {
     };
   }
 
-  async #fetchCatalog(apiKey: string): Promise<CatalogFetchResult> {
+  async #fetchCatalog(apiKey: string, diagnostics: XcityProviderDiagnostics):
+      Promise<CatalogFetchResult> {
     let response: Response;
     try {
       response = await fetchWithOneRetry(`${this.#config.tokenhubUrl}/v1/models`, () => ({
@@ -578,10 +654,13 @@ export class XcityModelPlane {
       logger.warn("tokenhub model catalog request failed", {
         event: "xcity.tokenhub.models.failed", error,
       });
+      diagnostics.catalog = { error: classifyFetchError(error) };
       return { status: "failed" };
     }
 
     if (response.status === 401) {
+      // Reported as-is; a successful re-mint retry overwrites this with its own outcome.
+      diagnostics.catalog = { status: response.status };
       response.body?.cancel();
       return { status: "unauthorized" };
     }
@@ -591,16 +670,20 @@ export class XcityModelPlane {
         status: response.status,
         statusText: response.statusText,
       });
+      diagnostics.catalog = { status: response.status };
       response.body?.cancel();
       return { status: "failed" };
     }
 
     try {
-      return { status: "ok", body: await response.json() };
+      let body = await response.json();
+      diagnostics.catalog = { status: response.status };
+      return { status: "ok", body };
     } catch (error) {
       logger.warn("tokenhub model catalog response could not be read", {
         event: "xcity.tokenhub.models.malformed", error,
       });
+      diagnostics.catalog = { status: response.status, error: "malformed-response" };
       return { status: "failed" };
     }
   }

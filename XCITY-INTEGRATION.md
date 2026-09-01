@@ -27,7 +27,7 @@ xct-studio）。部署在 https://os.xcity.ai。
 |---|---|---|---|
 | 1 | 认证 | `packages/workshop-backend/src/auth/` + 部署配置 | 不改代码。通过 `AUTH_GATEKEEPERS=xcity` 白名单启用 `gatekeeper-xcity`（上游既有机制，见 `docs/oauth-signin.md`） |
 | 2 | 模型面 | `packages/workshop-backend/src/ai-models.ts` — `getModel()` | 在 `options.userGateway` 分支**之前**插入一个 `XCITY_TOKENHUB_URL` 门控分支，复用 `getModelDirect()` 的构造方式携带 per-user key。不碰 Cloudflare AI Gateway 的任何代码路径 |
-| 2b | quick model | `packages/workshop-backend/src/ai-gateway.ts` — `getQuickModelConfig()` | 门控下改用 tokenhub 的便宜模型替代硬编码的 Workers AI |
+| 2b | quick model | `packages/workshop-backend/src/ai-gateway.ts` — `getQuickModelConfig()` | 门控下改用 tokenhub 模型替代硬编码的 Workers AI。选取顺序见 `xcity/model-plane.ts` 的 `pickQuickXcityModelConfig`：`XCITY_QUICK_MODEL` → 硬编码默认模型 `XCITY_DEFAULT_MODEL_ID`（产品要求，逐字拼写）→ 成本最低启发式 |
 | 3 | 额度门禁 | overseer 中 `checkUsageAndBalance` 的调用点 + billing UI | 按 `XCITY_WALLET_URL` 门控，二选一地调用 `packages/workshop-backend/src/xcity/usage-checker.ts`；该 checker 从持久化的 Xcity gatekeeper 连接取 GoTrue user token，查 `GET $XCITY_WALLET_URL/v1/wallet/balance`，在 `UserDurableObject` 缓存余额 5 分钟。`balance > 0` 放行且不扣费，`balance <= 0` 拦截并引导去 `XCITY_HOME_URL` 充值；拿不到 token、wallet 失败或响应异常时 fail-open（真正扣费/预算边界在 tokenhub/litellm）。例外：按次计费的 marketplace skill（tokenhub persona 响应里的可选 `pricing.kwh_per_use`）在每个用户发起、persona 生效的 turn 开始时经 `xcity/skill-billing.ts` 调 `POST $XCITY_WALLET_URL/v1/wallet/debit`（`WALLET_SERVICE_TOKEN` 鉴权，request_id 按 prompt 序号幂等）扣一次费；该扣费同样 fail-open——200 与 402 都视为终态，网络/5xx 只记日志，拦截聊天的始终是本余额门禁而非扣费本身。前端沿用 `CloudflareUsageInfo` 通道的可选 `billingMode: "xcity"` 字段显示 KWH（credits / 100）并隐藏 Cloudflare 文案 |
 | 4 | Gadget 能力 | `packages/gatekeeper-mcp-portal/` | 转发用户的 tokenhub bearer；其余能力走新增的 `gatekeeper-xcity` |
 | 5 | 本地开发 | `scripts/run-dev-server.ts` — `SHARED_GATEKEEPER_CREDS`（2026-08 同步前在 `run-dev-server.js`） | 加一行 `"gatekeeper-xcity": { id: "XCITY_CLIENT_ID", secret: "XCITY_CLIENT_SECRET" }`。仅影响本地 dev，不影响生产 |
@@ -35,7 +35,18 @@ xct-studio）。部署在 https://os.xcity.ai。
 | 7 | 附件能力 | `chat-attachment-validation.ts` / `chat-attachment-pdf.ts` / `overseer.ts` 的调用点 | 把完整 `AiModelConfig` 而非仅 `provider` 传下去，让 tokenhub 的 per-model `vision` / `pdf_input` 能力生效。无 Xcity 元数据时逐字回落原有的 `ATTACHMENT_SUPPORT_BY_PROVIDER` 表 |
 | 8 | Agent Marketplace Persona | `packages/workshop-shared/src/api.ts` / `workshop-backend/src/{deployment-config.ts,server.ts,user.ts,overseer.ts,agent.ts}` / `workshop-frontend/src/{ChatInterface.tsx,routes/index.tsx,components/chat/XcityAgentPicker.tsx}` | 按 `XCITY_HOME_URL` + model-plane 配置门控，新增 authenticated catalog/persona-status RPC 与 `ServerConfig.xcityAgentMarketplaceEnabled`；catalog/persona 获取实现只放在 `workshop-backend/src/xcity/`。用户当前选择存在 User DO，chat 创建时把已校验 slug 的 persona snapshot 写入 `chatContext.xcityAgent` 和 metadata，普通 coding agent 在 system prompt slot 0 注入 persona；spawned agent 不继承。前端入口贴近 composer model picker，支持搜索/category 过滤和 `/?agent=<slug>` 深链校验 |
 
-**已知的结构性取舍**：Xcity 的模型元数据以 `XcityAiModelConfig = AiModelConfig & { xcity?: … }`
+**已知的结构性取舍**：目录为空或不可用时，模型面会就地合成一条 `XCITY_DEFAULT_MODEL_ID` 记录
+（`synthesizeXcityDefaultModelRecord`，标记 `xcity.synthesizedFallback`），让用户至少有一个可聊的模型。
+它只在**下发**时补上、从不写进缓存目录，真实目录条目一旦出现即取代它；代价是若用户的 key 实际没有这个
+模型的授权，聊天会在网关侧 400 —— 这是产品明确接受的取舍。诊断口径不受影响：
+`diagnostics.catalog.modelCount` / `grantNotExpanded` 始终描述网关真正返回了什么。
+
+同一处还有一条自愈链路：目录只回来 LiteLLM grant sentinel（`grantNotExpanded`）时，模型面会像
+401 一样强制经 wallet `POST /v1/keys/for-user` 重铸 key（这是唯一会触发 wallet 侧 reconciler 的
+调用），并重取一次目录 —— 每次 load 至多重试一次，仍是 sentinel 就落回 `grantNotExpanded` 状态。
+代价是 key 一直坏着时，每次目录 load 都会多一次 wallet 调用和一次目录请求。
+
+Xcity 的模型元数据以 `XcityAiModelConfig = AiModelConfig & { xcity?: … }`
 的形式挂在共享类型上（`xcity/model-plane.ts`）。好处是元数据随配置天然流到每个消费点，
 无需到处传第二个参数；代价是给一个跨 RPC 边界的共享类型做了结构化扩展。
 上游若给 `AiModelConfig` 加了运行时校验，这里会最先出问题。
@@ -55,7 +66,7 @@ Gatekeeper 本身按目录名 `gatekeeper-*` 自动发现并绑定为 `GATEKEEPE
 | `XCITY_AUTH_URL` | GoTrue 基址，如 `https://auth.xcity.ai` | gatekeeper-xcity 不可用 |
 | `XCITY_HOME_URL` | xct-home 基址，如 `https://xcity.ai`（agent 目录、充值跳转；通过 `ServerConfig` 下发给前端） | agent 目录与充值跳转不可用 |
 | `WALLET_SERVICE_TOKEN` | 铸 per-user litellm key 用（**secret**）；模型面和 `gatekeeper-xcity` 媒体生成复用同一个 wallet key mint 接口 | 无法自动发 key；`gatekeeper-xcity` 不暴露媒体生成资源 |
-| `XCITY_QUICK_MODEL` | quick model 指定的 tokenhub model id（可选） | 从 tokenhub 目录里挑成本最低的模型 |
+| `XCITY_QUICK_MODEL` | quick model / 默认模型指定的 tokenhub model id（可选，优先级最高） | 回落到硬编码的默认模型 `XCITY_DEFAULT_MODEL_ID`（目录里没有它时再挑成本最低的模型） |
 | `MCP_PORTAL_URL` | tokenhub MCP endpoint：`https://tokenhub.xcity.ai/mcp/` | Xcity MCP portal 不启用 |
 | `MCP_PORTAL_AUTH` | tokenhub MCP portal 鉴权模式：`oauth` | Xcity MCP portal 不启用 |
 | `MCP_PORTAL_NAME` | Connectors UI 显示名：`Xcity Tools` | Xcity MCP portal 使用默认名或不启用 |

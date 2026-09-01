@@ -4,6 +4,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getXcityProviderInfoForUser } from "../src/xcity/provider-info.js";
 import {
+  XCITY_DEFAULT_MODEL_ID,
   flushXcityCatalogRefreshesForTests,
   type XcityModelPlaneCache,
   type XcityModelPlaneStorage,
@@ -129,7 +130,7 @@ describe("getXcityProviderInfoForUser", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("still returns the minted key with an empty model list when the catalog fails", async () => {
+  it("still returns the minted key, with the default model, when the catalog fails", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url === "https://wallet.xcity.ai/v1/keys/for-user") {
@@ -147,8 +148,10 @@ describe("getXcityProviderInfoForUser", () => {
       tokenhubUrl: "https://tokenhub.xcity.ai",
       email: "user@example.com",
       apiKey: "sk-tokenhub-user",
-      modelIds: [],
-      catalog: [],
+      // The hard-coded default is synthesized so the user is not left with nothing to chat
+      // with; the diagnostics below still report the catalog hop as it actually went.
+      modelIds: [XCITY_DEFAULT_MODEL_ID],
+      catalog: [{ id: XCITY_DEFAULT_MODEL_ID, name: XCITY_DEFAULT_MODEL_ID, hidden: false }],
       diagnostics: {
         identity: true,
         keyPresent: true,
@@ -279,7 +282,8 @@ describe("getXcityProviderInfoForUser diagnostics", () => {
       keyMint: { attempted: true, status: 200 },
       catalog: { status: 200, modelCount: 0 },
     });
-    expect(info?.modelIds).toEqual([]);
+    // modelCount stays 0 — it describes the gateway — while the synthesized default is served.
+    expect(info?.modelIds).toEqual([XCITY_DEFAULT_MODEL_ID]);
   });
 
   it("distinguishes a wildcard-only catalog (the key's grant was never expanded)", async () => {
@@ -303,9 +307,9 @@ describe("getXcityProviderInfoForUser diagnostics", () => {
       keyMint: { attempted: true, status: 200 },
       catalog: { status: 200, modelCount: 0, grantNotExpanded: true },
     });
-    // The sentinel is never offered as a selectable model.
-    expect(info?.modelIds).toEqual([]);
-    expect(info?.catalog).toEqual([]);
+    // The sentinel is never offered as a selectable model; the hard-coded default is.
+    expect(info?.modelIds).toEqual([XCITY_DEFAULT_MODEL_ID]);
+    expect(info?.catalog.map(model => model.id)).toEqual([XCITY_DEFAULT_MODEL_ID]);
   });
 
   it("does not flag grantNotExpanded when a real model came back alongside a sentinel", async () => {
@@ -398,7 +402,7 @@ describe("getXcityProviderInfoForUser diagnostics", () => {
       keyPresent: true,
       catalog: { status: 503, modelCount: 0, grantNotExpanded: true },
     });
-    expect(info?.modelIds).toEqual([]);
+    expect(info?.modelIds).toEqual([XCITY_DEFAULT_MODEL_ID]);
   });
 
   it("flags a malformed catalog body", async () => {

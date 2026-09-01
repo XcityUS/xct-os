@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   getXcityModelMetadata,
+  isLiteLlmGrantSentinelModelId,
+  LITELLM_GRANT_SENTINEL_MODEL_IDS,
   parseTokenhubModelCatalog,
+  parseTokenhubModelCatalogEntries,
   pickQuickXcityModelConfig,
 } from "../src/xcity/model-plane.js";
 
@@ -99,6 +102,49 @@ describe("parseTokenhubModelCatalog", () => {
     }, CONTEXT);
 
     expect(records?.map(record => record.profile.id)).toEqual(["usable-model"]);
+  });
+
+  // LiteLLM answers /v1/models with the key's grant markers verbatim — notably it does NOT
+  // expand a literal "*" — so a key minted with models:["*"] yields a catalog of one fake model
+  // that is always "already added" and fails with 400 Invalid model name when chatted with.
+  it("drops litellm grant sentinels, keeping only callable models", () => {
+    const records = parseTokenhubModelCatalog({
+      data: [
+        { id: "*" },
+        { id: "all-proxy-models" },
+        { id: "all-team-models" },
+        { id: "no-default-models" },
+        { id: "gpt-5.5-xhigh" },
+      ],
+    }, CONTEXT);
+
+    expect(records?.map(record => record.profile.id)).toEqual(["gpt-5.5-xhigh"]);
+  });
+
+  it("reports how many sentinels were dropped, and yields no models for a wildcard-only grant",
+      () => {
+    const wildcardOnly = parseTokenhubModelCatalogEntries({ data: [{ id: "*" }] }, CONTEXT);
+    expect(wildcardOnly).toEqual({ models: [], sentinelCount: 1 });
+
+    const mixed = parseTokenhubModelCatalogEntries({
+      data: [{ id: "*" }, { id: "gpt-5.5-xhigh" }],
+    }, CONTEXT);
+    expect(mixed?.sentinelCount).toBe(1);
+    expect(mixed?.models.map(record => record.profile.id)).toEqual(["gpt-5.5-xhigh"]);
+
+    // A malformed body is still distinguishable from an all-sentinel one.
+    expect(parseTokenhubModelCatalogEntries({}, CONTEXT)).toBeUndefined();
+  });
+
+  it("treats every documented litellm grant marker as a sentinel", () => {
+    expect(LITELLM_GRANT_SENTINEL_MODEL_IDS).toEqual([
+      "*", "all-proxy-models", "all-team-models", "no-default-models",
+    ]);
+    for (const id of LITELLM_GRANT_SENTINEL_MODEL_IDS) {
+      expect(isLiteLlmGrantSentinelModelId(id)).toBe(true);
+    }
+    expect(isLiteLlmGrantSentinelModelId("gpt-5.5-xhigh")).toBe(false);
+    expect(isLiteLlmGrantSentinelModelId("all-proxy-models-2")).toBe(false);
   });
 });
 

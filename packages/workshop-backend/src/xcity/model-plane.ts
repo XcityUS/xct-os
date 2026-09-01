@@ -18,6 +18,25 @@ const CATALOG_CACHE_MS = 10 * 60 * 1000;
 const CATALOG_STALE_MAX_MS = 24 * 60 * 60 * 1000;
 export const XCITY_VENDOR_ID = "xcity";
 
+/**
+ * LiteLLM grant markers that `GET /v1/models` can echo back as if they were model ids. They are
+ * entitlement placeholders on a virtual key, never callable model names: chatting with one gets
+ * `400 Invalid model name passed in model=*` from the proxy. Note that LiteLLM does NOT expand a
+ * literal `*` — a key minted with `models: ["*"]` yields a catalog of exactly this one fake
+ * entry — so they are dropped before anything reaches the user's model list.
+ */
+export const LITELLM_GRANT_SENTINEL_MODEL_IDS: readonly string[] = [
+  "*",
+  "all-proxy-models",
+  "all-team-models",
+  "no-default-models",
+];
+
+/** True when `id` is a LiteLLM grant marker rather than a real, callable model id. */
+export function isLiteLlmGrantSentinelModelId(id: string): boolean {
+  return LITELLM_GRANT_SENTINEL_MODEL_IDS.includes(id);
+}
+
 // Single-flight guard for background catalog refreshes, keyed per tokenhub + user. The User DO is
 // effectively single-threaded, but overlapping requests during the stale window would otherwise
 // each kick their own refresh.
@@ -77,6 +96,12 @@ export type XcityModelCatalogRecord = {
   keyMintedAt: number;
   fetchedAt: number;
   models: Array<Omit<UserAiModelRecord, "config"> & { config: XcityAiModelConfig }>;
+  /**
+   * True when the fetched catalog held only LiteLLM grant sentinels, so `models` is empty for a
+   * reason worth reporting. Persisted so a cache hit reports it too, instead of degrading into
+   * an indistinguishable "no models granted".
+   */
+  grantNotExpanded?: boolean;
 };
 
 export type XcityModelPlaneCache = {
@@ -273,17 +298,52 @@ export function tokenhubModelToRecord(
   return { profile, config };
 }
 
+export type ParsedTokenhubModelCatalog = {
+  /** Real, callable models — LiteLLM grant sentinels are already dropped. */
+  models: Array<Omit<UserAiModelRecord, "config"> & { config: XcityAiModelConfig }>;
+
+  /** How many entries were dropped for being LiteLLM grant sentinels. */
+  sentinelCount: number;
+};
+
+/**
+ * Parses a tokenhub `GET /v1/models` body, dropping LiteLLM grant sentinels
+ * (`LITELLM_GRANT_SENTINEL_MODEL_IDS`) and reporting how many were dropped. Returns undefined
+ * only when the body itself is malformed.
+ *
+ * The counts matter because `sentinelCount > 0` with no models left means the gateway never
+ * expanded the key's grant — a wallet/key provisioning bug that looks identical to "no models
+ * granted" unless it is reported separately.
+ */
+export function parseTokenhubModelCatalogEntries(
+    body: unknown,
+    context: { tokenhubUrl: string; apiKey: string; xcityUserId: string }
+): ParsedTokenhubModelCatalog | undefined {
+  if (!isRecord(body) || !Array.isArray(body.data)) return undefined;
+  let models: ParsedTokenhubModelCatalog["models"] = [];
+  let sentinelCount = 0;
+  for (let rawModel of body.data) {
+    let record = tokenhubModelToRecord(rawModel, context);
+    if (!record) continue;
+    if (isLiteLlmGrantSentinelModelId(record.profile.id)) {
+      sentinelCount++;
+      continue;
+    }
+    models.push(record);
+  }
+  return { models, sentinelCount };
+}
+
+/**
+ * The model list from a tokenhub `GET /v1/models` body, with LiteLLM grant sentinels removed;
+ * undefined when the body is malformed. Use `parseTokenhubModelCatalogEntries` when the count of
+ * dropped sentinels is needed too.
+ */
 export function parseTokenhubModelCatalog(
     body: unknown,
     context: { tokenhubUrl: string; apiKey: string; xcityUserId: string }
 ): Array<Omit<UserAiModelRecord, "config"> & { config: XcityAiModelConfig }> | undefined {
-  if (!isRecord(body) || !Array.isArray(body.data)) return undefined;
-  let result: Array<Omit<UserAiModelRecord, "config"> & { config: XcityAiModelConfig }> = [];
-  for (let rawModel of body.data) {
-    let record = tokenhubModelToRecord(rawModel, context);
-    if (record) result.push(record);
-  }
-  return result;
+  return parseTokenhubModelCatalogEntries(body, context)?.models;
 }
 
 export function pickQuickXcityModelConfig(
@@ -440,6 +500,21 @@ export class XcityModelPlane {
         cache.key.walletUrl === this.#config.walletUrl &&
         cache.key.userId === this.#xcityUserId);
 
+    // A catalog that held only grant sentinels is a known-broken provisioning state, not a
+    // legitimately empty one: the key is repaired on the wallet side without its token changing,
+    // so honouring the cache here would keep serving an empty list for the rest of the TTL after
+    // the fix landed. Always revalidate instead.
+    if (cached && cached.grantNotExpanded) {
+      let models = await this.#refreshModels(diagnostics);
+      if (models) return models;
+      diagnostics.catalog = {
+        ...diagnostics.catalog,
+        modelCount: cached.models.length,
+        grantNotExpanded: true,
+      };
+      return cached.models;
+    }
+
     if (cached && age < CATALOG_CACHE_MS) {
       diagnostics.catalog = { modelCount: cached.models.length };
       return cached.models;
@@ -451,7 +526,10 @@ export class XcityModelPlane {
         event: "xcity.tokenhub.models.stale-served", durationMs: age,
       });
       this.#refreshInBackground();
-      diagnostics.catalog = { modelCount: cached.models.length, servedStale: true };
+      diagnostics.catalog = {
+        modelCount: cached.models.length,
+        servedStale: true,
+      };
       return cached.models;
     }
 
@@ -495,19 +573,32 @@ export class XcityModelPlane {
     }
     if (fetched.status !== "ok") return undefined;
 
-    let models = parseTokenhubModelCatalog(fetched.body, {
+    let parsed = parseTokenhubModelCatalogEntries(fetched.body, {
       tokenhubUrl: this.#config.tokenhubUrl,
       apiKey: key.key,
       xcityUserId: this.#xcityUserId,
     });
-    if (!models) {
+    if (!parsed) {
       logger.warn("tokenhub model catalog response was malformed", {
         event: "xcity.tokenhub.models.malformed",
       });
       diagnostics.catalog = { ...diagnostics.catalog, error: "malformed-response" };
       return undefined;
     }
-    diagnostics.catalog = { ...diagnostics.catalog, modelCount: models.length };
+    let { models, sentinelCount } = parsed;
+    // Nothing but grant sentinels came back: the key's grant was never expanded into real model
+    // names, which is a provisioning failure and not an empty plan.
+    let grantNotExpanded = sentinelCount > 0 && models.length === 0;
+    if (grantNotExpanded) {
+      logger.warn("tokenhub model catalog contained only litellm grant sentinels", {
+        event: "xcity.tokenhub.models.grant-not-expanded",
+      });
+    }
+    diagnostics.catalog = {
+      ...diagnostics.catalog,
+      modelCount: models.length,
+      ...(grantNotExpanded ? { grantNotExpanded: true } : {}),
+    };
 
     let cache = this.#storage.get();
     cache.catalog = {
@@ -515,6 +606,7 @@ export class XcityModelPlane {
       keyMintedAt: key.mintedAt,
       fetchedAt: Date.now(),
       models,
+      ...(grantNotExpanded ? { grantNotExpanded: true } : {}),
     };
     this.#storage.put(cache);
     return models;

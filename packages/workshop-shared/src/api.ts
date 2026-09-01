@@ -1214,6 +1214,14 @@ export type XcityProviderDiagnostics = {
     /** Number of models the served catalog contains (0 means the key grants none). */
     modelCount?: number;
 
+    /**
+     * True when the catalog came back holding nothing but LiteLLM grant sentinels (`*`,
+     * `all-proxy-models`, …), which are dropped as unusable — the gateway never expanded the
+     * key's model grant into real model names. Distinct from a plain `modelCount: 0`, which
+     * means the key legitimately grants no models.
+     */
+    grantNotExpanded?: boolean;
+
     /** True when a cached catalog was served because a refresh was skipped or failed. */
     servedStale?: boolean;
   };

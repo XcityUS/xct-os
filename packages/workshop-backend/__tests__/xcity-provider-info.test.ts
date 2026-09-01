@@ -282,6 +282,125 @@ describe("getXcityProviderInfoForUser diagnostics", () => {
     expect(info?.modelIds).toEqual([]);
   });
 
+  it("distinguishes a wildcard-only catalog (the key's grant was never expanded)", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://wallet.xcity.ai/v1/keys/for-user") {
+        return jsonResponse({ key: "sk-tokenhub-user" });
+      }
+      if (url === "https://tokenhub.xcity.ai/v1/models") {
+        // What litellm returns for a key minted with models: ["*"] — the sentinel verbatim.
+        return jsonResponse({ data: [{ id: "*" }] });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const info = await getXcityProviderInfoForUser(ENV, makeStorage(), IDENTITY);
+    expect(info?.diagnostics).toEqual({
+      identity: true,
+      keyPresent: true,
+      keyMint: { attempted: true, status: 200 },
+      catalog: { status: 200, modelCount: 0, grantNotExpanded: true },
+    });
+    // The sentinel is never offered as a selectable model.
+    expect(info?.modelIds).toEqual([]);
+    expect(info?.catalog).toEqual([]);
+  });
+
+  it("does not flag grantNotExpanded when a real model came back alongside a sentinel", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://wallet.xcity.ai/v1/keys/for-user") {
+        return jsonResponse({ key: "sk-tokenhub-user" });
+      }
+      if (url === "https://tokenhub.xcity.ai/v1/models") {
+        return jsonResponse({ data: [{ id: "all-proxy-models" }, { id: "gpt-5.5-xhigh" }] });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const info = await getXcityProviderInfoForUser(ENV, makeStorage(), IDENTITY);
+    expect(info?.diagnostics).toEqual({
+      identity: true,
+      keyPresent: true,
+      keyMint: { attempted: true, status: 200 },
+      catalog: { status: 200, modelCount: 1 },
+    });
+    expect(info?.modelIds).toEqual(["gpt-5.5-xhigh"]);
+  });
+
+  it("revalidates a cached wildcard-only catalog instead of honouring its TTL", async () => {
+    // The wallet repairs the key's grant in place — the key token never changes — so a cached
+    // sentinel-only catalog must not be served for the rest of its TTL after the fix landed.
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://tokenhub.xcity.ai/v1/models") {
+        return jsonResponse({ data: [{ id: "deepseek-v3.2" }] });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const storage = makeStorage({
+      key: {
+        userId: IDENTITY.userId,
+        walletUrl: "https://wallet.xcity.ai",
+        key: "sk-cached",
+        mintedAt: 111,
+      },
+      catalog: {
+        tokenhubUrl: "https://tokenhub.xcity.ai",
+        keyMintedAt: 111,
+        fetchedAt: Date.now(),
+        models: [],
+        grantNotExpanded: true,
+      },
+    });
+    const info = await getXcityProviderInfoForUser(ENV, storage, IDENTITY);
+    expect(info?.diagnostics).toEqual({
+      identity: true,
+      keyPresent: true,
+      catalog: { status: 200, modelCount: 1 },
+    });
+    expect(info?.modelIds).toEqual(["deepseek-v3.2"]);
+  });
+
+  it("keeps reporting grantNotExpanded when revalidating the cached empty catalog fails", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://tokenhub.xcity.ai/v1/models") {
+        return new Response("nope", { status: 503 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const storage = makeStorage({
+      key: {
+        userId: IDENTITY.userId,
+        walletUrl: "https://wallet.xcity.ai",
+        key: "sk-cached",
+        mintedAt: 111,
+      },
+      catalog: {
+        tokenhubUrl: "https://tokenhub.xcity.ai",
+        keyMintedAt: 111,
+        fetchedAt: Date.now(),
+        models: [],
+        grantNotExpanded: true,
+      },
+    });
+    const info = await getXcityProviderInfoForUser(ENV, storage, IDENTITY);
+    expect(info?.diagnostics).toEqual({
+      identity: true,
+      keyPresent: true,
+      catalog: { status: 503, modelCount: 0, grantNotExpanded: true },
+    });
+    expect(info?.modelIds).toEqual([]);
+  });
+
   it("flags a malformed catalog body", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);

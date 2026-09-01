@@ -224,6 +224,17 @@ function catalogHop(diag: XcityDiagnostics, allHidden: boolean): HopStatus {
           : `catalog failed: HTTP ${catalog.status}`,
     }
   }
+  // A catalog of nothing but LiteLLM grant markers (`*`, `all-proxy-models`, …) is a key
+  // provisioning failure, not an empty plan — call it out separately so an operator fixes the
+  // wallet's key mint instead of hunting through plan-params.
+  if (catalog.grantNotExpanded) {
+    return {
+      ok: false,
+      detail:
+        "the gateway returned only a wildcard placeholder — the key's model grant was not " +
+        "expanded (the wallet must grant 'all-proxy-models')",
+    }
+  }
   if (!catalog.modelCount) {
     return {
       ok: false,

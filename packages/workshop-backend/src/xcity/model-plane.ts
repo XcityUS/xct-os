@@ -37,6 +37,18 @@ export function isLiteLlmGrantSentinelModelId(id: string): boolean {
   return LITELLM_GRANT_SENTINEL_MODEL_IDS.includes(id);
 }
 
+/**
+ * The TokenHub model id Xcity deployments default to, hard-coded at the product owner's request.
+ * Spelled exactly as TokenHub spells it — the gateway matches model names verbatim.
+ *
+ * It is a preference, not a guarantee: `XCITY_QUICK_MODEL` still overrides it, and when the
+ * catalog does not contain it the cost heuristic in `pickQuickXcityModelConfig` still applies.
+ * The one place it is asserted rather than preferred is
+ * `synthesizeXcityDefaultModelRecord`, which fabricates it so a user with an empty or
+ * unreachable catalog still has something to chat with; see that function for the trade-off.
+ */
+export const XCITY_DEFAULT_MODEL_ID = "Deepseek-V4-Pro-GA";
+
 // Single-flight guard for background catalog refreshes, keyed per tokenhub + user. The User DO is
 // effectively single-threaded, but overlapping requests during the stale window would otherwise
 // each kick their own refresh.
@@ -73,6 +85,13 @@ export type XcityModelMetadata = {
   inputCostPerToken?: number;
   outputCostPerToken?: number;
   capabilities?: XcityModelCapabilities;
+
+  /**
+   * True only on a locally synthesized fallback record (see
+   * `synthesizeXcityDefaultModelRecord`): no TokenHub catalog entry backed this model. Never set
+   * on a record parsed from a catalog response, and never persisted in the cached catalog.
+   */
+  synthesizedFallback?: boolean;
 };
 
 export type XcityAiModelConfig = AiModelConfig & {
@@ -298,6 +317,28 @@ export function tokenhubModelToRecord(
   return { profile, config };
 }
 
+/**
+ * Fabricates the record for `XCITY_DEFAULT_MODEL_ID` for a user whose catalog does not list it,
+ * so an empty or unreachable TokenHub catalog still leaves something to chat with. Built by
+ * feeding a minimal catalog entry through `tokenhubModelToRecord`, so the result is shaped
+ * exactly like a catalog-derived record — same provider/apiUrl, the same minted `apiToken`, the
+ * same `xcity` metadata — and is then flagged `synthesizedFallback` so it stays distinguishable.
+ *
+ * Trade-off, accepted deliberately: nothing here checks that the user's key actually grants this
+ * model. If it does not, chatting with it fails at the gateway with a 400. The fallback is a last
+ * resort only — it is added at serve time, never written to the cached catalog, and a real
+ * catalog entry for the same id always wins (see `XcityModelPlane.#withDefaultModelFallback`).
+ * It also carries no cost or capability metadata, since none is known.
+ */
+export function synthesizeXcityDefaultModelRecord(
+    context: { tokenhubUrl: string; apiKey: string; xcityUserId: string },
+): Omit<UserAiModelRecord, "config"> & { config: XcityAiModelConfig } {
+  // Non-null: tokenhubModelToRecord only rejects non-objects and blank ids.
+  let record = tokenhubModelToRecord({ id: XCITY_DEFAULT_MODEL_ID }, context)!;
+  if (record.config.xcity) record.config.xcity.synthesizedFallback = true;
+  return record;
+}
+
 export type ParsedTokenhubModelCatalog = {
   /** Real, callable models — LiteLLM grant sentinels are already dropped. */
   models: Array<Omit<UserAiModelRecord, "config"> & { config: XcityAiModelConfig }>;
@@ -346,6 +387,16 @@ export function parseTokenhubModelCatalog(
   return parseTokenhubModelCatalogEntries(body, context)?.models;
 }
 
+/**
+ * Picks the default/quick model for an Xcity user, in preference order:
+ *
+ * 1. `quickModel` (the `XCITY_QUICK_MODEL` env override), so a deployment can retarget the
+ *    default without a code change. Deliberately absolute: a configured id that is not in the
+ *    catalog yields undefined rather than silently falling through to another model.
+ * 2. `XCITY_DEFAULT_MODEL_ID`, when the catalog contains it.
+ * 3. The cheapest model by summed input+output cost per token (models with no cost metadata rank
+ *    last, and are only used when nothing priced exists).
+ */
 export function pickQuickXcityModelConfig(
     models: readonly (Omit<UserAiModelRecord, "config"> & { config: XcityAiModelConfig })[],
     quickModel?: string,
@@ -353,6 +404,9 @@ export function pickQuickXcityModelConfig(
   if (quickModel) {
     return models.find(record => record.profile.id === quickModel)?.config;
   }
+
+  let preferred = models.find(record => record.profile.id === XCITY_DEFAULT_MODEL_ID);
+  if (preferred) return preferred.config;
 
   let best: { config: XcityAiModelConfig; score: number } | undefined;
   for (let { config } of models) {
@@ -442,7 +496,8 @@ export class XcityModelPlane {
     }
 
     let plane = new XcityModelPlane(env, config, storage, xcityUserId, email, []);
-    plane.#models = await plane.#loadModels(plane.#diagnostics);
+    plane.#models = plane.#withDefaultModelFallback(
+        await plane.#loadModels(plane.#diagnostics));
     return plane;
   }
 
@@ -482,6 +537,38 @@ export class XcityModelPlane {
 
   getQuickModelConfig(): AiModelConfig | undefined {
     return pickQuickXcityModelConfig(this.#models, this.#config.quickModel);
+  }
+
+  /**
+   * Guarantees the hard-coded default model is chattable even when TokenHub hands back nothing.
+   * Applied to what is *served* (this instance's model list), never to what is *stored*: the
+   * cached catalog keeps holding exactly what the gateway returned, so a synthesized entry can
+   * never shadow the real one once the catalog works again, and the catalog diagnostics
+   * (`modelCount`, `grantNotExpanded`) keep describing the gateway rather than this fallback.
+   *
+   * Only fires when there is nothing real to serve. A catalog that came back with models — even
+   * without the default among them — is left exactly as TokenHub reported it; in that case the
+   * quick-model heuristic picks from the real models instead.
+   */
+  #withDefaultModelFallback(models: XcityModelCatalogRecord["models"]):
+      XcityModelCatalogRecord["models"] {
+    if (models.length > 0) return models;
+
+    // The synthesized record embeds the user's minted key as its apiToken, exactly as a
+    // catalog-derived one does, so without a usable key there is nothing to synthesize.
+    let key = this.#storage.get().key;
+    if (!key || key.walletUrl !== this.#config.walletUrl || key.userId !== this.#xcityUserId) {
+      return models;
+    }
+
+    logger.info("serving the hard-coded xcity default model for an empty tokenhub catalog", {
+      event: "xcity.tokenhub.models.default-fallback", modelId: XCITY_DEFAULT_MODEL_ID,
+    });
+    return [synthesizeXcityDefaultModelRecord({
+      tokenhubUrl: this.#config.tokenhubUrl,
+      apiKey: key.key,
+      xcityUserId: this.#xcityUserId,
+    })];
   }
 
   async #loadModels(diagnostics: XcityProviderDiagnostics):
@@ -555,7 +642,11 @@ export class XcityModelPlane {
   /**
    * Refreshes the catalog from tokenhub (minting/re-minting the per-user key as needed) and
    * persists it on success. Returns undefined on failure without touching the cached catalog,
-   * except that a key re-mint on 401 invalidates the catalog tied to the old key.
+   * except that a key re-mint invalidates the catalog tied to the old key.
+   *
+   * Two conditions trigger a re-mint-and-retry, each at most once per refresh: a 401, and a
+   * catalog holding nothing but LiteLLM grant sentinels. In both cases the retry's outcome is
+   * the one reported and persisted.
    *
    * `diagnostics` collects this refresh's per-hop outcome; background refreshes pass their own
    * record so they never overwrite what a completed forUser() call reported.
@@ -573,9 +664,54 @@ export class XcityModelPlane {
     }
     if (fetched.status !== "ok") return undefined;
 
-    let parsed = parseTokenhubModelCatalogEntries(fetched.body, {
+    let parsed = this.#parseCatalog(fetched.body, key.key, diagnostics);
+    if (!parsed) return undefined;
+
+    // A sentinel-only catalog means the wallet minted this key with an unexpandable grant (e.g.
+    // `models: ["*"]`). The wallet repairs such a key inside POST /v1/keys/for-user, and
+    // #ensureKey(true) is the only path that calls it — a cached key never asks again — so
+    // without this the key stays broken forever. Treated exactly like the 401 path above:
+    // re-mint through the wallet, re-read the catalog once, and let that attempt stand.
+    if (parsed.grantNotExpanded) {
+      let reminted = await this.#ensureKey(true, diagnostics);
+      // A failed re-mint means no second catalog attempt happened at all, so the sentinel
+      // outcome already in `diagnostics` remains this refresh's final word (the wallet failure
+      // is reported separately, under `keyMint`).
+      if (reminted) {
+        let retried = await this.#fetchCatalog(reminted.key, diagnostics);
+        // Both #fetchCatalog and #parseCatalog overwrite diagnostics.catalog, so from here on
+        // the diagnostics describe the retry — including when it fails and sinks the refresh.
+        if (retried.status !== "ok") return undefined;
+        let reparsed = this.#parseCatalog(retried.body, reminted.key, diagnostics);
+        if (!reparsed) return undefined;
+        // Still sentinels after the re-mint: settle into the grantNotExpanded state below
+        // rather than retrying again.
+        key = reminted;
+        parsed = reparsed;
+      }
+    }
+
+    let cache = this.#storage.get();
+    cache.catalog = {
       tokenhubUrl: this.#config.tokenhubUrl,
-      apiKey: key.key,
+      keyMintedAt: key.mintedAt,
+      fetchedAt: Date.now(),
+      models: parsed.models,
+      ...(parsed.grantNotExpanded ? { grantNotExpanded: true } : {}),
+    };
+    this.#storage.put(cache);
+    return parsed.models;
+  }
+
+  /**
+   * Parses one catalog response body and records its outcome in `diagnostics.catalog`, which
+   * therefore always describes the most recent attempt. Returns undefined for a malformed body.
+   */
+  #parseCatalog(body: unknown, apiKey: string, diagnostics: XcityProviderDiagnostics):
+      { models: XcityModelCatalogRecord["models"]; grantNotExpanded: boolean } | undefined {
+    let parsed = parseTokenhubModelCatalogEntries(body, {
+      tokenhubUrl: this.#config.tokenhubUrl,
+      apiKey,
       xcityUserId: this.#xcityUserId,
     });
     if (!parsed) {
@@ -585,6 +721,7 @@ export class XcityModelPlane {
       diagnostics.catalog = { ...diagnostics.catalog, error: "malformed-response" };
       return undefined;
     }
+
     let { models, sentinelCount } = parsed;
     // Nothing but grant sentinels came back: the key's grant was never expanded into real model
     // names, which is a provisioning failure and not an empty plan.
@@ -599,17 +736,7 @@ export class XcityModelPlane {
       modelCount: models.length,
       ...(grantNotExpanded ? { grantNotExpanded: true } : {}),
     };
-
-    let cache = this.#storage.get();
-    cache.catalog = {
-      tokenhubUrl: this.#config.tokenhubUrl,
-      keyMintedAt: key.mintedAt,
-      fetchedAt: Date.now(),
-      models,
-      ...(grantNotExpanded ? { grantNotExpanded: true } : {}),
-    };
-    this.#storage.put(cache);
-    return models;
+    return { models, grantNotExpanded };
   }
 
   // Fire-and-forget catalog revalidation for the stale-serve path. The User DO has no
@@ -620,7 +747,7 @@ export class XcityModelPlane {
     if (inflightCatalogRefreshes.has(refreshKey)) return;
     let refresh = this.#refreshModels(newXcityProviderDiagnostics())
         .then(models => {
-          if (models) this.#models = models;
+          if (models) this.#models = this.#withDefaultModelFallback(models);
         })
         .catch(error => {
           logger.warn("background tokenhub model catalog refresh failed", {

@@ -5,6 +5,7 @@ import { useAuthenticatedApi } from './AuthContext'
 import {
   AiChatAuthorInfo,
   AiGatewayInfo,
+  XcityProviderInfo,
 } from '@gadgets/workshop-shared/api'
 import {
   VendorDescription,
@@ -21,6 +22,7 @@ import {
   Plugs,
 } from '@phosphor-icons/react'
 import AddModelModal from './AddModelModal'
+import XcityAddModelModal from './XcityAddModelModal'
 import { persistSelectedModel } from './modelSelection'
 import { logoComponents } from './components/ConnectionLogos'
 import { getVendorIconBackground } from './components/vendorColors'
@@ -85,6 +87,9 @@ export default function OnboardingWizard({
   const [models, setModels] = useState<AiChatAuthorInfo[]>([])
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null)
   const [aiConfig, setAiConfig] = useState<AiGatewayInfo | null>(null)
+  // Non-null only on Xcity deployments with the model plane configured — the same signal
+  // /providers uses to decide TokenHub is the model source instead of BYOK.
+  const [xcityInfo, setXcityInfo] = useState<XcityProviderInfo | null>(null)
   const [addModelOpen, setAddModelOpen] = useState(false)
   const [modelsLoading, setModelsLoading] = useState(true)
 
@@ -117,12 +122,15 @@ export default function OnboardingWizard({
   // Load models + AI config
   const fetchModels = useCallback(async () => {
     try {
-      const [modelList, cfg] = await Promise.all([
+      const [modelList, cfg, xcity] = await Promise.all([
         authenticatedApi.listModels(),
         authenticatedApi.getAiConfig(),
+        // Older backends don't implement this RPC; treat a rejection as "not an Xcity deployment".
+        authenticatedApi.getXcityProviderInfo().catch(() => null),
       ])
       setModels(modelList)
       setAiConfig(cfg)
+      setXcityInfo(xcity)
       // Default to the first model in the list
       if (modelList.length > 0) {
         setSelectedModelId((prev) => prev ?? modelList[0].id)
@@ -536,10 +544,12 @@ export default function OnboardingWizard({
                       {models.length === 0 && (
                         <div className="text-center py-8">
                           <p className="text-sm text-kumo-subtle mb-1">
-                            No models configured yet
+                            {xcityInfo ? 'No models in your list' : 'No models configured yet'}
                           </p>
                           <p className="text-xs text-kumo-inactive">
-                            Add a model to get started
+                            {xcityInfo
+                              ? 'Add a TokenHub model to get started'
+                              : 'Add a model to get started'}
                           </p>
                         </div>
                       )}
@@ -550,7 +560,7 @@ export default function OnboardingWizard({
                       className="mt-3 w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-kumo-subtle border border-dashed border-kumo-line rounded-xl hover:border-kumo-fill hover:text-kumo-default hover:bg-kumo-tint transition-colors"
                     >
                       <Plus size={14} weight="bold" />
-                      Add new model...
+                      {xcityInfo ? 'Add model' : 'Add new model...'}
                     </button>
                   </>
                 )}
@@ -705,17 +715,29 @@ export default function OnboardingWizard({
     </div>
 
     {/* Add Model Modal — outside the wizard's inner content so it's not
-        clipped by overflow-hidden on the sliding panel */}
-    <AddModelModal
-      visible={addModelOpen}
-      onCancel={() => setAddModelOpen(false)}
-      onSuccess={() => {
-        setAddModelOpen(false)
-        fetchModels()
-      }}
-      authenticatedApi={authenticatedApi}
-      aiConfig={aiConfig}
-    />
+        clipped by overflow-hidden on the sliding panel. On Xcity deployments TokenHub is the
+        only model source, so the picker lists the user's catalog instead of the BYOK form —
+        same split /providers makes. */}
+    {xcityInfo ? (
+      <XcityAddModelModal
+        visible={addModelOpen}
+        onCancel={() => setAddModelOpen(false)}
+        onAdded={fetchModels}
+        authenticatedApi={authenticatedApi}
+        catalog={xcityInfo.catalog}
+      />
+    ) : (
+      <AddModelModal
+        visible={addModelOpen}
+        onCancel={() => setAddModelOpen(false)}
+        onSuccess={() => {
+          setAddModelOpen(false)
+          fetchModels()
+        }}
+        authenticatedApi={authenticatedApi}
+        aiConfig={aiConfig}
+      />
+    )}
     </>
   )
 }

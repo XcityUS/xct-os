@@ -584,8 +584,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * Describe the user's default Xcity TokenHub provider for the /providers page. Null when the
-   * Xcity model plane is not configured or the user has no Xcity identity; never throws.
+   * Describe the user's default Xcity TokenHub provider for the /providers page, with per-hop
+   * diagnostics for this call. Null only when the Xcity model plane is not configured; with no
+   * stored Xcity identity the info comes back empty with `diagnostics.identity: false`. Never
+   * throws.
    */
   async getXcityProviderInfo(): Promise<XcityProviderInfo | null> {
     let identity = this.storage.xcityIdentity.get();

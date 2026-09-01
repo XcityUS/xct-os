@@ -2,10 +2,11 @@
 // connected identity, the user's tokenhub virtual key (the same key the xcity.ai dashboard
 // shows — minted by wallet POST /v1/keys/for-user), and which model IDs come from tokenhub.
 
-import type { XcityProviderInfo } from "@gadgets/workshop-shared/api";
+import type { XcityProviderDiagnostics, XcityProviderInfo } from "@gadgets/workshop-shared/api";
 import { createWorkshopLogger } from "../observability.js";
 import { getXcityConfig } from "./config.js";
 import {
+  newXcityProviderDiagnostics,
   XcityModelPlane,
   type XcityModelPlaneStorage,
   type XcityUserIdentity,
@@ -14,9 +15,12 @@ import {
 const logger = createWorkshopLogger("workshop.xcity.provider-info");
 
 /**
- * Resolve the user's Xcity TokenHub provider info. Returns null when the Xcity model plane is
- * not configured or the user has no Xcity identity. Never throws: on internal failure it logs
- * and returns whatever is knowable (e.g. a minted key with an empty model list).
+ * Resolve the user's Xcity TokenHub provider info. Returns null only when the Xcity model plane
+ * is not configured; with no stored Xcity identity it returns an empty info carrying
+ * `diagnostics.identity: false`, so the page can say the user is not signed in to Xcity instead
+ * of hiding the card. Never throws: on internal failure it logs and returns whatever is knowable
+ * (e.g. a minted key with an empty model list), always with `diagnostics` describing the hop
+ * that failed on THIS call.
  *
  * `mintEmail` is the email forwarded to the wallet when the key still has to be minted (same
  * fallback the model plane uses elsewhere); the returned `email` is always the identity's own.
@@ -31,14 +35,27 @@ export async function getXcityProviderInfoForUser(
     hiddenModelIds: readonly string[] = [],
 ): Promise<XcityProviderInfo | null> {
   let config = getXcityConfig(env);
-  if (!config || !identity) return null;
+  if (!config) return null;
+
+  // Configured but never signed in to Xcity: there is nothing to mint a key for, so report the
+  // failed hop rather than pretending the deployment has no Xcity provider at all.
+  if (!identity) {
+    return {
+      tokenhubUrl: config.tokenhubUrl,
+      modelIds: [],
+      catalog: [],
+      diagnostics: { identity: false, keyPresent: false },
+    };
+  }
 
   let catalog: XcityProviderInfo["catalog"] = [];
+  let diagnostics: XcityProviderDiagnostics = newXcityProviderDiagnostics();
   try {
     // forUser mints the per-user key if absent and loads the catalog through the resilient
     // cache; both are best-effort inside the plane itself.
     let plane = await XcityModelPlane.forUser(
         env, config, storage, identity.userId, mintEmail ?? identity.email);
+    diagnostics = plane.getDiagnostics();
     let hidden = new Set(hiddenModelIds);
     catalog = plane.getModelList().map(model => ({
       id: model.id,
@@ -63,5 +80,6 @@ export async function getXcityProviderInfoForUser(
     ...(apiKey ? { apiKey } : {}),
     modelIds,
     catalog,
+    diagnostics,
   };
 }

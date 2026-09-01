@@ -139,6 +139,12 @@ describe("getXcityProviderInfoForUser catalog", () => {
         { id: "gpt-5.5-xhigh", name: "gpt-5.5-xhigh", hidden: false },
         { id: "cheap-model", name: "cheap-model", hidden: true },
       ],
+      diagnostics: {
+        identity: true,
+        keyPresent: true,
+        keyMint: { attempted: true, status: 200 },
+        catalog: { status: 200, modelCount: 2 },
+      },
     });
   });
 
@@ -168,6 +174,12 @@ describe("getXcityProviderInfoForUser catalog", () => {
       apiKey: "sk-tokenhub-user",
       modelIds: [],
       catalog: [],
+      diagnostics: {
+        identity: true,
+        keyPresent: true,
+        keyMint: { attempted: true, status: 200 },
+        catalog: { status: 500 },
+      },
     });
   });
 });

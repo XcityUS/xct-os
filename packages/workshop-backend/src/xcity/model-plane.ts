@@ -500,11 +500,23 @@ export class XcityModelPlane {
         cache.key.walletUrl === this.#config.walletUrl &&
         cache.key.userId === this.#xcityUserId);
 
-    if (cached && age < CATALOG_CACHE_MS) {
+    // A catalog that held only grant sentinels is a known-broken provisioning state, not a
+    // legitimately empty one: the key is repaired on the wallet side without its token changing,
+    // so honouring the cache here would keep serving an empty list for the rest of the TTL after
+    // the fix landed. Always revalidate instead.
+    if (cached && cached.grantNotExpanded) {
+      let models = await this.#refreshModels(diagnostics);
+      if (models) return models;
       diagnostics.catalog = {
+        ...diagnostics.catalog,
         modelCount: cached.models.length,
-        ...(cached.grantNotExpanded ? { grantNotExpanded: true } : {}),
+        grantNotExpanded: true,
       };
+      return cached.models;
+    }
+
+    if (cached && age < CATALOG_CACHE_MS) {
+      diagnostics.catalog = { modelCount: cached.models.length };
       return cached.models;
     }
 
@@ -517,7 +529,6 @@ export class XcityModelPlane {
       diagnostics.catalog = {
         modelCount: cached.models.length,
         servedStale: true,
-        ...(cached.grantNotExpanded ? { grantNotExpanded: true } : {}),
       };
       return cached.models;
     }
@@ -535,7 +546,6 @@ export class XcityModelPlane {
         ...diagnostics.catalog,
         modelCount: cached.models.length,
         servedStale: true,
-        ...(cached.grantNotExpanded ? { grantNotExpanded: true } : {}),
       };
       return cached.models;
     }

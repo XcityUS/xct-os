@@ -331,11 +331,13 @@ describe("getXcityProviderInfoForUser diagnostics", () => {
     expect(info?.modelIds).toEqual(["gpt-5.5-xhigh"]);
   });
 
-  it("keeps reporting grantNotExpanded when the empty catalog is served from cache", async () => {
+  it("revalidates a cached wildcard-only catalog instead of honouring its TTL", async () => {
+    // The wallet repairs the key's grant in place — the key token never changes — so a cached
+    // sentinel-only catalog must not be served for the rest of its TTL after the fix landed.
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url === "https://tokenhub.xcity.ai/v1/models") {
-        throw new Error("must not refetch a fresh catalog");
+        return jsonResponse({ data: [{ id: "deepseek-v3.2" }] });
       }
       throw new Error(`unexpected fetch: ${url}`);
     });
@@ -360,9 +362,43 @@ describe("getXcityProviderInfoForUser diagnostics", () => {
     expect(info?.diagnostics).toEqual({
       identity: true,
       keyPresent: true,
-      catalog: { modelCount: 0, grantNotExpanded: true },
+      catalog: { status: 200, modelCount: 1 },
     });
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(info?.modelIds).toEqual(["deepseek-v3.2"]);
+  });
+
+  it("keeps reporting grantNotExpanded when revalidating the cached empty catalog fails", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://tokenhub.xcity.ai/v1/models") {
+        return new Response("nope", { status: 503 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const storage = makeStorage({
+      key: {
+        userId: IDENTITY.userId,
+        walletUrl: "https://wallet.xcity.ai",
+        key: "sk-cached",
+        mintedAt: 111,
+      },
+      catalog: {
+        tokenhubUrl: "https://tokenhub.xcity.ai",
+        keyMintedAt: 111,
+        fetchedAt: Date.now(),
+        models: [],
+        grantNotExpanded: true,
+      },
+    });
+    const info = await getXcityProviderInfoForUser(ENV, storage, IDENTITY);
+    expect(info?.diagnostics).toEqual({
+      identity: true,
+      keyPresent: true,
+      catalog: { status: 503, modelCount: 0, grantNotExpanded: true },
+    });
+    expect(info?.modelIds).toEqual([]);
   });
 
   it("flags a malformed catalog body", async () => {

@@ -10,6 +10,7 @@ import {
 } from "../src/xcity/model-visibility.js";
 import { getXcityProviderInfoForUser } from "../src/xcity/provider-info.js";
 import {
+  XCITY_DEFAULT_MODEL_ID,
   flushXcityCatalogRefreshesForTests,
   type XcityModelPlaneCache,
   type XcityModelPlaneStorage,
@@ -139,6 +140,12 @@ describe("getXcityProviderInfoForUser catalog", () => {
         { id: "gpt-5.5-xhigh", name: "gpt-5.5-xhigh", hidden: false },
         { id: "cheap-model", name: "cheap-model", hidden: true },
       ],
+      diagnostics: {
+        identity: true,
+        keyPresent: true,
+        keyMint: { attempted: true, status: 200 },
+        catalog: { status: 200, modelCount: 2 },
+      },
     });
   });
 
@@ -150,7 +157,7 @@ describe("getXcityProviderInfoForUser catalog", () => {
     expect(info?.catalog.every(model => !model.hidden)).toBe(true);
   });
 
-  it("returns an empty catalog (not a throw) when the catalog fetch fails", async () => {
+  it("falls back to the default model (not a throw) when the catalog fetch fails", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url === "https://wallet.xcity.ai/v1/keys/for-user") {
@@ -162,12 +169,20 @@ describe("getXcityProviderInfoForUser catalog", () => {
 
     const info = await getXcityProviderInfoForUser(
         ENV, makeStorage(), IDENTITY, undefined, ["cheap-model"]);
+    // No catalog to filter, so the hard-coded default stands in — and it is a normal catalog
+    // entry as far as visibility is concerned.
     expect(info).toEqual({
       tokenhubUrl: "https://tokenhub.xcity.ai",
       email: "user@example.com",
       apiKey: "sk-tokenhub-user",
-      modelIds: [],
-      catalog: [],
+      modelIds: [XCITY_DEFAULT_MODEL_ID],
+      catalog: [{ id: XCITY_DEFAULT_MODEL_ID, name: XCITY_DEFAULT_MODEL_ID, hidden: false }],
+      diagnostics: {
+        identity: true,
+        keyPresent: true,
+        keyMint: { attempted: true, status: 200 },
+        catalog: { status: 500 },
+      },
     });
   });
 });

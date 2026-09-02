@@ -441,8 +441,9 @@ export interface AuthenticatedApi extends RpcTarget {
 
   /**
    * Describe the user's default Xcity TokenHub provider: connected identity, tokenhub virtual
-   * key, and which model IDs come from tokenhub. Returns null when the deployment has no Xcity
-   * model plane configured or the user has no Xcity identity.
+   * key, which model IDs come from tokenhub, and per-hop `diagnostics` for this call. Returns
+   * null only when the deployment has no Xcity model plane configured; a user with no stored
+   * Xcity identity gets an empty info with `diagnostics.identity: false`.
    */
   getXcityProviderInfo(): Promise<XcityProviderInfo | null>;
 
@@ -1168,6 +1169,62 @@ export type XcityProviderInfo = {
    * existing chats, and can be re-added at any time via setXcityModelHidden().
    */
   catalog: XcityCatalogModel[];
+
+  /**
+   * Per-hop outcome of the call that produced this info, so the /providers page can say which
+   * step of identity → wallet key mint → tokenhub catalog left the model list empty. Absent on
+   * older backends that don't collect it.
+   */
+  diagnostics?: XcityProviderDiagnostics;
+};
+
+/**
+ * Hop-by-hop outcome of resolving a user's tokenhub models: the stored Xcity identity, the
+ * per-user wallet key mint, and the tokenhub catalog fetch. Populated fresh on every
+ * getXcityProviderInfo() call — never a cached or global snapshot — and safe to show to the
+ * user: `error` is always a short classified string, never a raw error or stack.
+ */
+export type XcityProviderDiagnostics = {
+  /** True when the user has a stored Xcity identity (set at Xcity login). */
+  identity: boolean;
+
+  /** True when a wallet-minted tokenhub key for this user and wallet is available. */
+  keyPresent: boolean;
+
+  /** Outcome of the wallet key mint, present only when this call attempted one. */
+  keyMint?: {
+    /** Always true — the mint hop ran (a cached key means this field is absent entirely). */
+    attempted: boolean;
+
+    /** HTTP status of the wallet mint response, when one was received. */
+    status?: number;
+
+    /** Short classified failure: "network-error", "timeout", or "malformed-response". */
+    error?: string;
+  };
+
+  /** Outcome of the tokenhub catalog hop, present once the catalog was fetched or served. */
+  catalog?: {
+    /** HTTP status of the tokenhub catalog response, when one was received. */
+    status?: number;
+
+    /** Short classified failure: "network-error", "timeout", or "malformed-response". */
+    error?: string;
+
+    /** Number of models the served catalog contains (0 means the key grants none). */
+    modelCount?: number;
+
+    /**
+     * True when the catalog came back holding nothing but LiteLLM grant sentinels (`*`,
+     * `all-proxy-models`, …), which are dropped as unusable — the gateway never expanded the
+     * key's model grant into real model names. Distinct from a plain `modelCount: 0`, which
+     * means the key legitimately grants no models.
+     */
+    grantNotExpanded?: boolean;
+
+    /** True when a cached catalog was served because a refresh was skipped or failed. */
+    servedStale?: boolean;
+  };
 };
 
 /** One tokenhub catalog model entry inside XcityProviderInfo, with per-user visibility. */

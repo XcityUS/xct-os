@@ -62,6 +62,35 @@ export type XcityTokenhubImage = {
   revisedPrompt?: string;
 };
 
+/**
+ * An approved-but-not-yet-applied generation, as persisted in the gatekeeper Durable Object. It
+ * lives here rather than in xcity.ts so the apply/failure state machine below can be exercised
+ * without a workerd harness.
+ */
+export type StoredGenerateVideoAction = {
+  kind: "video";
+  mediaId: string;
+  options: Required<GenerateVideoOptions>;
+  cost?: MediaGenerationCost;
+  submittedAt: number;
+};
+
+export type StoredGenerateImageAction = {
+  kind: "image";
+  mediaId: string;
+  options: Required<GenerateImageOptions>;
+  cost?: MediaGenerationCost;
+  submittedAt: number;
+};
+
+export type StoredGenerateAction = StoredGenerateVideoAction | StoredGenerateImageAction;
+
+/** The pending-action store as the apply path uses it. */
+export type PendingMediaActions = {
+  get(actionId: number): StoredGenerateAction | undefined;
+  remove(actionId: number): void;
+};
+
 export class XcityMediaApiError extends Error {
   readonly status: number;
   readonly details: unknown;
@@ -511,7 +540,7 @@ export async function createImage(
   const { raw } = await tokenhubRequestJson<unknown>(
     config,
     apiKey,
-    "/images",
+    "/images/generations",
     { method: "POST", body: JSON.stringify(imageCreateBody(options)) },
     fetchImpl,
   );
@@ -739,4 +768,51 @@ export function pendingGeneratedMedia(
     createdAt: new Date(now()),
     updatedAt: new Date(now()),
   };
+}
+
+export function failedGeneratedMedia(
+  action: StoredGenerateAction,
+  error: unknown,
+  providerJobId?: string,
+  now: () => number = Date.now,
+): GeneratedMedia {
+  return {
+    id: action.mediaId,
+    kind: action.kind,
+    status: "failed",
+    archived: false,
+    ...(action.cost ? { cost: action.cost } : {}),
+    ...(providerJobId ? { providerJobId } : {}),
+    error: error instanceof Error ? error.message : String(error),
+    createdAt: new Date(action.submittedAt),
+    updatedAt: new Date(now()),
+  };
+}
+
+/**
+ * Applies one approved generation, turning an upstream failure into the generation's stored result.
+ *
+ * A generation that the provider rejects is an outcome of the approved action, not a failure to
+ * apply it: if the error escaped, the approval itself would fail, the user would see a bare
+ * "failed to approve action" with the real message discarded, and the pending record would survive
+ * so every retry failed identically. So the error is recorded where the agent already looks for the
+ * generation's status, and the pending record is cleared on both paths.
+ */
+export async function applyMediaAction(options: {
+  actionId: number;
+  pending: PendingMediaActions;
+  run: (action: StoredGenerateAction) => Promise<void>;
+  storeResult: (result: GeneratedMedia) => void;
+  onFailure?: (action: StoredGenerateAction, error: unknown) => void;
+}): Promise<void> {
+  const { actionId, pending, run, storeResult, onFailure } = options;
+  const action = pending.get(actionId);
+  if (!action) throw new Error(`Unknown pending Xcity media action: ${actionId}`);
+  try {
+    await run(action);
+  } catch (error) {
+    onFailure?.(action, error);
+    storeResult(failedGeneratedMedia(action, error));
+  }
+  pending.remove(actionId);
 }

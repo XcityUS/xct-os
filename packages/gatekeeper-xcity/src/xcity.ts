@@ -12,12 +12,14 @@ import {
 } from "./oauth";
 import { fetchIdentity, type XcityIdentity } from "./xcity-api";
 import {
+  applyMediaAction,
   archiveImageOrTemporary,
   archiveVideoOrTemporary,
   createImage,
   createVideoJob,
   estimateSeedanceVideoCost,
   extractTokenhubCost,
+  failedGeneratedMedia,
   mintTokenhubKey,
   normalizeImageOptions,
   normalizeVideoOptions,
@@ -26,6 +28,9 @@ import {
   retrieveVideoJob,
   xcityMediaResourceUrl,
   XcityMediaApiError,
+  type StoredGenerateAction,
+  type StoredGenerateImageAction,
+  type StoredGenerateVideoAction,
   type XcityMediaConfig,
   type XcityTokenhubVideoJob,
   type XcityVirtualKeyRecord,
@@ -662,24 +667,6 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
 
 type XcityMediaGatekeeperProps = { userObjectId: string };
 
-type StoredGenerateVideoAction = {
-  kind: "video";
-  mediaId: string;
-  options: Required<GenerateVideoOptions>;
-  cost?: MediaGenerationCost;
-  submittedAt: number;
-};
-
-type StoredGenerateImageAction = {
-  kind: "image";
-  mediaId: string;
-  options: Required<GenerateImageOptions>;
-  cost?: MediaGenerationCost;
-  submittedAt: number;
-};
-
-type StoredGenerateAction = StoredGenerateVideoAction | StoredGenerateImageAction;
-
 type StoredVideoFlight = {
   action: StoredGenerateVideoAction;
   providerJobId: string;
@@ -909,17 +896,7 @@ export class XcityMediaGatekeeperImpl extends DurableObject<Env, XcityMediaGatek
   }
 
   #failedResult(action: StoredGenerateAction, error: unknown, providerJobId?: string): GeneratedMedia {
-    return {
-      id: action.mediaId,
-      kind: action.kind,
-      status: "failed",
-      archived: false,
-      ...(action.cost ? { cost: action.cost } : {}),
-      ...(providerJobId ? { providerJobId } : {}),
-      error: error instanceof Error ? error.message : String(error),
-      createdAt: new Date(action.submittedAt),
-      updatedAt: new Date(),
-    };
+    return failedGeneratedMedia(action, error, providerJobId);
   }
 
   #processingResult(flight: StoredVideoFlight): GeneratedMedia {
@@ -1099,16 +1076,26 @@ export class XcityMediaGatekeeperImpl extends DurableObject<Env, XcityMediaGatek
     ));
   }
 
+  /**
+   * A provider failure is the generation's outcome, not a failure to apply the action, so
+   * applyMediaAction records it as the stored result and lets the approval succeed -- mirroring
+   * XcityContextGatekeeperImpl.applyAction. See its doc comment for why the error must not escape.
+   */
   async applyAction(actionId: number): Promise<void> {
-    const pending = this.#pending();
-    const action = pending.get(actionId);
-    if (!action) throw new Error(`Unknown pending Xcity media action: ${actionId}`);
-    if (action.kind === "video") {
-      await this.#startVideo(action);
-    } else {
-      await this.#applyImage(action);
-    }
-    pending.remove(actionId);
+    await applyMediaAction({
+      actionId,
+      pending: this.#pending(),
+      run: action => action.kind === "video" ? this.#startVideo(action) : this.#applyImage(action),
+      storeResult: result => { this.#storeResult(result); },
+      // mediaId is prefixed with the kind ("image_1" / "video_1"), so it identifies both.
+      onFailure: (action, error) => {
+        logger.warn("xcity media generation failed", {
+          event: "xcity.media.generate.failed",
+          mediaId: action.mediaId,
+          error,
+        });
+      },
+    });
   }
 
   async rejectAction(actionId: number): Promise<void> {

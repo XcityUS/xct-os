@@ -14,7 +14,9 @@ import {
 import { fetchWithOneRetry } from "../src/xcity/fetch-retry.js";
 import {
   XcityModelPlane,
+  XCITY_DEFAULT_MODEL_ID,
   flushXcityCatalogRefreshesForTests,
+  getXcityModelMetadata,
   parseTokenhubModelCatalog,
   type XcityModelPlaneCache,
   type XcityModelPlaneStorage,
@@ -54,9 +56,13 @@ function makeStorage(initial: XcityModelPlaneCache = {}): XcityModelPlaneStorage
 }
 
 // Storage pre-populated with a minted key and a catalog fetched `catalogAgeMs` ago.
-function seededStorage(userId: string, catalogAgeMs: number): XcityModelPlaneStorage {
+function seededStorage(
+    userId: string,
+    catalogAgeMs: number,
+    rawModels: unknown[] = [{ id: "cached-model" }],
+): XcityModelPlaneStorage {
   const mintedAt = 111;
-  const models = parseTokenhubModelCatalog({ data: [{ id: "cached-model" }] }, {
+  const models = parseTokenhubModelCatalog({ data: rawModels }, {
     tokenhubUrl: CONFIG.tokenhubUrl,
     apiKey: "sk-old",
     xcityUserId: userId,
@@ -364,5 +370,227 @@ describe("Xcity agent persona resilience", () => {
         .resolves.toBe("Build with care.");
     // Key mint + skill index + persona (500) + persona retry.
     expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+});
+
+describe("Xcity default model fallback", () => {
+  it("serves the hard-coded default when the catalog comes back empty", async () => {
+    const storage = makeStorage();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://wallet.xcity.ai/v1/keys/for-user") {
+        return jsonResponse({ key: "sk-user" });
+      }
+      if (url === "https://tokenhub.xcity.ai/v1/models") return jsonResponse({ data: [] });
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const plane = await XcityModelPlane.forUser(ENV, CONFIG, storage, "user-empty-catalog");
+    expect(plane.getModelList().map(profile => profile.id)).toEqual([XCITY_DEFAULT_MODEL_ID]);
+
+    // It is chattable: resolvable, quick-model-picked, and carrying the user's minted key.
+    const quick = plane.getQuickModelConfig();
+    expect(quick?.model).toBe(XCITY_DEFAULT_MODEL_ID);
+    expect(quick?.apiToken).toBe("sk-user");
+    expect(plane.resolveModel(XCITY_DEFAULT_MODEL_ID)?.config.apiUrl)
+        .toBe("https://tokenhub.xcity.ai/v1");
+
+    // Diagnostics keep describing what the gateway actually returned, not what was synthesized.
+    expect(plane.getDiagnostics().catalog).toEqual({ status: 200, modelCount: 0 });
+    // The fallback is served, never stored, so it cannot shadow a later real catalog entry.
+    expect(storage.get().catalog?.models).toEqual([]);
+  });
+
+  it("replaces the synthesized default with the real catalog entry", async () => {
+    const storage = seededStorage("user-default-swr", 11 * MINUTE_MS, []);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "https://tokenhub.xcity.ai/v1/models") {
+        return jsonResponse({
+          data: [{ id: XCITY_DEFAULT_MODEL_ID, input_cost_per_token: 0.01 }],
+        });
+      }
+      throw new Error(`unexpected fetch: ${String(input)}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const plane = await XcityModelPlane.forUser(ENV, CONFIG, storage, "user-default-swr");
+    // The stale catalog is empty, so the fallback stands in while it revalidates.
+    expect(plane.getModelList().map(profile => profile.id)).toEqual([XCITY_DEFAULT_MODEL_ID]);
+    expect(getXcityModelMetadata(plane.resolveModel(XCITY_DEFAULT_MODEL_ID)!.config))
+        .toMatchObject({ synthesizedFallback: true });
+
+    await flushXcityCatalogRefreshesForTests();
+    // Exactly one entry for the id — the real one, with the catalog's own metadata.
+    expect(plane.getModelList().map(profile => profile.id)).toEqual([XCITY_DEFAULT_MODEL_ID]);
+    const metadata = getXcityModelMetadata(plane.resolveModel(XCITY_DEFAULT_MODEL_ID)!.config);
+    expect(metadata?.synthesizedFallback).toBeUndefined();
+    expect(metadata?.inputCostPerToken).toBe(0.01);
+    expect(storage.get().catalog?.models.map(model => model.profile.id))
+        .toEqual([XCITY_DEFAULT_MODEL_ID]);
+  });
+});
+
+// The wallet repairs a key whose model grant was never expanded (a literal `*`) inside
+// POST /v1/keys/for-user. Only a forced re-mint calls it, so a sentinel-only catalog has to
+// force one, or the cached key stays broken forever and no amount of re-logging-in helps.
+describe("Xcity grant self-heal", () => {
+  it("re-mints through the wallet and re-fetches when the catalog holds only sentinels",
+      async () => {
+    const storage = makeStorage();
+    let mintCalls = 0;
+    let modelCalls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://wallet.xcity.ai/v1/keys/for-user") {
+        return jsonResponse({ key: `sk-${++mintCalls}` });
+      }
+      if (url === "https://tokenhub.xcity.ai/v1/models") {
+        return ++modelCalls === 1
+            ? jsonResponse({ data: [{ id: "*" }] })
+            : jsonResponse({ data: [{ id: "real-model" }] });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const plane = await XcityModelPlane.forUser(ENV, CONFIG, storage, "user-heal");
+    expect(plane.getModelList().map(profile => profile.id)).toEqual(["real-model"]);
+    // Initial mint plus the repair mint that actually runs the wallet-side reconciler.
+    expect(mintCalls).toBe(2);
+    expect(modelCalls).toBe(2);
+    // The re-minted key replaces the cached one and is what the served models authenticate with.
+    expect(storage.get().key?.key).toBe("sk-2");
+    expect(plane.resolveModel("real-model")?.config.apiToken).toBe("sk-2");
+    // Diagnostics describe the final attempt: no lingering sentinel state.
+    expect(plane.getDiagnostics().catalog).toEqual({ status: 200, modelCount: 1 });
+    expect(storage.get().catalog?.grantNotExpanded).toBeUndefined();
+  });
+
+  it("retries once and settles into grantNotExpanded when the key is still broken", async () => {
+    const storage = makeStorage();
+    let mintCalls = 0;
+    let modelCalls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://wallet.xcity.ai/v1/keys/for-user") {
+        return jsonResponse({ key: `sk-${++mintCalls}` });
+      }
+      if (url === "https://tokenhub.xcity.ai/v1/models") {
+        modelCalls++;
+        return jsonResponse({ data: [{ id: "*" }] });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const plane = await XcityModelPlane.forUser(ENV, CONFIG, storage, "user-still-broken");
+    // Exactly one repair attempt: no loop.
+    expect(mintCalls).toBe(2);
+    expect(modelCalls).toBe(2);
+    expect(plane.getDiagnostics().catalog).toEqual({
+      status: 200, modelCount: 0, grantNotExpanded: true,
+    });
+    expect(storage.get().catalog).toMatchObject({ models: [], grantNotExpanded: true });
+    // ...and the user is still left with the hard-coded default to chat with.
+    expect(plane.getModelList().map(profile => profile.id)).toEqual([XCITY_DEFAULT_MODEL_ID]);
+  });
+
+  it("forces the repair mint even though the cached key would have been reused", async () => {
+    const mintedAt = 111;
+    const storage = makeStorage({
+      key: {
+        userId: "user-cached-sentinel",
+        walletUrl: CONFIG.walletUrl,
+        key: "sk-broken",
+        mintedAt,
+      },
+      catalog: {
+        tokenhubUrl: CONFIG.tokenhubUrl,
+        keyMintedAt: mintedAt,
+        fetchedAt: Date.now(),
+        models: [],
+        grantNotExpanded: true,
+      },
+    });
+    let mintCalls = 0;
+    let modelCalls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://wallet.xcity.ai/v1/keys/for-user") {
+        mintCalls++;
+        return jsonResponse({ key: "sk-repaired" });
+      }
+      if (url === "https://tokenhub.xcity.ai/v1/models") {
+        return ++modelCalls === 1
+            ? jsonResponse({ data: [{ id: "*" }] })
+            : jsonResponse({ data: [{ id: "real-model" }] });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const plane = await XcityModelPlane.forUser(ENV, CONFIG, storage, "user-cached-sentinel");
+    // The cached key served the first fetch (no mint), the sentinel result forced the second.
+    expect(mintCalls).toBe(1);
+    expect(modelCalls).toBe(2);
+    expect(storage.get().key?.key).toBe("sk-repaired");
+    expect(plane.getModelList().map(profile => profile.id)).toEqual(["real-model"]);
+  });
+
+  it("keeps reporting the sentinel catalog when the repair mint fails", async () => {
+    const storage = makeStorage();
+    let mintCalls = 0;
+    let modelCalls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://wallet.xcity.ai/v1/keys/for-user") {
+        return ++mintCalls === 1
+            ? jsonResponse({ key: "sk-user" })
+            : new Response("nope", { status: 403 });
+      }
+      if (url === "https://tokenhub.xcity.ai/v1/models") {
+        modelCalls++;
+        return jsonResponse({ data: [{ id: "*" }] });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const plane = await XcityModelPlane.forUser(ENV, CONFIG, storage, "user-mint-fails");
+    // No second catalog attempt happened, so the first one's outcome stays the final word.
+    expect(modelCalls).toBe(1);
+    expect(plane.getDiagnostics().catalog).toEqual({
+      status: 200, modelCount: 0, grantNotExpanded: true,
+    });
+    expect(plane.getDiagnostics().keyMint).toMatchObject({ attempted: true, status: 403 });
+    expect(storage.get().catalog).toMatchObject({ models: [], grantNotExpanded: true });
+  });
+
+  it("reports the retry's own failure when the re-fetch fails", async () => {
+    const storage = makeStorage();
+    let modelCalls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://wallet.xcity.ai/v1/keys/for-user") {
+        return jsonResponse({ key: "sk-user" });
+      }
+      if (url === "https://tokenhub.xcity.ai/v1/models") {
+        return ++modelCalls === 1
+            ? jsonResponse({ data: [{ id: "*" }] })
+            : new Response("down", { status: 500 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const plane = await XcityModelPlane.forUser(ENV, CONFIG, storage, "user-retry-fails");
+    // Sentinel fetch, then the retry's 500 plus its one transient retry.
+    expect(modelCalls).toBe(3);
+    // Same as the 401 path: the final attempt's failure is what gets reported.
+    expect(plane.getDiagnostics().catalog).toEqual({ status: 500 });
+    // Nothing was persisted, and the default still stands in for the empty list.
+    expect(storage.get().catalog).toBeUndefined();
+    expect(plane.getModelList().map(profile => profile.id)).toEqual([XCITY_DEFAULT_MODEL_ID]);
   });
 });

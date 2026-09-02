@@ -53,6 +53,13 @@ Xcity 的模型元数据以 `XcityAiModelConfig = AiModelConfig & { xcity?: … 
 
 Gatekeeper 本身按目录名 `gatekeeper-*` 自动发现并绑定为 `GATEKEEPER_XCITY`（见 `run-dev-server.js` 的 `findGatekeepers` 与 `packages/workshop-backend/src/auth/auth-vendors.ts`），无需改注册表。
 
+**唯一一处不受接缝表约束的上游改动**：`auth-vendors.ts` 的 `buildGatekeeperVendorMap` 会把
+`GATEKEEPER_<NAME>_HTTP`（`server.ts` 转发 `/gatekeeper/<name>/*` OAuth 回跳用的绑定，见
+`xct-os-starter` 的 `deploy.mjs`）也当成 vendor 注册，产生一个 describe() 必然失败的幽灵 vendor
+`xcity_http`。修法是在发现时跳过 `_HTTP` 后缀。这是上游自身的 bug（约定由上游 `server.ts` 定义）、
+不含任何 Xcity 逻辑，因此没有也不应该做 `XCITY_*` 门控；应择机回推上游。rebase 时若此处冲突，
+保留跳过 `_HTTP` 的那一行判断即可。
+
 前端文案（KWH 余额、充值引导）不可避免会碰到 `CloudflareUsageInfo` 的消费组件 ——
 改动同样以门控为准，且尽量收敛在渲染层。
 

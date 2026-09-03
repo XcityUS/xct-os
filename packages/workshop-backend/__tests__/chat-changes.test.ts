@@ -37,7 +37,7 @@ async function withImpl(fn: (impl: any) => Promise<void>): Promise<void> {
 
 function addGadget(impl: any, id: number, bindingName: string, commitId?: string): void {
   impl.storage.gadgets.put({
-    id, title: bindingName, created: new Date(0), bindingName, bindings: {},
+    type: "gadget", id, title: bindingName, created: new Date(0), bindingName, bindings: {},
     ...(commitId !== undefined ? { commitId } : {}),
   });
 }
@@ -865,14 +865,16 @@ describe("revert and draft discard", () => {
       createdGadgets: [{ gadgetId: 2, title: "Mine", bindingName: "MINE" }],
     });
     impl.storage.gadgets.put({
-      id: 2, title: "Mine", created: new Date(0), bindingName: "MINE", bindings: {},
-      pending: { chatId: 1, sequence: boundary },
+      type: "gadget", id: 2, title: "Mine", created: new Date(0), bindingName: "MINE",
+      bindings: {}, pending: { chatId: 1, sequence: boundary },
     });
     let meta = impl.storage.chatMeta.get(1)!;
     meta.codeBase = {
       pins: [{ gadgetId: 1, baseCommit: c1, mergedCommit: c1 }],
       generation: 0, epoch: boundary, revision: 0,
     };
+    // A stale cached flag, as rows written before proposed-ness became derived may carry
+    // (see StoredChatMetadata): nothing reads it, and delivery must strip it.
     meta.hasProposedChanges = true;
     impl.storage.chatMeta.put(meta);
     return boundary;
@@ -898,7 +900,12 @@ describe("revert and draft discard", () => {
     let meta = impl.storage.chatMeta.get(1)!;
     expect(meta.codeBase!.pins).toEqual([]);
     expect(meta.codeBase).toMatchObject({ generation: 1, revision: 0 });
-    expect(meta.hasProposedChanges).toBeUndefined();
+    expect(impl.proposedChangeWorkpieceIds(1, meta)).toEqual([]);
+    // The stale legacy flag the seed wrote is dead weight: derivation ignores it and delivery
+    // strips it.
+    let delivered = impl.chatMetaForClient(meta);
+    expect(delivered.proposedChangeWorkpieces).toBeUndefined();
+    expect(delivered.hasProposedChanges).toBeUndefined();
     expect(await gadgetContent(impl, 1, 1)).toEqual({});
     expect(impl.storage.gadgets.get(2)).toBeUndefined();
   }));
@@ -917,7 +924,7 @@ describe("revert and draft discard", () => {
     let meta = impl.storage.chatMeta.get(1)!;
     expect(meta.codeBase!.pins).toEqual([]);
     expect(meta.codeBase).toMatchObject({ generation: 1, revision: 0 });
-    expect(meta.hasProposedChanges).toBeUndefined();
+    expect(impl.proposedChangeWorkpieceIds(1, meta)).toEqual([]);
     expect(await gadgetContent(impl, 1, 1)).toEqual({});
     expect(impl.storage.gadgets.get(2)).toBeUndefined();
   }));
@@ -1053,7 +1060,7 @@ describe("agent step barrier", () => {
   function stepMsgs(text: string): { type: "message", message: string }[] {
     return [{ type: "message", message: text }];
   }
-  const NO_EXTRAS = { createdGadgets: [], addedBindings: [] };
+  const NO_EXTRAS = { createdGadgets: [], createdWorktrees: [], addedBindings: [] };
 
   it("persists the step message, appends rows in order, and materializes -- one transaction",
       () => withImpl(async impl => {
@@ -1190,6 +1197,7 @@ describe("agent step barrier", () => {
       changes: [{ change: { [created.id]: [["main.js", { set: "code\n" }]] } }],
       createdGadgets: [
         { gadgetId: created.id, title: created.title, bindingName: "MY_GADGET" }],
+      createdWorktrees: [],
       addedBindings: [],
     })).toBe(true);
 
@@ -1249,6 +1257,7 @@ describe("reconcilePendingGadgets", () => {
       changes: [{ change: { [created.id]: [["main.js", { set: "code\n" }]] } }],
       createdGadgets: [
         { gadgetId: created.id, title: created.title, bindingName: "MY_GADGET" }],
+      createdWorktrees: [],
       addedBindings: [],
     });
     let stamp = impl.storage.gadgets.get(created.id)!.pending!.sequence!;
@@ -1419,5 +1428,95 @@ describe("chat content reconstruction", () => {
     expect(changes[0].author).toEqual(USER);
     expect(changes[0].watermark).toEqual({ changesGeneration: 0, throughRevision: 1 });
     expect(liveRows(impl, 1)).toHaveLength(1);
+  }));
+});
+
+describe("proposed-changes derivation", () => {
+  // proposedChangeWorkpieceIds derives per-workpiece proposed-ness from the chat's pins and the
+  // registry's pending records/edges -- there is no cached flag to drift. Worktree-side coverage
+  // (worktree pins and creations never propose) lives in worktrees.test.ts.
+
+  function derived(impl: any, chatId: number): number[] {
+    return impl.proposedChangeWorkpieceIds(chatId, impl.storage.chatMeta.get(chatId)!);
+  }
+
+  it("derives from pins: only the touched gadget proposes, and accept clears it",
+      () => withImpl(async impl => {
+    let c1 = await commitFiles(impl, { "a.txt": "one\n" });
+    let c2 = await commitFiles(impl, { "b.txt": "two\n" });
+    addGadget(impl, 1, "APP", c1);
+    addGadget(impl, 2, "OTHER", c2);
+    addChat(impl, 1);
+    expect(derived(impl, 1)).toEqual([]);
+
+    await submit(impl, 1, {
+      generation: 0, revision: 0, clientId: "cli", seq: 1,
+      pins: [{ gadgetId: 1, baseCommit: c1 }],
+      change: editChange(1, { "a.txt": "one\n" }, { "a.txt": "xone\n" }),
+    });
+    // The untouched gadget 2 stays out: it must keep loading as its mainline self even while
+    // this chat proposes changes elsewhere (see getGadgetFacetFetcher). Delivery carries the
+    // same list.
+    expect(derived(impl, 1)).toEqual([1]);
+    expect(impl.chatMetaForClient(impl.storage.chatMeta.get(1)!).proposedChangeWorkpieces)
+        .toEqual([1]);
+
+    expect(await impl.mergeChanges(1, USER_META, "user-do-id")).toEqual({ outcome: "merged" });
+    expect(derived(impl, 1)).toEqual([]);
+    expect(impl.chatMetaForClient(impl.storage.chatMeta.get(1)!).proposedChangeWorkpieces)
+        .toBeUndefined();
+  }));
+
+  it("counts pending creations and pending binding edges, scoped to their chat",
+      () => withImpl(async impl => {
+    let c1 = await commitFiles(impl, { "a.txt": "one\n" });
+    addGadget(impl, 1, "APP", c1);
+    addChat(impl, 1);
+    // (Distinct lastActive: chatMeta.byLastActive is a unique index.)
+    impl.storage.chatMeta.put(
+        { id: 2, title: "Chat 2", started: new Date(0), lastActive: new Date(1) });
+
+    // A provisional creation in chat 1, and a provisional binding edge on gadget 1 added by
+    // chat 2 (seeded directly; only the edge's pending stamp matters here). A binding addition
+    // changes the gadget's env without touching its code, so it must count.
+    let created = impl.createGadget("Mine", "MINE", 1);
+    let app = impl.storage.gadgets.get(1)!;
+    app.bindings["GK"] = { target: 999, pending: { chatId: 2 } };
+    impl.storage.gadgets.put(app);
+
+    expect(derived(impl, 1)).toEqual([created.id]);
+    expect(derived(impl, 2)).toEqual([1]);
+  }));
+
+  it("a revert re-broadcasts derived metadata after reaping the doomed creation",
+      () => withImpl(async impl => {
+    let c1 = await commitFiles(impl, { "a.txt": "one\n" });
+    addGadget(impl, 1, "APP", c1);
+    addChat(impl, 1);
+    let created = impl.createGadget("Mine", "MINE", 1);
+    // Record the creation so the pending record gets sequence-stamped.
+    impl.materializeChatChanges(1, undefined, { author: USER, createdGadgets: [
+      { gadgetId: created.id, title: "Mine", bindingName: "MINE" },
+    ]});
+    expect(derived(impl, 1)).toEqual([created.id]);
+
+    let deliveredLists: (number[] | undefined)[] = [];
+    impl.storage.chatMeta.subscribe({
+      add: () => {},
+      update: (_old: unknown, next: unknown) => {
+        deliveredLists.push(impl.chatMetaForClient(next).proposedChangeWorkpieces);
+      },
+      remove: () => {},
+    });
+
+    // The revert's own meta write precedes the awaited record reap (see #revertChanges on why
+    // that order is fixed), so reconciliation must re-put the metadata afterwards: the *last*
+    // broadcast a subscriber saw has to reflect the post-reap state, or the client keeps
+    // offering accept/discard for a chat that proposes nothing.
+    await impl.revertChanges(1, 0, USER);
+    expect(impl.storage.gadgets.get(created.id)).toBeUndefined();
+    expect(derived(impl, 1)).toEqual([]);
+    expect(deliveredLists.length).toBeGreaterThan(0);
+    expect(deliveredLists.at(-1)).toBeUndefined();
   }));
 });

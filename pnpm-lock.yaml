@@ -15,6 +15,9 @@ catalogs:
     capnweb-validate:
       specifier: 0.3.0
       version: 0.3.0
+    diff:
+      specifier: ^8.0.4
+      version: 8.0.4
     typescript:
       specifier: 7.0.2
       version: 7.0.2
@@ -345,7 +348,13 @@ importers:
       capnweb-validate:
         specifier: 'catalog:'
         version: 0.3.0(capnweb@0.12.0)(esbuild@0.28.1)(rollup@4.62.3)(vite@7.3.6(@types/node@26.1.0)(jiti@2.7.0)(lightningcss@1.33.0)(terser@5.49.2)(yaml@2.9.0))
+      diff:
+        specifier: 'catalog:'
+        version: 8.0.4
     devDependencies:
+      '@cloudflare/vitest-pool-workers':
+        specifier: 'catalog:'
+        version: 0.22.0(@cloudflare/workers-types@5.20260825.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
       '@gadgets/scripts':
         specifier: workspace:*
         version: link:../../scripts
@@ -907,7 +916,7 @@ importers:
         specifier: 'catalog:'
         version: 0.3.0(capnweb@0.12.0)(esbuild@0.28.1)(rollup@4.62.3)(vite@7.3.6(@types/node@26.1.0)(jiti@2.7.0)(lightningcss@1.33.0)(terser@5.49.2)(yaml@2.9.0))
       diff:
-        specifier: ^8.0.4
+        specifier: 'catalog:'
         version: 8.0.4
       diff3:
         specifier: ^0.0.3
@@ -918,6 +927,9 @@ importers:
       jose:
         specifier: ^6.2.8
         version: 6.2.8
+      pako:
+        specifier: ^2.1.0
+        version: 2.2.0
       yjs:
         specifier: ^13.6.32
         version: 13.6.32
@@ -931,6 +943,9 @@ importers:
       '@gadgets/scripts':
         specifier: workspace:*
         version: link:../../scripts
+      '@types/pako':
+        specifier: ^2.0.4
+        version: 2.0.4
       dompurify:
         specifier: ^3.4.13
         version: 3.4.13
@@ -2847,6 +2862,9 @@ packages:
   '@types/node@26.1.0':
     resolution: {integrity: sha512-O0A1G3xPGy4w7AgQdAQYUlQ+BKk2Oovw8eRpofyp5KdBZULnbe+WqaOVNrm705SHphCiG4XHsACrSmPu1f+Kgw==}
 
+  '@types/pako@2.0.4':
+    resolution: {integrity: sha512-VWDCbrLeVXJM9fihYodcLiIv0ku+AlOa/TQ1SvYOaBuyrSKgEcro95LJyIsJ4vSo6BXIxOKxiJAat04CmST9Fw==}
+
   '@types/react-dom@19.2.5':
     resolution: {integrity: sha512-fMPwH9v7r/pp43yUd2/Mbiex5KouJwwR3dzHkhLREUC6764VyDsqxhAxv6OFEYR1RhjOyD1naqba8ECDBe7ZQg==}
     peerDependencies:
@@ -4517,6 +4535,9 @@ packages:
 
   pako@1.0.11:
     resolution: {integrity: sha512-4hLB8Py4zZce5s4yd9XzopqwVv/yGNhV1Bl8NTmCq1763HeK2+EwVTv+leGeL13Dnh2wfbqowVPXCIO0z4taYw==}
+
+  pako@2.2.0:
+    resolution: {integrity: sha512-zJq6RP/5q+TO2OpFV3FHzlPnFjmkb7Nc99a5SNjJE+uu/PkpChs+NIZSSzbBoD+6kjiISXjfYdwj1ZRQ81dz/w==}
 
   parse-entities@4.0.2:
     resolution: {integrity: sha512-GG2AQYWoLgL877gQIKeRPGO1xF9+eG1ujIb5soS5gPvLQ1y2o8FL90w2QWNdf9I361Mpp7726c+lj3U0qK1uGw==}
@@ -6977,6 +6998,8 @@ snapshots:
     dependencies:
       undici-types: 8.3.0
 
+  '@types/pako@2.0.4': {}
+
   '@types/react-dom@19.2.5(@types/react@19.2.18)':
     dependencies:
       '@types/react': 19.2.18
@@ -8702,6 +8725,8 @@ snapshots:
       netmask: 2.1.1
 
   pako@1.0.11: {}
+
+  pako@2.2.0: {}
 
   parse-entities@4.0.2:
     dependencies:

@@ -2,7 +2,7 @@ import {DurableObject, RpcStub, RpcTarget} from "cloudflare:workers";
 import {skipRpcValidation, validateRpc} from "capnweb-validate";
 import type {
   ActionDescription, ActionKind, ApprovalQueue, Cursor, Gatekeeper, GatekeeperUserVerifier,
-  ObservationDescription, ResourceDescription,
+  GitCache, ObservationDescription, ResourceDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {
   base64UrlDecodedByteLength, decodeBase64UrlToBytes, enumerateGmailAttachments,
@@ -3749,7 +3749,7 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
     return ctx.restricted ? new GmailScopedSessionImpl(ctx) : new GmailSessionImpl(ctx);
   }
 
-  async applyAction(actionId: number): Promise<void> {
+  async applyAction(actionId: number, _cache: RpcStub<GitCache>): Promise<void> {
     const store = new GmailStore(this.ctx.storage);
     const initialAction = store.getAction(actionId);
     if (!initialAction) throw new Error(`Unknown pending Gmail action: ${actionId}`);

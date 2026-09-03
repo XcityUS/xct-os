@@ -1,7 +1,9 @@
 import { DurableObject, RpcStub, RpcTarget } from "cloudflare:workers";
 import type {
-  ActionDescription, ApprovalQueue, HookController, HookDescription, ObservationDescription,
+  ActionDescription, ApprovalQueue, GitCache, HookController, HookDescription,
+  ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
+import { TestGitCache } from "./test-git-cache";
 import type { GoogleAccessToken } from "../src/google-api";
 import type { GoogleDocSession } from "../src/docs-types";
 import type { GoogleDocGatekeeperImpl as GoogleDocGatekeeper } from "../src/google";
@@ -20,6 +22,10 @@ class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
   actionId?: number;
 
   async authorizeObservation(_description: ObservationDescription): Promise<void> {}
+
+  async getGitCache(): Promise<GitCache> {
+    throw new Error("Unexpected git cache access");
+  }
 
   async submitAction(actionId: number, _description: ActionDescription): Promise<void> {
     this.actionId = actionId;
@@ -79,7 +85,10 @@ export class TestHooks extends DurableObject<Env> {
 
   async applyAction(facetName: string, actionId: number): Promise<string | null> {
     try {
-      await this.#gatekeeper(facetName).applyAction(actionId);
+      // The overseer always passes an action-scoped git cache with the apply call, and the
+      // validator (sharpened by the `Gatekeeper` interface) requires it, so the test passes a
+      // stand-in the same way.
+      await this.#gatekeeper(facetName).applyAction(actionId, new RpcStub(new TestGitCache()));
       return null;
     } catch (error) {
       return error instanceof Error ? error.message : String(error);

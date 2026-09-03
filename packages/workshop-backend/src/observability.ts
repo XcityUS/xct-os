@@ -9,6 +9,7 @@ export type WorkshopObservabilityFields = {
   blueprintId: string;
   callbackInitiated: boolean;
   chatId: number;
+  claimedType: string;
   commitCount: number;
   durableObjectId: string;
   durationMs: number;
@@ -20,9 +21,12 @@ export type WorkshopObservabilityFields = {
   logBytes: number;
   modelId: string;
   observerId: string;
+  oidCount: number;
+  oidPrefix: string;
   operation: string;
   outcome: "ok" | "error" | "usage_limit" | "callbacks_stalled" | "no_email" | "signups_disabled";
   path: string;
+  recordedType: string;
   resourceTitle: string;
   sequence: number;
   size: number;

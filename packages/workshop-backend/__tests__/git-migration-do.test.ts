@@ -7,13 +7,13 @@
 //
 // This lives in __tests__/ (the unit workerd config), not __integration__/: the TEST_OVERSEER
 // DO binding exists only in vitest.config.ts, and no public API path can create a legacy
-// workspace anymore (new workspaces are born at version 3), so seeding must reach into
+// workspace anymore (new workspaces are born at version 4), so seeding must reach into
 // impl.storage -- the same pattern as chat-changes.test.ts. The public DO surface (open() etc.)
-// is deliberately never called: #initializeNewWorkspace would stamp version 3 and shadow the
+// is deliberately never called: #initializeNewWorkspace would stamp version 4 and shadow the
 // scenario.
 //
-// The version-3 action-index backfill rides the same constructor trigger, so its tests live
-// here too.
+// The version-3 action-index backfill and the version-4 workpiece-type stamp ride the same
+// constructor trigger, so their tests live here too.
 
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
@@ -95,10 +95,13 @@ describe("git-storage migration via the Overseer constructor", () => {
 
     await inOverseer("git-migration-single", async impl => {
       // The constructor's blockConcurrencyWhile completed before this event was delivered,
-      // running the whole migration ladder: git storage (2), then the action indexes (3).
-      expect(impl.storage.version.get()).toBe(3);
+      // running the whole migration ladder: git storage (2), the action indexes (3), then the
+      // workpiece-type stamp (4).
+      expect(impl.storage.version.get()).toBe(4);
       expect([...impl.storage.actions.pendingByGatekeeper.list()].map((r: any) => r.id))
           .toEqual([1]);
+      // The type stamp (3→4) covered the row the git migration wrote.
+      expect(impl.storage.gadgets.get(1)!.type).toBe("gadget");
 
       await expectHeadsMatchDoc(impl.storage, impl.gitStore, ws.docAt("current"), 1);
 
@@ -149,7 +152,7 @@ describe("git-storage migration via the Overseer constructor", () => {
     await abortAllDurableObjects();
 
     await inOverseer("git-migration-multi", async impl => {
-      expect(impl.storage.version.get()).toBe(3);
+      expect(impl.storage.version.get()).toBe(4);
 
       // Every gadget's head equals its own root's content in an independent replay of the log.
       await expectHeadsMatchDoc(impl.storage, impl.gitStore, ws.docAt("current"), 1);
@@ -194,7 +197,7 @@ describe("action-index backfills via the Overseer constructor", () => {
     await abortAllDurableObjects();
 
     await inOverseer("pending-index-v2", async impl => {
-      expect(impl.storage.version.get()).toBe(3);
+      expect(impl.storage.version.get()).toBe(4);
       // The pending index sees exactly the pendings (grouped by gatekeeper, so 1 before 3 here).
       expect([...impl.storage.actions.pendingByGatekeeper.list()].map((r: any) => r.id))
           .toEqual([1, 3]);

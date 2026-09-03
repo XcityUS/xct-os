@@ -1,6 +1,6 @@
 import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, AiChatStreamEvent, BlueprintOutput, ChatGadgetPin, ChatCodeBase, WorkpieceId, type AiModelConfig, isTextLikeAttachmentMimeType, validateBindingName } from '@gadgets/workshop-shared/api';
 import { applyCodeChange, codeChangeSerializedSize, replaceSpanChange, type CodeContent,
-  type CodeChange } from '@gadgets/workshop-shared/code-change';
+  type CodeChange, type FileChange } from '@gadgets/workshop-shared/code-change';
 import { PDF_MIME_TYPE, modelApiSupportsPdfAttachments } from './chat-attachment-pdf';
 import { AgentCatalog, ObservationDescription } from '@gadgets/workshop-shared/gatekeeper';
 import { createWorkshopLogger } from "./observability";
@@ -79,6 +79,64 @@ export interface AgentStepChange {
    * mirrors it into the chat's code base in the same transaction that records the row.
    */
   pin?: {gadgetId: WorkpieceId, baseCommit: string};
+}
+
+/**
+ * The agent turn's worktree state, as the programmatic Worktree binding needs it. The binding is
+ * served overseer-side (see worktree-session.ts; executeCode's env loopback resolves to it), but
+ * everything a worktree operation touches lives in the turn: the session-content overlay of
+ * touched/read files, the removal tombstones, the step's change buffer, and commit()'s in-memory
+ * head advancements. runAgent implements this interface over its turn state and passes it to
+ * executeCodeMode, which registers it for exactly the duration of the execution (see
+ * OverseerImpl.executeCodeMode) -- so a stored worktree stub cannot operate outside its turn.
+ */
+export interface WorktreeTurnAccess {
+  /**
+   * The worktree's pinned base commit -- what the current epoch's changes compose on -- or
+   * undefined when the id is not a worktree pinned in this session (which every live worktree of
+   * the chat is; undefined means "not this chat's worktree").
+   */
+  getPinBase(worktreeId: WorkpieceId): string | undefined;
+
+  /**
+   * The head advanced by a commit() buffered earlier in this turn, or undefined if none: the
+   * in-memory half of "reported HEAD is the last explicit commit" (the durable half is the
+   * record's headCommit, advanced at each step's barrier).
+   */
+  getBufferedHead(worktreeId: WorkpieceId): string | undefined;
+
+  /**
+   * The worktree's session content entry: the touched and lazily-read files (always a subset of
+   * the tree -- worktree content is never materialized whole). Also exactly the overlay an
+   * explicit commit()'s tree build applies over the pin base, together with getRemovedPaths().
+   */
+  getOverlayFiles(worktreeId: WorkpieceId): ReadonlyMap<string, string>;
+
+  /** Paths whose latest change is a removal: absent from the overlay, but not from the base. */
+  getRemovedPaths(worktreeId: WorkpieceId): ReadonlySet<string>;
+
+  /**
+   * Read a file exactly as the file tools do: session content first, else the pinned base
+   * (faulting the text into the session content, so later edits apply against it). Returns
+   * undefined for an absent (or removed) path; throws the descriptive symlink/submodule errors
+   * and UnreadableContentError for oversized/binary content.
+   */
+  readFile(worktreeId: WorkpieceId, path: string): Promise<string | undefined>;
+
+  /**
+   * Buffer one validated file change into the step: applied to the session content immediately,
+   * durable (as an ordinary chat change row) at the step's barrier. The caller has already
+   * enforced the base-entry write rules; this applies the same step budget the file tools do.
+   */
+  appendChange(worktreeId: WorkpieceId, path: string, change: FileChange): void;
+
+  /**
+   * Buffer a commit() head advancement for the step barrier, which validates the previousHead
+   * chain, advances the record's headCommit, and records the advancement as `worktreeCommits`
+   * on the step's "changes" message. In-memory until then: a step that dies before its barrier
+   * drops the advancement, leaving only harmless dangling commit objects.
+   */
+  appendCommit(worktreeId: WorkpieceId, commit: string, previousHead: string): void;
 }
 
 /** Additional per-chat-thread info needed by the AI agent but not by the client. */
@@ -350,11 +408,12 @@ export interface AgentHooks {
    * messages (`msgs`, the tool-call record among them), validate and append each buffered
    * change as a chat change row -- one row per tool call, in call order, with the same
    * pin/codeBase bookkeeping the appends always had -- materialize the rows into the step's
-   * single "changes" message carrying the step's gadget creations and binding additions
-   * (which stamps their pending registry records), and retire the rows. The step's effects
-   * are thus durable iff its transcript record is; a crash mid-step loses both, and the
-   * resumed model re-runs the step against unmodified content. Returns whether a "changes"
-   * message was written (change-ID numbering counts messages).
+   * single "changes" message carrying the step's gadget creations, binding additions, and
+   * worktree head advancements (stamping pending registry records and advancing worktree
+   * heads), and retire the rows. The step's effects are thus durable iff its transcript record
+   * is; a crash mid-step loses both, and the resumed model re-runs the step against unmodified
+   * content. Returns whether a "changes" message was written (change-ID numbering counts
+   * messages).
    *
    * Rows and messages broadcast from inside the transaction, as every append always has: the
    * transaction protects server-side storage, not what subscribers saw before a rollback (a
@@ -372,7 +431,9 @@ export interface AgentHooks {
       step: {
         changes: AgentStepChange[],
         createdGadgets: {gadgetId: WorkpieceId, title: string, bindingName: string}[],
+        createdWorktrees: {worktreeId: WorkpieceId, title: string, bindingName: string}[],
         addedBindings: {gadgetId: WorkpieceId, name: string, target: WorkpieceId}[],
+        worktreeCommits: {worktreeId: WorkpieceId, commit: string, previousHead: string}[],
       },
       totalTokens?: number, aiGatewayLogId?: string, aiGatewayLogRoute?: AiGatewayLogRoute,
       estimatedCost?: number): Promise<boolean>;
@@ -425,6 +486,41 @@ export interface AgentHooks {
       : {id: WorkpieceId, title: string};
 
   /**
+   * Create a new worktree workpiece rooted at the given commit reference (a full oid or an
+   * unambiguous prefix, resolved against the workspace's local git knowledge -- never a remote
+   * lookup), provisional to and permanently private to the given chat. Performs the initial pull
+   * when the commit is known only from a gatekeeper. Like createGadget, the creation becomes
+   * durable via the step's "changes" message (`createdWorktrees`), which also establishes the
+   * worktree's birth pin; a step that dies before its barrier leaves an unstamped record that
+   * reconciliation reaps. Returns the resolved base commit alongside the id (the input may be a
+   * prefix, and replay serves lazy base reads from it).
+   */
+  createWorktree(title: string, chatId: number, commitRef: string)
+      : Promise<{id: WorkpieceId, title: string, baseCommit: string}>;
+
+  /**
+   * Whether the workpiece is a worktree: chat-private, git-rooted, always pinned, read lazily.
+   * False for gadgets and for ids that no longer resolve.
+   */
+  isWorktree(id: WorkpieceId): boolean;
+
+  /**
+   * Read one file of a commit's tree by path, walking (and fault-pulling) only the objects along
+   * the path -- the lazy base resolver behind worktree session content. Returns undefined for an
+   * absent path; throws descriptive, agent-visible errors for a symlink or submodule path
+   * (naming the target), oversized or binary content, and pull failures.
+   */
+  readFileAtCommit(commit: string, path: string): Promise<string | undefined>;
+
+  /**
+   * Throws the same descriptive errors readFileAtCommit does when `path` names a symlink or
+   * submodule in the commit's tree -- the write side of the tree-entry modes rules. Absent
+   * paths (new files) and regular files pass, including ones whose content is unreadable
+   * (a whole-file write is coherent against any base).
+   */
+  assertWorktreePathWritable(commit: string, path: string): Promise<void>;
+
+  /**
    * Describe a workpiece (a gadget or a gatekeeper) reachable as `envName` in the chat's env,
    * for the agent's describeBinding tool. (`envName` is provided here only so that it can be
    * incorporated into the returned description.)
@@ -450,10 +546,16 @@ export interface AgentHooks {
    */
   prepareChatBindings(chatId: number, chatMessages: AiChatMessage[]): Promise<SeedBindingInfo[]>;
 
+  /**
+   * Run one executeCode tool call. `worktreeTurn` is the turn's worktree state (see
+   * WorktreeTurnAccess): the overseer registers it for the duration of the execution so the
+   * chat's worktree env bindings can resolve against the running turn.
+   */
   executeCodeMode(chatId: number, code: string,
                    initiator: AiChatAuthorInfo, initiatorModelId: string,
                    bindings: Record<string, ChatBindingEntry>,
-                   onOutputText?: (delta: string) => void): Promise<string>;
+                   onOutputText?: (delta: string) => void,
+                   worktreeTurn?: WorktreeTurnAccess): Promise<string>;
   activeAgentCallbackCount(chatId: number): number;
   rejectAllAgentCallbacks(chatId: number, error: string): void;
   consumeCapturedActions(chatId: number)
@@ -797,6 +899,14 @@ Use this when the workspace has no gadgets yet, or when the user asks for an add
 By default the new gadget is empty. Pass \`blueprintId\` (discovered with the \`listBlueprints\` tool, or given by the user) to instead start the gadget from a blueprint's code; the result then also describes the bindings the blueprint expects you to wire up.
 `.trim();
 
+let CREATE_WORKTREE_TOOL_DESCRIPTION = `
+Create a worktree: a file tree rooted at a git commit, which you can then read and edit with the regular file tools (\`readFile\`, \`writeFile\`, \`editFile\`) by passing the \`bindingName\` you choose as their \`workpiece\` parameter. Unlike a gadget, a worktree has no runnable code of its own and is private to this conversation.
+
+\`commitId\` is a git commit id (a full 40-hex SHA-1, or an unambiguous prefix) already known to this workspace — typically one returned by a connection's API (e.g. a repository's branch or commit listing). Look the commit up through the connection first if you only know a branch or tag name.
+
+In \`executeCode\`, the worktree's env binding additionally offers a programmatic API — \`listFiles\`, \`grep\`, \`commit\` (write a git commit of the worktree's content), \`diff\`, and more; use \`describeBinding\` to see it.
+`.trim();
+
 let LIST_BLUEPRINTS_TOOL_DESCRIPTION = `
 List the blueprints available to the user: their own published blueprints, their blueprint library, and this deployment's featured blueprints. A blueprint is a shareable snapshot of a Gadget's code; instantiate one as a new Gadget by passing its \`blueprintId\` to \`createGadget\`. There is no search — read the list and pick the best match yourself.
 `.trim();
@@ -1059,9 +1169,90 @@ export async function runAgent(
   // reconciliation reaps (see reconcilePendingGadgets in overseer.ts).
   let pendingCreatedGadgets: {gadgetId: WorkpieceId, title: string, bindingName: string}[] = [];
 
+  // Worktrees created this step (see the createWorktree tool), awaiting the same barrier: its
+  // "changes" message records each creation (`createdWorktrees`), sequence-stamps the pending
+  // record, and establishes the worktree's birth pin.
+  let pendingCreatedWorktrees: {worktreeId: WorkpieceId, title: string, bindingName: string}[] =
+      [];
+
   // Binding edges added this step (via the setGadgetBinding tool), likewise awaiting the
   // barrier's "changes" message (see `addedBindings`), which sequence-stamps the pending edge.
   let pendingAddedBindings: {gadgetId: WorkpieceId, name: string, target: WorkpieceId}[] = [];
+
+  // The pinned base commit of every worktree in the session, keyed by worktree id: recorded by
+  // createWorktree (live and replay) and by pin establishment, and consulted by the worktree
+  // read paths -- a worktree's session content holds only touched/read files, and a path absent
+  // from it is resolved lazily against this base (hooks.readFileAtCommit). Cleared with the
+  // pins at an epoch boundary and immediately re-established from the merge message's
+  // `worktreePins` -- the epoch reset auto-commits dirty worktrees and re-pins at the result,
+  // so content carries across an accept (see mergeChanges in overseer.ts).
+  let worktreePinBases = new Map<WorkpieceId, string>();
+
+  // Worktree paths whose latest change-stream entry is a `remove`. A worktree's session content
+  // holds only touched paths, so a removed path and a never-touched one are both absent from the
+  // map -- but only the latter may resolve against the base commit. Without this, a removed file
+  // would silently resurrect on the next read (fault-from-base). Maintained by
+  // noteWorktreeRemovals wherever changes apply to the session content; consulted only by the
+  // live read paths (readWorktreeBase), never by replay seeding (see seedWorktreeBasesForChange).
+  let worktreeRemovedPaths = new Map<WorkpieceId, Set<string>>();
+
+  // Records a change's worktree removals (and un-records paths it re-creates); see
+  // worktreeRemovedPaths.
+  let noteWorktreeRemovals = (change: CodeChange) => {
+    for (let [key, entries] of Object.entries(change)) {
+      let worktreeId = Number(key);
+      if (!worktreePinBases.has(worktreeId)) continue;
+      for (let [path, fileChange] of entries) {
+        if ("remove" in fileChange) {
+          let removed = worktreeRemovedPaths.get(worktreeId);
+          if (removed === undefined) worktreeRemovedPaths.set(worktreeId, removed = new Set());
+          removed.add(path);
+        } else {
+          worktreeRemovedPaths.get(worktreeId)?.delete(path);
+        }
+      }
+    }
+  };
+
+  // Lazily reads a worktree file's base text into the session content, so later edits (and
+  // replayed changes) apply against it exactly as if the base tree had been materialized.
+  // Returns undefined for a path absent from the base; throws readFileAtCommit's descriptive
+  // errors (symlink/submodule/oversized/binary/pull failure). No-ops for unpinned worktrees.
+  let faultWorktreeBase = async (worktreeId: WorkpieceId, filename: string)
+      : Promise<string | undefined> => {
+    let base = worktreePinBases.get(worktreeId);
+    if (base === undefined || !pinnedGadgets.has(worktreeId)) return undefined;
+    let text = await hooks.readFileAtCommit(base, filename);
+    if (text === undefined) return undefined;
+    sessionContent = new Map(sessionContent);
+    let files = new Map(sessionContent.get(worktreeId));
+    files.set(filename, text);
+    sessionContent.set(worktreeId, files);
+    return text;
+  };
+
+  // The live-read variant of faultWorktreeBase: a path the chat's change stream has removed
+  // reports absent instead of resurrecting from the base. Only the tool-facing reads use this;
+  // replay seeding deliberately does not (see seedWorktreeBasesForChange).
+  let readWorktreeBase = async (worktreeId: WorkpieceId, filename: string)
+      : Promise<string | undefined> =>
+      worktreeRemovedPaths.get(worktreeId)?.has(filename)
+          ? undefined : await faultWorktreeBase(worktreeId, filename);
+
+  // Seeds the base texts a change's worktree edits need before it applies to the session
+  // content -- the agent-side mirror of the overseer's seedWorktreeEditBases, and deliberately
+  // the same rule (including its edit-after-remove re-seed quirk, hence faultWorktreeBase with
+  // no tombstone check), so replay reconstructs byte-identical content.
+  let seedWorktreeBasesForChange = async (change: CodeChange) => {
+    for (let [key, entries] of Object.entries(change)) {
+      let worktreeId = Number(key);
+      if (!worktreePinBases.has(worktreeId)) continue;
+      for (let [path, fileChange] of entries) {
+        if (!("edit" in fileChange) || sessionContent.get(worktreeId)?.has(path)) continue;
+        await faultWorktreeBase(worktreeId, path);
+      }
+    }
+  };
 
   // The chat's binding map: what each name in the agent's executeCode `env` resolves to. Starts
   // from the seed layer (see AgentHooks.prepareChatBindings) and accumulates chat-local entries
@@ -1096,6 +1287,7 @@ export async function runAgent(
   let applyReplayedChange = (change: CodeChange, includeDiff: boolean): string | undefined => {
     let before = sessionContent;
     sessionContent = applyCodeChange(sessionContent, change);
+    noteWorktreeRemovals(change);
     if (!includeDiff) return;
 
     let diffParts: string[] = [];
@@ -1228,6 +1420,8 @@ export async function runAgent(
                                  mergeCommits?: Map<WorkpieceId, string>) => {
     sessionContent = new Map();
     pinnedGadgets.clear();
+    worktreePinBases.clear();
+    worktreeRemovedPaths.clear();
     pendingReplayEdits = [];
     let survivors = new Map<WorkpieceId, Map<string, string | undefined>>();
     for (let [workpieceId, files] of filesRead) {
@@ -1250,6 +1444,19 @@ export async function runAgent(
   // pinned. Idempotent: commits are immutable, so re-establishing the same base is harmless --
   // which is what lets ensureReplayContentForWrite below establish a base *early*.
   let applyReplayedPin = async (pin: ChatGadgetPin) => {
+    if (hooks.isWorktree(pin.gadgetId)) {
+      // A worktree's base is a whole repository tree, so it is never materialized: the entry
+      // holds only touched/read files, resolved lazily against the pinned base (accumulated
+      // content is kept on re-establishment -- it is all base-derived or change-applied, so
+      // re-faulting would reproduce it).
+      worktreePinBases.set(pin.gadgetId, pin.baseCommit);
+      if (!sessionContent.has(pin.gadgetId)) {
+        sessionContent = new Map(sessionContent);
+        sessionContent.set(pin.gadgetId, new Map());
+      }
+      pinnedGadgets.add(pin.gadgetId);
+      return;
+    }
     let files = await hooks.readCommitFiles(pin.baseCommit);
     sessionContent = new Map(sessionContent);
     sessionContent.set(pin.gadgetId, files);
@@ -1362,7 +1569,10 @@ export async function runAgent(
   for (let pin of checkpoint?.pins ?? []) {
     await applyReplayedPin(pin);
   }
-  if (checkpoint?.proposedChange) applyReplayedChange(checkpoint.proposedChange, false);
+  if (checkpoint?.proposedChange) {
+    await seedWorktreeBasesForChange(checkpoint.proposedChange);
+    applyReplayedChange(checkpoint.proposedChange, false);
+  }
 
   for (let msg of chatMessages) {
     let modelMessageStart = modelMessages.length;
@@ -1583,9 +1793,11 @@ export async function runAgent(
                     // in the same step are applied to the file's text here: the content map
                     // advances only when the step's "changes" message's change applies, so
                     // reads between an edit and that message replay the edits against the
-                    // string.
+                    // string. Worktree paths absent from the (lazy) session content resolve
+                    // against the pinned base, exactly as the live tool resolves them.
                     let value: string | null =
-                        sessionContent.get(workpieceId)?.get(toolCall.input.filename) ?? null;
+                        sessionContent.get(workpieceId)?.get(toolCall.input.filename) ??
+                        await faultWorktreeBase(workpieceId, toolCall.input.filename) ?? null;
                     for (let edit of pendingReplayEdits) {
                       if (edit.workpieceId === workpieceId &&
                           edit.filename === toolCall.input.filename) {
@@ -1672,6 +1884,25 @@ export async function runAgent(
                   toolOutput = {text: jsonToolResultText(toolCall.output)};
                   break;
                 }
+                case "createWorktree": {
+                  // Like createGadget: a creation tool can't re-run, so replay returns the
+                  // recorded result. The worktree is pinned from birth; the recorded baseCommit
+                  // (not the input, which may be a prefix) serves lazy base reads until the
+                  // step's own "changes" message re-establishes the pin from the log.
+                  if (toolCall.output === undefined) {
+                    throw new Error("createWorktree tool call in log is missing its result");
+                  }
+                  chatBindings.set(toolCall.input.bindingName,
+                      {type: "workpiece", id: toolCall.output.worktreeId});
+                  worktreePinBases.set(toolCall.output.worktreeId, toolCall.output.baseCommit);
+                  pinnedGadgets.add(toolCall.output.worktreeId);
+                  if (!sessionContent.has(toolCall.output.worktreeId)) {
+                    sessionContent = new Map(sessionContent);
+                    sessionContent.set(toolCall.output.worktreeId, new Map());
+                  }
+                  toolOutput = {text: jsonToolResultText(toolCall.output)};
+                  break;
+                }
                 case "executeCode":
                   toolOutput = {text: toolCall.output!};
                   break;
@@ -1742,6 +1973,14 @@ export async function runAgent(
             chatBindings.set(bindingName, {type: "workpiece", id: gadgetId});
           }
         }
+        // Likewise worktree creations (always agent-made, so normally a no-op after the
+        // createWorktree tool-call replay -- but a compaction boundary can swallow the call
+        // while this message survives).
+        for (let {worktreeId, bindingName} of msg.createdWorktrees ?? []) {
+          if (!chatBindings.has(bindingName)) {
+            chatBindings.set(bindingName, {type: "workpiece", id: worktreeId});
+          }
+        }
 
         // A migrated chat's conversion boundary acts as an epoch boundary that re-seeds at
         // (pin bases + this change): everything before it is text-only history whose code payloads
@@ -1764,6 +2003,7 @@ export async function runAgent(
           // are still surfaced as observations below. A conversion boundary's change is not user
           // activity -- it re-records content from before the boundary, which the model already
           // saw (or wrote) -- so it applies without an observation.
+          if (msg.change !== undefined) await seedWorktreeBasesForChange(msg.change);
           let diff = msg.change !== undefined
               ? applyReplayedChange(
                   msg.change, msg.author.type === "user" && !msg.conversionBoundary)
@@ -1829,10 +2069,22 @@ export async function runAgent(
       case "merge":
         // Nothing to tell the agent, but a boundary merge closed the chat's epoch: the session
         // content restarts empty, later pins re-seed lazily, and read-before-edit knowledge
-        // re-anchors to the merge's commits (see resetSessionEpoch).
+        // re-anchors to the merge's commits (see resetSessionEpoch) -- for a worktree, to its
+        // re-pin base, whose tree is by construction the chat's content at the reset, so
+        // session-served worktree reads survive the boundary byte-accurately.
         if (msg.epochBoundary) {
-          await resetSessionEpoch(msg.sequence,
-              new Map(msg.commits.map(c => [c.gadgetId, c.commitId])));
+          await resetSessionEpoch(msg.sequence, new Map<WorkpieceId, string>([
+            ...msg.commits.map(c => [c.gadgetId, c.commitId] as const),
+            ...(msg.worktreePins ?? []).map(p => [p.worktreeId, p.baseCommit] as const),
+          ]));
+          // Worktree pins re-establish immediately from the merge message (the durable record
+          // of the epoch reset's re-pins; see AiChatMessageBody.worktreePins) rather than
+          // lazily -- worktrees have no mainline head for a later write to re-pin against.
+          for (let pin of msg.worktreePins ?? []) {
+            if (hooks.isWorktree(pin.worktreeId)) {
+              await applyReplayedPin({gadgetId: pin.worktreeId, baseCommit: pin.baseCommit});
+            }
+          }
         }
         break;
 
@@ -2040,6 +2292,36 @@ export async function runAgent(
     stepBuffer.bytes += size;
     if (pin !== undefined) pinnedGadgets.add(workpieceId);
     sessionContent = newContent;
+    noteWorktreeRemovals(change);
+  };
+
+  // commit() head advancements buffered this step (see WorktreeTurnAccess.appendCommit),
+  // drained into the barrier's `worktreeCommits` alongside the change buffer: an advancement is
+  // durable iff the executeCode call that made it is, and an aborted or crashed step simply
+  // drops it (the commit objects it named stay -- dangling and harmless).
+  let pendingWorktreeCommits:
+      {worktreeId: WorkpieceId, commit: string, previousHead: string}[] = [];
+
+  // The Worktree binding's view of this turn (see the interface doc): closures over the same
+  // session state the file tools use, so binding operations and tool operations see one
+  // consistent worktree. Passed to executeCodeMode, which serves it to the chat's worktree env
+  // bindings for the duration of each execution.
+  let worktreeTurnAccess: WorktreeTurnAccess = {
+    getPinBase: id => pinnedGadgets.has(id) ? worktreePinBases.get(id) : undefined,
+    getBufferedHead: id =>
+        pendingWorktreeCommits.findLast(entry => entry.worktreeId === id)?.commit,
+    getOverlayFiles: id => sessionContent.get(id) ?? new Map(),
+    getRemovedPaths: id => worktreeRemovedPaths.get(id) ?? new Set(),
+    readFile: async (id, path) =>
+        sessionContent.get(id)?.get(path) ?? await readWorktreeBase(id, path),
+    appendChange: (id, path, change) => {
+      appendAgentEdit(id, {[id]: [[path, change]]});
+      // A write leaves the caller knowing the file's exact content, so it counts as a read for
+      // editFile's gate, exactly as the writeFile tool records its own writes.
+      if (!("remove" in change)) markFileRead(id, path);
+    },
+    appendCommit: (id, commit, previousHead) =>
+        pendingWorktreeCommits.push({worktreeId: id, commit, previousHead}),
   };
 
   let agentContext = hooks.getChatAgentContext(chatId);
@@ -2048,7 +2330,16 @@ export async function runAgent(
   };
   let codePreviewManager = new CodePreviewManager(
       emitStreamEvent,
-      workpiece => hooks.resolveWorkpieceRoot(resolveToolWorkpieceId(workpiece), true, chatId));
+      workpiece => {
+        let resolved = hooks.resolveWorkpieceRoot(resolveToolWorkpieceId(workpiece), true, chatId);
+        if (hooks.isWorktree(resolved.workpieceId)) {
+          // Worktree content never reaches clients (it is stripped from every delivery), so a
+          // streamed edit preview must not carry it either; an unresolvable target shows no
+          // preview (see CodePreviewManager).
+          throw new Error("worktree edits are not previewed");
+        }
+        return resolved;
+      });
   let executeCodeStreamManager = new ExecuteCodeStreamManager(emitStreamEvent);
 
   // Deployment-wide admin instructions, appended to the static system slot (slot 0) so they stay
@@ -2333,7 +2624,11 @@ export async function runAgent(
             }
           }
 
-          let text = sessionContent.get(resolved.workpieceId)?.get(filename);
+          // Worktree session content is lazy: a path not yet touched or read resolves against
+          // the pinned base commit (with descriptive errors for symlinks, submodules, and
+          // oversized or binary content). A removed path stays removed (readWorktreeBase).
+          let text = sessionContent.get(resolved.workpieceId)?.get(filename) ??
+              await readWorktreeBase(resolved.workpieceId, filename);
           if (text === undefined) {
             throw new Error("File does not exist.");
           }
@@ -2362,9 +2657,22 @@ export async function runAgent(
           let resolved =
               hooks.resolveWorkpieceRoot(resolveToolWorkpieceId(workpiece), true, chatId);
 
+          // Writing over a worktree's symlink or submodule entry is rejected with the same
+          // descriptive error reading one gets, and a base *directory* path too -- such a
+          // write could never commit (a whole-file write needs no readable *content*, so this
+          // is the one base check the set path makes). A removed path is a new file: the base
+          // entry it displaced is already gone, so no check applies.
+          let worktreeBase = worktreePinBases.get(resolved.workpieceId);
+          if (worktreeBase !== undefined && pinnedGadgets.has(resolved.workpieceId) &&
+              !sessionContent.get(resolved.workpieceId)?.has(filename) &&
+              !worktreeRemovedPaths.get(resolved.workpieceId)?.has(filename)) {
+            await hooks.assertWorktreePathWritable(worktreeBase, filename);
+          }
+
           // The first write to an unpinned gadget with committed code pins it at the current
           // head (a whole-file overwrite is coherent against any base, so no read gate here).
           // Gadgets with no committed code stay unpinned; their content builds up from changes.
+          // (Worktrees never take this branch: they are pinned from birth.)
           let pin: {baseCommit: string, baseFiles: Map<string, string>} | undefined;
           if (!pinnedGadgets.has(resolved.workpieceId)) {
             let head = hooks.getGadgetHead(resolved.workpieceId);
@@ -2445,7 +2753,8 @@ export async function runAgent(
           // textToReplace with, so the change reports only the text that actually changed.
           let before = pin !== undefined
               ? pin.baseFiles.get(filename)
-              : sessionContent.get(resolved.workpieceId)?.get(filename);
+              : sessionContent.get(resolved.workpieceId)?.get(filename) ??
+                await readWorktreeBase(resolved.workpieceId, filename);
           if (before === undefined) {
             throw new Error("File does not exist.");
           }
@@ -2703,6 +3012,66 @@ export async function runAgent(
       }
     }),
 
+    createWorktree: defineTool({
+      name: "createWorktree",
+      label: "Create worktree",
+      description: CREATE_WORKTREE_TOOL_DESCRIPTION,
+      parameters: Type.Object({
+        title: Type.String({
+          description:
+              "Short, descriptive, human-readable title for the new worktree. Shown to the user.",
+        }),
+        bindingName: Type.String({
+          description:
+              "Name under which the new worktree appears in your env, and how the file tools " +
+              "refer to it (their `workpiece` parameter). Must be a JavaScript identifier not " +
+              "already in use; style: ALL_CAPS_WITH_UNDERSCORES.",
+        }),
+        commitId: Type.String({
+          description:
+              "The git commit to root the worktree at: a full 40-hex SHA-1, or an unambiguous " +
+              "prefix of at least 4 hex digits.",
+        }),
+      }),
+      execute: async (toolCallId, {title, bindingName, commitId}) => {
+        try {
+          validateBindingName(bindingName);
+          if (isNameInScope(bindingName)) {
+            throw new Error(`There is already a binding named "${bindingName}" in your env. ` +
+                `Choose a different name.`);
+          }
+
+          // Like createGadget: the registry record (chat-private) is created immediately -- this
+          // is also where the commit reference resolves and, for gatekeeper-known commits, the
+          // initial pull happens -- but the creation is *recorded* (and the record
+          // sequence-stamped, and the birth pin established) by the step's "changes" message at
+          // the barrier. A step that dies first leaves an unstamped orphan for reconciliation.
+          let created = await hooks.createWorktree(title, chatId, commitId);
+          pendingCreatedWorktrees.push(
+              {worktreeId: created.id, title: created.title, bindingName});
+          chatBindings.set(bindingName, {type: "workpiece", id: created.id});
+
+          // The worktree is born pinned at its base; session reads resolve lazily against it.
+          worktreePinBases.set(created.id, created.baseCommit);
+          pinnedGadgets.add(created.id);
+          sessionContent = new Map(sessionContent);
+          sessionContent.set(created.id, new Map());
+
+          // Report the batch's change ID like the other creation/edit tools, and the resolved
+          // full commit id (the input may have been a prefix). Recorded as the tool's output for
+          // replay, which can't re-run a creation (see the replay path above).
+          let output = {worktreeId: created.id, changeId: nextChangeId,
+                        baseCommit: created.baseCommit};
+          return toolResult(jsonToolResultText(output), {output} as Partial<AiToolCall>);
+        } catch (error) {
+          toolCallNotes.set(toolCallId, {
+            error: toolErrorText(error)
+          });
+          throw error;
+        }
+      }
+    }),
+
     listBlueprints: defineTool({
       name: "listBlueprints",
       label: "List blueprints",
@@ -2760,7 +3129,8 @@ export async function runAgent(
                 type: "toolOutputDelta",
                 toolCallId,
                 delta,
-              }));
+              }),
+              worktreeTurnAccess);
           return toolResult(`${output}`, {output: `${output}`} as Partial<AiToolCall>);
         } catch (error) {
           toolCallNotes.set(toolCallId, {
@@ -3063,10 +3433,15 @@ export async function runAgent(
         stepBuffer.bytes = 0;
         let createdGadgets = pendingCreatedGadgets;
         pendingCreatedGadgets = [];
+        let createdWorktrees = pendingCreatedWorktrees;
+        pendingCreatedWorktrees = [];
         let addedBindings = pendingAddedBindings;
         pendingAddedBindings = [];
+        let worktreeCommits = pendingWorktreeCommits;
+        pendingWorktreeCommits = [];
         if (await hooks.commitAgentStep(chatId, author, msgs,
-            {changes: stepChanges, createdGadgets, addedBindings},
+            {changes: stepChanges, createdGadgets, createdWorktrees, addedBindings,
+             worktreeCommits},
             message.usage.totalTokens, handle.lastResponse?.aiGatewayLogId,
             handle.aiGatewayLogRoute, message.usage.cost.total)) {
           ++nextChangeId;
@@ -3143,7 +3518,12 @@ export async function runAgent(
   return undefined;
 }
 
-function formatUnifiedDiff(
+/**
+ * Renders one file's before/after as a git-style unified diff (headers only, `a/`\/`b/`
+ * prefixes, `/dev/null` for a missing side). Shared by the replay path's user-change
+ * observations and the Worktree binding's diff().
+ */
+export function formatUnifiedDiff(
     filename: string,
     oldContent: string,
     newContent: string,

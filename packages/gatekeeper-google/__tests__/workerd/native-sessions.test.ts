@@ -1,6 +1,7 @@
 import { RpcStub, RpcTarget } from "cloudflare:workers";
 import type {
-  ActionDescription, ApprovalQueue, HookController, HookDescription, ObservationDescription,
+  ActionDescription, ApprovalQueue, GitCache, HookController, HookDescription,
+  ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GoogleDocsApi } from "../../src/docs-api";
@@ -21,6 +22,10 @@ class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
 
   async authorizeObservation(description: ObservationDescription): Promise<void> {
     this.observations.push(description);
+  }
+
+  async getGitCache(): Promise<GitCache> {
+    throw new Error("Unexpected git cache access");
   }
 
   async submitAction(_action: number, _description: ActionDescription): Promise<void> {

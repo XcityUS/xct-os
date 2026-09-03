@@ -3,6 +3,7 @@ import { GmailForwardSnapshotStore } from "../../src/gmail-state";
 import { GmailGatekeeperImpl, type GmailGatekeeperImplProps } from "../../src/gmail";
 import { UserAccount } from "../../src/google";
 import type {ActionKind} from "@gadgets/workshop-shared/gatekeeper";
+import {TestGitCache} from "../test-git-cache";
 import type {
   GmailComposeOptions, GmailDraftInput, GmailDraftPatch, GmailMessage, GmailReplyOptions,
   GmailSession,
@@ -173,7 +174,15 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
       facetName: string, id: string, props: GmailGatekeeperImplProps,
       actionId: number,
   ): Promise<void> {
-    await this.#gatekeeper(facetName, id, props).applyAction(actionId);
+    // The overseer always passes an action-scoped git cache with the apply call, and the
+    // validator (sharpened by the `Gatekeeper` interface) requires it even though Gmail's
+    // `applyAction()` omits the parameter, so the test passes a stand-in the same way.
+    const cache = new RpcStub(new TestGitCache());
+    try {
+      await this.#gatekeeper(facetName, id, props).applyAction(actionId, cache);
+    } finally {
+      cache[Symbol.dispose]();
+    }
   }
 
   async getAutoApprovableActions(
@@ -401,7 +410,12 @@ testGmailPrototype.runTestOperation = async function(
     return await withMessage(session, id as string, async message => {
       const before = await message.getMetadata();
       await message.markRead();
-      await this.applyAction(value as number);
+      const cache = new RpcStub(new TestGitCache());
+      try {
+        await this.applyAction(value as number, cache);
+      } finally {
+        cache[Symbol.dispose]();
+      }
       return {before, after: await message.getMetadata()};
     });
   case "message.thread":

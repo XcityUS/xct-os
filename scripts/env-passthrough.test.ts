@@ -212,8 +212,11 @@ describe("build-time env passthrough", () => {
 
   it("declares every forwarded variable on the task that reads it", () => {
     for (const [area, groups] of Object.entries(EXPECTED)) {
-      // `scripts/` holds no package config; its one forwarded read is pinned by
-      // build-gatekeeper-configurator.test.ts against the shared task's `env`.
+      // `scripts/` has a `vite.config.ts`, but its only task is `test`. The forwarded read here is
+      // `build-gatekeeper-configurator.ts`'s, and the task that runs *that* is the gatekeepers'
+      // `build:configurator` -- which is the only place the `env` declaration would do anything. So
+      // there is nothing for `declarationsIn` to find on this side, and the declaration is pinned by
+      // build-gatekeeper-configurator.test.ts against the shared task's `env` instead.
       if (area === "scripts") continue;
       const { patterns } = declarationsIn(area);
       for (const name of groups.forwarded ?? []) {

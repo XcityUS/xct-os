@@ -1,3 +1,5 @@
+/** Observer-policy strategies and per-read authorization. */
+
 import type { RpcStub } from "cloudflare:workers";
 import type {
   ApprovalQueue,
@@ -144,7 +146,26 @@ export type ObservationScope =
 /** Observation text completed by the gate with derived exclusions. */
 export type ObservationInput = Omit<ObservationDescription, "excludeObservers">;
 
-/** Authorizes observations after applying the selected observer strategy. */
+/** The queue surface a session stages actions through; observations go only through the gate. */
+export type ActionQueue = Pick<RpcStub<ApprovalQueue>, "submitAction" | "bindHook">;
+
+/**
+ * Authorizes observations after applying the selected observer strategy.
+ *
+ * @example
+ * ```ts
+ * #observations = new ObservationGate(queue.dup(), observerStrategy);
+ *
+ * async listProjects() {
+ *   const projects = await this.#api.listProjects();
+ *   await this.#observations.authorize(
+ *     describeProjects(projects),
+ *     { kind: "sets", ids: projects.map(project => project.id) },
+ *   );
+ *   return projects;
+ * }
+ * ```
+ */
 export class ObservationGate implements Disposable {
   readonly #queue: RpcStub<ApprovalQueue>;
   readonly #strategy: ObserverStrategy;
@@ -159,7 +180,20 @@ export class ObservationGate implements Disposable {
     this.#strategy = strategy;
   }
 
-  /** Releases the duplicated approval-queue stub. */
+  /**
+   * Shares the gate's stub for staging actions, so a session holds one dup for observations and
+   * actions alike. Narrowed to the action surface: a raw `authorizeObservation` would skip the
+   * strategy's exclusions, so observations go only through `authorize()`.
+   * @returns The action surface of the queue, borrowed: the gate keeps ownership, never dispose it.
+   */
+  get actions(): ActionQueue {
+    return this.#queue;
+  }
+
+  /**
+   * Releases the duplicated approval-queue stub. Disposing during isolate shutdown trips a fatal
+   * workerd assertion; shipped gatekeepers leave the release to RPC connection teardown.
+   */
   [Symbol.dispose](): void {
     this.#queue[Symbol.dispose]();
   }

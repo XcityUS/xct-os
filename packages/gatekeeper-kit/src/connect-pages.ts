@@ -1,3 +1,5 @@
+/** Hardened HTML and browser request guards for gatekeeper connect flows. */
+
 const HTML_ESCAPES: Readonly<Record<string, string>> = {
   "&": "&amp;",
   "<": "&lt;",
@@ -46,16 +48,27 @@ function mediaType(value: string | null): string {
 }
 
 /**
- * Classifies a browser mutation request.
+ * Classifies a browser mutation request. The expected origin is explicit rather than derived from
+ * `req.url`, which a fronting proxy may rewrite; the browser's `Origin` names the configured base
+ * URL the form was served under.
  * @param req Mutation request.
- * @param options Expected media type.
+ * @param options Expected origin (a base URL is accepted) and media type.
  * @returns An error code, or `undefined` when accepted.
+ *
+ * @example
+ * ```ts
+ * const error = connectMutationError(req, { origin: baseUrl, contentType: "application/json" });
+ * if (error) {
+ *   const status = error === "cross-origin" ? 403 : 415;
+ *   return htmlResponse(errorPageHtml("Connection failed", "Start again."), status);
+ * }
+ * ```
  */
 export function connectMutationError(
   req: Request,
-  options: { contentType: string },
+  options: { origin: string; contentType: string },
 ): "cross-origin" | "unsupported-content-type" | undefined {
-  if (req.headers.get("origin") !== new URL(req.url).origin) return "cross-origin";
+  if (req.headers.get("origin") !== new URL(options.origin).origin) return "cross-origin";
   if (mediaType(req.headers.get("content-type")) !== mediaType(options.contentType)) {
     return "unsupported-content-type";
   }

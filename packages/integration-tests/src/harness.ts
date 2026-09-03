@@ -81,6 +81,12 @@ function readWorkerConfig(dir: string): WorkerConfig {
   const config = parsed.data;
   config.build = { ...config.build, cwd: dir };
   config.main = join(dir, config.main);
+
+  // Local-dev var files (.dev.vars/.env at the harness root) must not leak into tests: a
+  // developer's local settings (say CF_AI_GATEWAY_*) would make suites behave differently on
+  // their machine than in CI -- up to sending real AI traffic. Declaring an empty required-secrets
+  // list makes wrangler exclude every such key that is not already a config var.
+  config.secrets = { required: [] };
   return config;
 }
 
@@ -161,6 +167,25 @@ export async function startHarness(opts: {
     url,
     fetchWorker: (name, ...args) => server.getWorker(name).fetch(...args),
   };
+}
+
+/**
+ * How long to wait for a scheduled workspace restart to land (scheduleAccessRestart's delay plus
+ * slack). See settleRestart().
+ */
+export const RESTART_SETTLE_MS = 400;
+
+/**
+ * Wait out a restart a test triggered but doesn't otherwise observe.
+ *
+ * Widening a collaborator's verification scope severs every session on the workspace by aborting
+ * the DO ~100ms later, i.e. after the test body has returned. An abort that lands with no client
+ * left on the workspace crashes the local workerd, and a suite's tests share one harness, so the
+ * crash fails whichever siblings are mid-flight rather than the test that caused it. Call this
+ * before the triggering test drops its connection.
+ */
+export function settleRestart(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, RESTART_SETTLE_MS));
 }
 
 /** Boot the Workshop with only the bundled fixture gatekeeper bound. */

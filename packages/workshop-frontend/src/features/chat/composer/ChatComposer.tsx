@@ -651,6 +651,10 @@ export const ChatComposer = ({
       kind: "command" as const,
       start: selectedSlashCommand.start,
       length: selectedSlashCommand.length,
+      label: selectedSlashCommand.choice.name,
+      description: selectedSlashCommand.choice.description,
+      providerLabel: selectedSlashCommand.choice.providerLabel,
+      resourceLabel: selectedSlashCommand.choice.resourceLabel,
     }] : []),
     ...formatTokens.map(({start, length, logo}) => ({
       kind: "capsule" as const,

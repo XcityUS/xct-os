@@ -54,6 +54,9 @@ const EXPECTED: Record<string, ExpectedArea> = {
   "packages/workshop-frontend": {
     forwarded: [
       "VITE_BACKEND_HOST",
+      "VITE_BUILD_COMMIT",
+      "VITE_BUILD_DATE",
+      "VITE_BUILD_NUMBER",
       "VITE_CF_ACCESS_MODE",
       "VITE_DEV_AUTO_LOGIN",
       "VITE_DEV_PASSWORD",

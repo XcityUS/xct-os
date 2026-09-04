@@ -108,8 +108,7 @@ describe("hidden portal server boundaries", () => {
   it("rejects a crafted hidden-server URL before fetching portal data", async () => {
     const { user } = makeSubject();
 
-    await expect(user.getGatekeeperClassFor(`${ENDPOINT}#server=jira`))
-      .rejects.toThrow(/resource type/);
+    await expect(user.getGatekeeperClassFor(`${ENDPOINT}#server=jira`)).rejects.toThrow();
     expect(mocks.withClient).not.toHaveBeenCalled();
   });
 

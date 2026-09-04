@@ -106,8 +106,15 @@ const PORTAL_COLOR = "#f6821f";
 // ---------------------------------------------------------------------------
 // Helpers
 
-function getBaseUrl(env: Env): string {
-  return stripTrailingSlashes(env.BASE_URL ?? "http://localhost:8787/gatekeeper/mcp-portal");
+export function getBaseUrl(env: Env): string {
+  const baseUrl = env.BASE_URL?.trim();
+  if (!baseUrl) {
+    throw new Error(
+      "gatekeeper-mcp-portal is missing BASE_URL. Set it to the public route, " +
+        "for example https://<origin>/gatekeeper/mcp-portal.",
+    );
+  }
+  return stripTrailingSlashes(baseUrl);
 }
 
 async function listPortalServers(

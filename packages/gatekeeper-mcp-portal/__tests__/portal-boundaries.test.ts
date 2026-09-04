@@ -15,7 +15,7 @@ vi.mock("@gadgets/mcp-shared/connection", async importOriginal => ({
   withClient: mocks.withClient,
 }));
 
-import { GatekeeperUserImpl, McpGatekeeperImpl } from "../src/portal.js";
+import { GatekeeperUserImpl, McpGatekeeperImpl, getBaseUrl } from "../src/portal.js";
 
 const ENDPOINT = "https://gw.example.com/mcp";
 
@@ -81,6 +81,12 @@ beforeEach(() => {
   mocks.withClient.mockReset();
 });
 
+describe("portal base URL", () => {
+  it("does not fall back to localhost when BASE_URL is missing", async () => {
+    expect(() => getBaseUrl({} as never)).toThrow(/missing BASE_URL/);
+  });
+});
+
 describe("hidden portal server boundaries", () => {
   it("removes hidden servers from the configurator RPC result", async () => {
     const { user } = makeSubject();
@@ -103,7 +109,7 @@ describe("hidden portal server boundaries", () => {
     const { user } = makeSubject();
 
     await expect(user.getGatekeeperClassFor(`${ENDPOINT}#server=jira`))
-      .rejects.toThrow(/native connector/);
+      .rejects.toThrow(/resource type/);
     expect(mocks.withClient).not.toHaveBeenCalled();
   });
 

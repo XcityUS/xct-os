@@ -843,6 +843,10 @@ export default {
     // the GatekeeperVendor entrypoint, which has no fetch handler, so forwarding uses a dedicated
     // `GATEKEEPER_<NAME>_HTTP` binding to the gatekeeper's default entrypoint. Deployments with a
     // real router simply don't configure the _HTTP bindings and this never matches.
+    //
+    // Vendor discovery scans the same `GATEKEEPER_` prefix, so it excludes the `_HTTP` suffix to
+    // avoid registering these forwarding targets as gatekeeper vendors; if this naming convention
+    // changes, update `HTTP_FORWARDING_BINDING_SUFFIX` in `auth/auth-vendors.ts` with it.
     {
       let match = /^\/gatekeeper\/([a-z0-9-]+)\//.exec(url.pathname);
       if (match) {

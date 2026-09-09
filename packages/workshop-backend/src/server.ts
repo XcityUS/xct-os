@@ -318,6 +318,10 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return this.#user.connectAccount(vendorId, resourceUrlPatterns);
   }
 
+  completeConnectHandoff(ticket: string): Promise<void> {
+    return this.#user.completeConnectHandoff(ticket);
+  }
+
   ensureAccountResources(accountId: number, resourceUrlPatterns: string[]): Promise<{url?: string}> {
     return this.#user.ensureAccountResources(accountId, resourceUrlPatterns);
   }
@@ -617,18 +621,17 @@ async function serveBlueprintScreenshot(env: Env, blueprintId: string): Promise<
   });
 }
 
-// Returned by startGatekeeperLogin(). Wraps the PendingLogin DO so the client awaits the login
+// Returned by startGatekeeperLogin(). Wraps the PendingLogin DO so the client redeems the login
 // result through a capability (this stub) rather than a guessable id — no login id is ever exposed
-// to the client. Disposing the stub (e.g. when the pop-up closes or the component unmounts) cancels
-// the in-flight wait and lets the DO be evicted.
+// to the client. The stub alone is not enough: claim() also needs the ticket the popup posts back.
 @validateRpc()
 class LoginAttemptImpl extends RpcTarget implements LoginAttempt {
   constructor(private pending: DurableObjectStub<PendingLogin>) {
     super();
   }
 
-  async wait(): Promise<string> {
-    return await this.pending.awaitResult();
+  async claim(ticket: string): Promise<string | null> {
+    return await this.pending.claim(ticket);
   }
 }
 
@@ -662,6 +665,9 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     // invocation. The client never sees its id — we hand back an `attempt` stub instead.
     const pendingId = this.ctx.exports.PendingLogin.newUniqueId();
     const pending = this.ctx.exports.PendingLogin.get(pendingId);
+    // Mark the attempt as started before the gatekeeper can deliver to it, so a foreign ticket the
+    // browser hears first is answered with null instead of expiring an attempt that is still running.
+    await pending.begin();
     const callback = this.ctx.exports.LoginConnectCallbackImpl(
         { props: { pendingId: pendingId.toString(), vendorId } });
     // For most providers, sign-in needs only minimal scopes to verify the user's email (the grant is

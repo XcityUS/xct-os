@@ -38,11 +38,17 @@ export const SERVICE_SALT = new Uint8Array([
  */
 export interface LoginAttempt extends RpcTarget {
   /**
-   * Resolves with a session token (to store and pass to `authenticate()`, same format as `login()`)
-   * once the gatekeeper popup completes, or rejects if the attempt fails or is abandoned. Safe to
-   * call immediately after `startGatekeeperLogin()`.
+   * Redeem the handoff ticket the sign-in popup posted to this window (the `ticket` of a
+   * `CONNECT_HANDOFF_MESSAGE_TYPE` message, exactly as for `AuthenticatedApi.completeConnectHandoff`)
+   * for a session token (to store and pass to `authenticate()`, same format as `login()`). Resolves
+   * null when the ticket belongs to a different attempt (a broadcast can carry another window's),
+   * including one that arrives before this attempt has finished; in either case the attempt is
+   * untouched and the caller keeps listening. Rejects if the gatekeeper
+   * reported a failure or the attempt has expired or was already claimed. Holding this stub alone
+   * never yields a token: the sign-in URL is a bearer capability, and only the browser that finished
+   * it receives the ticket.
    */
-  wait(): Promise<string>;
+  claim(ticket: string): Promise<string | null>;
 }
 
 /** Public API exposed to the internet. */
@@ -58,12 +64,13 @@ export interface PublicApi extends RpcTarget {
 
   /**
    * Begin a sign-in via an authentication gatekeeper (e.g. "google", "github", "cloudflare").
-   * Returns a `url` the client opens in a new tab (the gatekeeper's OAuth popup, which self-closes)
-   * and an `attempt` stub whose `wait()` resolves once the popup completes. The vendor must be
+   * Returns a `url` the client opens as a popup with the opener retained (unlike
+   * `AuthenticatedApi.connectAccount`, whose popup is disowned) and an `attempt` stub whose `claim()`
+   * exchanges the ticket the popup posts back for the session token. The vendor must be
    * auth-capable and allowlisted (see ServerConfig.authVendors); throws otherwise.
    *
-   * Dispose `attempt` to abandon the sign-in (e.g. the user closed the popup); this cancels the wait
-   * server-side.
+   * Dispose `attempt` to abandon the sign-in (e.g. the user closed the popup). Nothing is cancelled
+   * server-side: the browser just stops listening, and an unclaimed token expires on its own.
    */
   startGatekeeperLogin(vendorId: string): Promise<{ url: string; attempt: RpcStub<LoginAttempt> }>;
 
@@ -527,9 +534,11 @@ export interface AuthenticatedApi extends RpcTarget {
 
   /**
    * Connect this account to a specific account on a third-party service. Returns the URL which
-   * should be opened in a new tab in the user's browser to complete the authorization. When the
-   * authorization flow completes, the account will be added to the list, which can be observed
-   * through subscribeConnectedAccounts().
+   * should be opened as a popup in the user's browser to complete the authorization; the Workshop
+   * disowns the popup before navigating it (see `openConnectWindow`), so the flow's final page
+   * delivers a handoff ticket over a same-origin `BroadcastChannel` (`CONNECT_HANDOFF_MESSAGE_TYPE`),
+   * which the client redeems with completeConnectHandoff(); only then is the account added to the
+   * list, which can be observed through subscribeConnectedAccounts().
    *
    * `resourceUrlPatterns`, if given, limits the connection to the authorization needed for those
    * grantable resource types (those with `grantable`; see `SupportedResource`). If omitted,
@@ -541,9 +550,20 @@ export interface AuthenticatedApi extends RpcTarget {
   connectAccount(vendorId: string, resourceUrlPatterns?: string[]): Promise<{url: string}>;
 
   /**
+   * Redeem the handoff ticket a connect popup delivered to this window (the `ticket` of a
+   * `CONNECT_HANDOFF_MESSAGE_TYPE` message, over the broadcast channel or, where the popup kept
+   * its opener, by `postMessage`). Activates the pending connect / reconnect /
+   * ensure-resources grant if it was started by this user, after which the account (or its
+   * restored credentials) appears via subscribeConnectedAccounts(). Throws if the ticket is
+   * unknown to this user, already redeemed, or expired.
+   */
+  completeConnectHandoff(ticket: string): Promise<void>;
+
+  /**
    * Ensure the authorization for the listed grantable resource types (by `urlPattern`) is granted
-   * on a connected account, expanding if needed. Returns a URL to open in a new tab to authorize
-   * them, or no url if nothing was needed. The updated grant is observable via
+   * on a connected account, expanding if needed. Returns a URL to open as a popup (disowned, as for
+   * connectAccount()) to authorize them, or no url if nothing was needed. Completion is
+   * confirmed via completeConnectHandoff(); the updated grant is then observable via
    * subscribeConnectedAccounts().
    */
   ensureAccountResources(accountId: number, resourceUrlPatterns: string[]): Promise<{url?: string}>;
@@ -674,8 +694,9 @@ export interface AuthenticatedApi extends RpcTarget {
 
   /**
    * Re-authenticate a connected account whose credentials have expired (or may be about to
-   * expire). Returns the URL to open in a new tab. When the OAuth flow completes, the account
-   * is updated and subscribers are notified with credentialsValid: true.
+   * expire). Returns the URL to open as a popup (disowned, as for connectAccount()). Once
+   * the OAuth flow completes and the client redeems the handoff via completeConnectHandoff(), the
+   * account is updated and subscribers are notified with credentialsValid: true.
    */
   reconnectAccount(accountId: number): Promise<{url: string}>;
 

@@ -1,11 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { RpcStub } from 'capnweb'
 import { PublicApi, AuthVendorInfo } from '@gadgets/workshop-shared/api'
-import {
-  CONNECT_HANDOFF_ACK_MESSAGE_TYPE, CONNECT_HANDOFF_MESSAGE_TYPE,
-} from '@gadgets/workshop-shared/gatekeeper'
 import { Button, Banner } from '@cloudflare/kumo'
-import { connectHandoffTicket, parseHandoffEnvelope } from '../../connectHandoff'
+import { openDisownedPopup, uniquePopupName } from '../../connectHandoff'
 
 interface OAuthButtonsProps {
   rpcStub: RpcStub<PublicApi>
@@ -17,29 +14,35 @@ interface OAuthButtonsProps {
 // attempt) rather than failing: the caller then has no state to update.
 const CANCELLED = Symbol('sign-in cancelled')
 
+// How often the login attempt is asked whether its token has been released.
+const RECEIVE_POLL_MS = 1000
+
 /**
- * Renders a sign-in button per auth-capable gatekeeper vendor. Clicking opens the gatekeeper's
- * OAuth popup with this window as its opener; when the flow finishes, the popup delivers a handoff
- * ticket back here, which is redeemed over RPC for the session token. The ticket is what ties the
- * session to this browser: the sign-in URL alone can be finished by anyone (see connectHandoff.ts).
- * On success the token is stored and the app re-authenticates.
+ * Renders a sign-in button per auth-capable gatekeeper vendor. Clicking starts a login attempt and
+ * opens the gatekeeper's OAuth URL as a disowned popup carrying the attempt's nonce in its own
+ * sessionStorage (see connectHandoff.ts). When the flow finishes, the gatekeeper's final page lands
+ * the popup on our /connect/handoff page, which confirms the single-use ticket together with the
+ * nonce over the public API. That confirmation is what ties the session to this browser: the
+ * sign-in URL alone can be finished by anyone. This component meanwhile polls
+ * `attempt.receive()`, which releases the session token only once the ticket is confirmed and only
+ * to the holder of the `attempt` capability; the popup never sees the token. On success the token
+ * is stored and the app re-authenticates.
  *
- * The ticket arrives over one of two transports. Normally the popup posts it to its opener. A
- * provider that isolates its pages with COOP severs that opener mid-flow, though (Google stages
- * this), and the handoff page then falls back to a same-origin BroadcastChannel — which reaches us
- * because in production the login page shares an origin with the handoff page. A broadcast has no
- * source to filter on, so a ticket heard there may be another tab's sign-in or an account-connect
- * ticket; the server answers such a claim with null, and we keep listening for ours.
+ * A newer attempt waits for the previous one's in-flight `receive()` before tearing it down: the
+ * server releases the token exactly once, so a call cancelled mid-flight could discard a token
+ * that had already been handed out, leaving the user to sign in twice.
  */
 export default function OAuthButtons({ rpcStub, vendors, onSuccess }: OAuthButtonsProps) {
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState<string | null>(null)
 
-  // The attempt in flight, if any, as the function that tears it down: stops the popup poll, drops
-  // both ticket listeners and disposes the login RPC (Cap'n Web treats this as a best-effort cancel
-  // and frees the client-side pending call). Run when the component unmounts mid-login (e.g. the
-  // user navigates away) and when a new attempt starts, so at most one attempt is ever listening.
-  const attemptRef = useRef<(() => void) | null>(null)
+  // The attempt in flight, if any, as the function that tears it down: waits for a receive() still
+  // in flight, then stops the poll and disposes the login RPC (Cap'n Web treats this as a
+  // best-effort cancel and frees the client-side pending call). Resolves to whether the attempt
+  // ended up receiving the token, in which case its own continuation completes the login. Run when
+  // the component unmounts mid-login (e.g. the user navigates away) and when a new attempt starts,
+  // so at most one attempt is ever polling.
+  const attemptRef = useRef<(() => Promise<boolean>) | null>(null)
   const mountedRef = useRef(true)
   useEffect(() => {
     // Re-assert on (re)mount: under StrictMode the effect runs mount→cleanup→mount, and the cleanup
@@ -49,7 +52,7 @@ export default function OAuthButtons({ rpcStub, vendors, onSuccess }: OAuthButto
     mountedRef.current = true
     return () => {
       mountedRef.current = false
-      attemptRef.current?.()
+      void attemptRef.current?.()
       attemptRef.current = null
     }
   }, [])
@@ -57,13 +60,17 @@ export default function OAuthButtons({ rpcStub, vendors, onSuccess }: OAuthButto
   if (vendors.length === 0) return null
 
   const start = async (vendorId: string) => {
-    attemptRef.current?.()
-    attemptRef.current = null
+    // Disable the buttons at once, then let the previous attempt finish a receive() it may have in
+    // flight: if that call releases the token, the previous attempt completes the login and this
+    // one has nothing to do.
+    setPending(vendorId)
+    const previousReceived = await attemptRef.current?.()
+    if (!mountedRef.current || previousReceived) return
     setError(null)
     setPending(vendorId)
     try {
-      const { url, attempt } = await rpcStub.startGatekeeperLogin(vendorId)
-      // `attempt` is the capability to redeem the session token.
+      const { url, nonce, attempt } = await rpcStub.startGatekeeperLogin(vendorId)
+      // `attempt` is the capability to receive the session token.
       const dispose = () => {
         try { (attempt as unknown as Disposable)[Symbol.dispose]() } catch { /* already disposed */ }
       }
@@ -73,90 +80,59 @@ export default function OAuthButtons({ rpcStub, vendors, onSuccess }: OAuthButto
         dispose()
         return
       }
-      // Unlike account-connect popups (see openConnectWindow), a login popup deliberately keeps this
-      // window as its opener: sign-in providers are admin-allowlisted, and the opener is how the
-      // ticket normally comes back (postMessage). Don't pass "noopener" — window.open() returns null
-      // with it, indistinguishable from a pop-up block.
-      const popup = window.open(url, 'gatekeeper-login', 'popup,width=520,height=680')
-      if (!popup) {
+      // Disowned like connect popups: sign-in providers are admin-allowlisted, but the popup
+      // traverses provider pages all the same, and none of them gets a handle on this tab. The
+      // nonce rides along in the popup's own storage for the handoff page to present.
+      let popup: Window
+      try {
+        popup = openDisownedPopup(url, uniquePopupName('gatekeeper-login'), { kind: 'login', nonce })
+      } catch (err) {
         dispose()
-        throw new Error('Pop-up blocked. Please allow pop-ups and try again.')
+        throw err
       }
-      // Resolve once a ticket arrives and the claim succeeds; reject if the claim fails or the
-      // attempt is torn down.
+      // Resolve once the attempt releases the token; reject if it fails or is torn down.
       const token = await new Promise<string>((resolve, reject) => {
         let settled = false
-        let poll: number | null = null
-        const channel = 'BroadcastChannel' in globalThis
-          ? new BroadcastChannel(CONNECT_HANDOFF_MESSAGE_TYPE)
-          : null
-
-        function stopPolling() {
-          if (poll !== null) { clearInterval(poll); poll = null }
-        }
-        // An arrow, not a declaration: only a closure created after the null check above sees
-        // `popup` narrowed.
-        const startPolling = () => {
-          if (poll !== null) return
-          poll = window.setInterval(() => {
-            if (!popup.closed) return
-            // Not necessarily a cancellation: a provider that swaps browsing context groups (COOP)
-            // reports the popup closed while the flow is still running, and its ticket will arrive
-            // over the channel. So just hand the buttons back and keep listening; if the user really
-            // closed it, nothing arrives and the attempt ends with the next one or on unmount.
-            stopPolling()
-            if (mountedRef.current) setPending(null)
-          }, 500)
-        }
+        let received = false
+        // The receive() call in flight, if any, as a promise that settles once its outcome has been
+        // handled here; never rejects.
+        let inflight: Promise<void> | null = null
+        const poll = window.setInterval(() => {
+          // Not necessarily a cancellation: the popup closes itself after confirming, and a
+          // provider that swaps browsing context groups (COOP) reports it closed while the flow is
+          // still running. So just hand the buttons back and keep polling. If the user really
+          // closed it, nothing arrives: the poll ends with the next attempt, on unmount, or when
+          // the attempt expires server-side, which then shows as the expiry error. The buttons
+          // stay disabled while a receive() is in flight, though: a second click at that moment
+          // would tear down a call the server may be answering with the token.
+          if (popup.closed && inflight === null && mountedRef.current) setPending(null)
+          // A receive() still in flight is not re-entered.
+          if (inflight !== null) return
+          inflight = attempt.receive()
+            .then(t => {
+              inflight = null
+              if (t !== null) {
+                received = true
+                finish(() => resolve(t))
+              }
+            })
+            .catch(e => finish(() => reject(e instanceof Error ? e : new Error('Could not sign in'))))
+        }, RECEIVE_POLL_MS)
         function finish(fn: () => void) {
           if (settled) return
           settled = true
           attemptRef.current = null
-          stopPolling()
-          window.removeEventListener('message', onMessage)
-          channel?.close()
+          clearInterval(poll)
           dispose()
           fn()
         }
-        // Claims may overlap: a foreign ticket answered with null must not hold up the real one
-        // behind it, and `finish` settles only once. Polling pauses during a claim so a popup that
-        // closes itself on completion is not read as a cancellation, and resumes after a foreign
-        // ticket, or closing the popup afterwards would leave the buttons stuck.
-        function claimTicket(ticket: string) {
-          if (settled) return
-          stopPolling()
-          attempt.claim(ticket)
-            .then(t => {
-              if (settled) return
-              if (t === null) {
-                startPolling()
-                return
-              }
-              // A popup whose opener COOP severed broadcasts, and repeats until acknowledged.
-              // oxlint-disable-next-line unicorn/require-post-message-target-origin -- a BroadcastChannel has no targetOrigin.
-              channel?.postMessage({ type: CONNECT_HANDOFF_ACK_MESSAGE_TYPE, ticket })
-              finish(() => resolve(t))
-            })
-            .catch(e => finish(() => reject(e instanceof Error ? e : new Error('Could not sign in'))))
+        attemptRef.current = async () => {
+          await inflight
+          if (!settled) finish(() => reject(CANCELLED))
+          return received
         }
-        function onMessage(event: MessageEvent) {
-          // Unlike the connect listener, this page holds the popup handle, so a ticket from any
-          // other window (say, an account-connect popup that outlived a logout) is not ours: claiming
-          // it would only burn this attempt.
-          if (event.source !== popup) return
-          const ticket = connectHandoffTicket(event)
-          if (ticket !== null) claimTicket(ticket)
-        }
-
-        window.addEventListener('message', onMessage)
-        channel?.addEventListener('message', (event: MessageEvent) => {
-          const ticket = parseHandoffEnvelope(event.data)
-          if (ticket !== null) claimTicket(ticket)
-        })
-        startPolling()
-        attemptRef.current = () => finish(() => reject(CANCELLED))
       })
-      // Best-effort: after a COOP swap the handle is dead, and the page closes itself anyway.
+      // Best-effort: the page closes itself anyway, and a COOP swap leaves the handle dead.
       try { popup.close() } catch { /* severed */ }
       if (!mountedRef.current) return  // user navigated away mid-flow; drop the result
       localStorage.setItem('authToken', token)

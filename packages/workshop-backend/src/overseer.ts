@@ -494,7 +494,9 @@ function fallbackBindingName(base: string, isTaken: (name: string) => boolean): 
 function observerVendorId(record: GatekeeperRecord): string | null {
   if (!record.creationSpec) {
     throw new Error(
-        "This workspace has a legacy connection that must be reconnected by its owner before it can be shared.");
+        "This workspace has a legacy connection that cannot verify collaborators' access. Its " +
+        "owner must remove the connection before the workspace can be shared, or start a new " +
+        "workspace.");
   }
   return "vendorId" in record.creationSpec ? record.creationSpec.vendorId : null;
 }
@@ -5509,17 +5511,6 @@ class OverseerImpl implements AgentHooks {
 
   async authorizeObservation(gatekeeperId: number, description: ObservationDescription,
                              caller: GatekeeperCaller): Promise<void> {
-    if (description.containsRestrictedData) {
-      if ((await this.getSharingManager()).hasAnyShares()) {
-        throw new Error(
-            "This observation was blocked because it contains sensitive data that must only be " +
-            "shown to the account owner, but this workspace is shared with other users. Try again " +
-            "from a workspace that is not shared.");
-      }
-
-      this.storage.containsRestrictedData.put(true);
-    }
-
     // Forward exclusion: the gatekeeper may name observers who must not see this observation. Since
     // v1 has no per-thread hiding, the only way to let such an observation proceed is if no named
     // observer could reach it -- either they have lost access in the sharing graph, or this
@@ -5527,6 +5518,10 @@ class OverseerImpl implements AgentHooks {
     // observers-implementation-plan.md §5 Step 5.
     if (description.excludeObservers && description.excludeObservers.length > 0) {
       await this.#enforceExcludeObservers(gatekeeperId, description.excludeObservers);
+    }
+
+    if (description.containsRestrictedData) {
+      this.storage.containsRestrictedData.put(true);
     }
 
     let actionId = this.storage.nextActionId.get();
@@ -5683,6 +5678,10 @@ class OverseerImpl implements AgentHooks {
     let outOfScope: string[] = [];
     for (let observerId of observerIds) {
       let observer = this.storage.observers.byObserverId.get(observerId);
+      // TODO(observer-races): a first-time ensureObserver registers its observerId with the
+      // gatekeepers before the record is persisted, so an id named here in that window reads as
+      // unknown and the observation is admitted. Fix: an in-memory pending-id map consulted
+      // here, failing closed.
       if (!observer) continue;  // not an active observer -> ignore
       let role = sharing.getEffectiveRole(observer.profileId);
       if (!role) {
@@ -9167,6 +9166,11 @@ class OverseerImpl implements AgentHooks {
   // creationSpec: an unrelated legacy connection outside the caller's scope must not block their
   // open, since nothing they can reach needs verification against it. An in-scope one still
   // throws, fail-closed (and "build" scope is everything, so it always throws there).
+  //
+  // TODO(known-risk): a "use" collaborator is never verified against a producer outside their
+  //   scope, yet restricted data read from it can reach gadget state they see, because provenance
+  //   is not tracked past the observation. Accepted for v1; see "Known security risk -- never-bound
+  //   producers" in plans/restricted-data-sharing.md.
   #inScopeGatekeepers(role: CollaboratorRole): GatekeeperRecord[] {
     let boundIds = role === "use" ? this.#useScopeGatekeeperIds() : undefined;
 
@@ -9319,6 +9323,10 @@ class OverseerImpl implements AgentHooks {
   // resource access promptly. Returns when fully verified; throws to deny access.
   //
   // See observers-implementation-plan.md §5 Step 3.
+  //
+  // TODO: Concurrent opens by the same profile race this method -- two calls mint two observerIds
+  //   and the last-written record forgets the other's gatekeeper registrations -- so verification
+  //   needs to be serialized per profile.
   async ensureObserver(
       profileId: string,
       clientUser: DurableObjectStub<UserDurableObject>,
@@ -9803,13 +9811,6 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     let role: CollaboratorRole = "build";
 
     if (!isOwner) {
-      if (this.impl.storage.containsRestrictedData.get()) {
-        // `containsRestrictedData` can only have been set when the gadget had no shares (see
-        // `authorizeObservation`), and no new shares can be created while it's set, so any
-        // non-owner reaching here is necessarily unauthorized.
-        throw createOpenGadgetError(OPEN_GADGET_ERROR_CODES.workspaceAccessDenied);
-      }
-
       let sharing = await this.impl.getSharingManager();
 
       // If a share key was provided, redeem it. The owner already has full access and should not
@@ -9830,7 +9831,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       // verify they may observe everything this Gadget has read through its in-scope gatekeepers,
       // configuring their connected accounts if needed. Observer verification runs only after a
       // valid role is confirmed, so it never reveals gatekeeper or resource metadata to an
-      // unauthorized user; the containsRestrictedData short-circuit above still wins over both.
+      // unauthorized user.
       //
       // An unauthorized caller (no effective role -- never had access, or was removed) gets a
       // distinct denial without workspace metadata. A removed collaborator who reconnects after
@@ -9948,12 +9949,6 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     // denial below rather than being verified (or told to fix a verification failure) for access
     // this path can never grant them.
     if (ownerId !== callerId) {
-      if (this.impl.storage.containsRestrictedData.get()) {
-        return {
-          accepted: false,
-          message: "This workspace has sharing disabled, so only its owner can access it.",
-        };
-      }
       let role: CollaboratorRole | null;
       try {
         role = await this.impl.authorizeCollaborator(
@@ -11976,8 +11971,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   // --- Collaborator management ---
   //
   // The sharing/permission logic lives in SharingManager (./sharing). These methods handle only
-  // the RPC-bound pieces (resolving profiles via User DOs, the `containsRestrictedData` policy) and
-  // delegate the rest.
+  // the RPC-bound pieces (resolving profiles via User DOs) and delegate the rest.
 
   async listObserverRequirements(
       role: CollaboratorRole): Promise<ObserverBindingNeed[]> {
@@ -11996,12 +11990,6 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     let profile = await userDo.whoamiIfExists();
     if (!profile) {
       return null;
-    }
-
-    if (this.impl.storage.containsRestrictedData.get()) {
-      throw new Error(
-          "This workspace has observed sensitive data. To prevent leaks, the workspace cannot be " +
-          "shared.");
     }
 
     return (await this.impl.getSharingManager()).addCollaborator({
@@ -12061,23 +12049,11 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async createShareLink(role: CollaboratorRole, note?: string)
       : Promise<{ key: string; linkId: string }> {
-    if (this.impl.storage.containsRestrictedData.get()) {
-      throw new Error(
-          "This workspace has observed sensitive data. To prevent leaks, the workspace cannot be " +
-          "shared.");
-    }
-
     return (await this.impl.getSharingManager())
         .createShareLink({ caller: this.#sharingCaller(), role, note });
   }
 
   async newShareLinkKey(linkId: string): Promise<{ key: string }> {
-    if (this.impl.storage.containsRestrictedData.get()) {
-      throw new Error(
-          "This workspace has observed sensitive data. To prevent leaks, the workspace cannot be " +
-          "shared.");
-    }
-
     return (await this.impl.getSharingManager())
         .newShareLinkKey({ caller: this.#sharingCaller(), linkId });
   }

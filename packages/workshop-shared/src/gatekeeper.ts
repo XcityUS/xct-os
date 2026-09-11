@@ -1193,19 +1193,17 @@ export type ObservationDescription = {
   //   can help detect situations where the gadget could leak information.
 
   /**
-   * If true, then this observation contains sensitive information that MUST NOT be shared with
-   * ANYONE except the account owner. This means:
-   * - If the gadget is shared already, authorizeObservation() must throw an exception to block
-   *   the observation.
-   * - All future sharing of the gadget is prohibited.
-   * - Once observed, the gadget goes into "lockdown mode" where it can no longer perform any
-   *   actions, only make observations. This prevents the gadget from leaking data through other
-   *   gatekeepers.
+   * If true, then this observation contains sensitive information that must only be shown to
+   * people who are verified to have access to the same data. This means:
+   * - Every collaborator must pass this gatekeeper's `addObserver()` to open the gadget, so a
+   *   gatekeeper whose `addObserver()` always throws makes the gadget effectively unshareable
+   *   once it has made one of these observations.
+   * - Once observed, the gadget enters a restricted mode: no more actions or public-web fetches,
+   *   only observations, so the gadget cannot leak the data through other gatekeepers.
    *
-   * TODO(someday): This was added as a stopgap in order to be able to make certain sensitive data
-   *   sources available to internal users. In the longer-term, it should be possible to share
-   *   sensitive data as long as the recipients also have access to that same data, but this
-   *   requires a more complex policy framework to compute.
+   * TODO(someday): The restricted mode is a blunt instrument. It should be possible to perform
+   *   actions whose visibility is limited to people verified to have access to the same data,
+   *   but this requires a more complex policy framework to compute.
    */
   containsRestrictedData?: boolean;
 

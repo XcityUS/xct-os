@@ -1629,8 +1629,9 @@ export type BoundHookInfo = {
  * create new agents, that is, start new agent chat threads, which appear in the gadget's agent
  * chat UI as new conversations. Agents created this way don't typically edit the gadget code, but
  * rather use the `executeCode` tool to directly invoke the gadget's bindings to perform tasks.
- * Each agent can additionally be provide "props" which may include additional RPC stubs
- * representing specific resources or callbacks relevant to that agent session.
+ * Beyond the bindings configured here, a gadget hands an agent per-task capabilities -- RPC stubs
+ * representing specific resources or callbacks relevant to that agent session -- as the arguments
+ * of calls made on the stub that the binding's `spawnCallable()` returns.
  *
  * For example, a gadget that responds to emails might invoke an agent for each email message that
  * arrives, with an RPC stub that allows it to reply to that email -- but prohibits the agent from
@@ -1643,8 +1644,8 @@ export type AgentSpawnerConfig = {
 
   /**
    * Model ID to run, of the gadget owner's available models. Can be `null` to just create a chat
-   * that doesn't actually run an agent -- the chat will be notified that the chat needs attention,
-   * same as for an agent chat where the agent fails to mark the task complete.
+   * that doesn't actually run an agent -- the prompt, or the calls made on a callable agent, are
+   * appended to the chat for a human to pick up.
    */
   modelId: string | null,
 
@@ -2909,23 +2910,29 @@ export type AiChatMessageBody = {
   code?: string;
 } | {
   /**
-   * Indicates that a callback was received on the agent's `self` object. When the agent uses
-   * `executeCode`, the executed code receives a `self` parameter. Calling any method on `self`
-   * (e.g., `self.onUpdate(data)`) delivers a callback message back to this chat thread and
-   * activates the agent to respond.
+   * Indicates that a call was delivered to the agent: a method was called on its `self` object
+   * (which code run by the agent's `executeCode` tool receives, and may pass along or store) or on
+   * the stub an agent spawner's `spawnCallable()` returned. The call activates the agent to
+   * respond; nothing is returned to the caller.
    */
   type: "agentCallback";
 
-  /** The method name that was called on `self`. */
+  /** The method name that was called. */
   methodName: string;
 
   /** A depth-limited summary string of the arguments for the agent's context window. */
   argsSummary: string;
+
+  /**
+   * Name under which the arguments appear in the agent's `env`. Absent on messages from before
+   * callable agents became durable, whose arguments are no longer available.
+   */
+  bindingName?: string;
 } | {
   /**
-   * A system-generated nudge message sent to the agent when it tries to end its turn while
-   * agent callbacks are still unresolved. This is displayed as a user message to the LLM
-   * so it can be prompted to continue.
+   * **Obsolete.** A system-generated nudge message that was sent to the agent when it tried to
+   * end its turn while agent callbacks were still unresolved. No longer emitted since callable
+   * agents stopped returning values; retained so older chat logs remain readable.
    */
   type: "agentNudge";
   text: string;
@@ -3223,6 +3230,11 @@ export type AiToolCall = {
   /** Output, if the code actually ran. (Otherwise, `error` should be present.) */
   output?: string;
 } | {
+  /**
+   * **Obsolete.** Rejected all of the agent's outstanding callbacks with an error. No longer
+   * emitted since callable agents stopped returning values; retained so older chat logs remain
+   * readable.
+   */
   toolName: "giveUp";
   input: {
     error: string;

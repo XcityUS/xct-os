@@ -361,6 +361,23 @@ describe("compaction checkpoint state", () => {
     expect(state.nextChangeId).toBe(1);
   });
 
+  // A delivered call's arguments stay reachable under the name stamped on its message; a message
+  // from before calls were durable carries no name, and its arguments are gone.
+  it("binds a delivered call's arguments by the name stamped on it, and a legacy call not at all",
+      () => {
+    let state = buildState([
+      record(0, agent, {
+        type: "agentCallback", methodName: "run", argsSummary: "[0]: 1", bindingName: "run_ARGS",
+      }),
+      record(1, agent, {type: "agentCallback", methodName: "run", argsSummary: "[0]: 2"}),
+    ], 2);
+
+    expect(state.chatBindings).toEqual([
+      ["APP", {type: "workpiece", id: 1}],
+      ["run_ARGS", {type: "value", messageSequence: 0}],
+    ]);
+  });
+
   it("carries a previous checkpoint's proposed state forward", () => {
     let previous = {
       chatId: 1, compactedTo: 3, summary: "earlier",

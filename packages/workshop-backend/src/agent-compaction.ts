@@ -376,7 +376,6 @@ export function buildCompactionState(
     : Omit<CompactionCheckpoint, "chatId" | "compactedTo" | "summary"> {
   let compacted = messages.filter(message => message.sequence < compactedTo);
   let chatBindings = new Map(previous?.chatBindings ?? initialBindings);
-  let callbackNameCounter = 0;
   let nextChangeId = previous?.nextChangeId ?? 0;
 
   for (let message of compacted) {
@@ -396,11 +395,11 @@ export function buildCompactionState(
         }
       }
     } else if (message.type === "agentCallback") {
-      let name: string;
-      do {
-        name = `PARAMS_${++callbackNameCounter}`;
-      } while (chatBindings.has(name));
-      chatBindings.set(name, {type: "value", messageSequence: message.sequence});
+      // The name was stamped when the call was appended; a message without one predates durable
+      // calls and binds nothing (its arguments are gone).
+      if (message.bindingName !== undefined) {
+        chatBindings.set(message.bindingName, {type: "value", messageSequence: message.sequence});
+      }
     } else if (message.type === "connectionRequest" && message.state === "accepted" &&
                message.gatekeeperId !== undefined && message.bindingName !== undefined) {
       if (!chatBindings.has(message.bindingName)) {

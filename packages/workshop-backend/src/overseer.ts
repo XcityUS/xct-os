@@ -1,6 +1,6 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, actionChangeTime } from '@gadgets/workshop-shared/api';
+import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, FileAtCommit, MAX_READ_FILES_PER_CALL, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, actionChangeTime } from '@gadgets/workshop-shared/api';
 import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange, diffFiles,
   transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
@@ -370,11 +370,12 @@ export type GadgetRecord = {
 /**
  * A worktree workpiece (the other variant of WorkpieceRecord): a file tree rooted at a git
  * commit, created by an agent's createWorktree tool and private to the chat that created it.
- * The agent reads and edits its files with the regular file tools -- a worktree is born pinned
- * at `baseCommit`, so its edits ride the chat's ordinary change stream -- but it has no output,
- * no bindings, no facet, and never executes. Worktrees are invisible to clients: they never
- * appear in the workpiece subscription, and their content is stripped from every chat delivery
- * (see stripWorktreeChangeEntries and its callers).
+ * The agent reads and edits its files with the regular file tools -- its edits ride the chat's
+ * ordinary change stream, pinned on first modification like a gadget's (see `pinBase`) -- but
+ * it has no output, no bindings, no facet, and never executes. Clients see it as a
+ * WorktreeSummary on build-role workpiece subscriptions (see subscribeToWorkpieces) and read its
+ * content lazily, by commit and path (see listTree / readFilesAtCommit); its change-stream
+ * entries and pins are delivered like a gadget's.
  */
 export type WorktreeRecord = {
   type: "worktree";
@@ -410,10 +411,15 @@ export type WorktreeRecord = {
   headCommit: string;
 
   /**
-   * The commit the chat's current pin for this worktree is rooted at (initially baseCommit):
-   * the base the epoch's OT rows compose on. Advanced only by epoch resets (never by explicit
-   * commits -- moving it mid-epoch would double-apply the still-live rows on replay). Internal
-   * bookkeeping, never surfaced.
+   * The accepted commit (initially baseCommit): the worktree's content as of the chat's last
+   * accept, and the worktree analog of a gadget's head. An unpinned worktree reads as this
+   * commit's tree; the epoch's first modification -- a write, or a commit() -- pins the worktree
+   * in the chat at exactly this commit (so a chat pin, when present, always has
+   * `baseCommit === pinBase`), and the epoch's OT rows compose on it. Advanced only by epoch
+   * resets, to the accept's auto-commit of the dirty overlay (never by explicit commits --
+   * moving it mid-epoch would double-apply the still-live rows on replay). Published as
+   * WorktreeSummary.pinBase: the commit the UI reads an unpinned worktree from, and the base a
+   * client's pin declaration must name.
    */
   pinBase: string;
 
@@ -427,10 +433,14 @@ export type WorktreeRecord = {
   bindingName?: undefined;
 
   /**
-   * The provisional-to-chat lifecycle, mirroring GadgetRecord.pending stamp-for-stamp: stamped
-   * by the "changes" message that records the creation (via `createdWorktrees`), reaped by
-   * reconcilePendingGadgets when unstamped or reverted, promoted (cleared) by the accept that
-   * covers the creation -- with no head-commit work; a worktree's head lifecycle is its own.
+   * Set only between creation and the "changes" message that records it (via
+   * `createdWorktrees`), which clears it in the same write: an unstamped record whose chat has
+   * no active turn is a crash orphan, reaped by reconcilePendingGadgets like an unstamped
+   * gadget. Unlike GadgetRecord.pending, it is never stamped for a later accept or revert to
+   * decide on, because creating a worktree proposes nothing (see proposedChangeWorkpieceIds):
+   * once recorded, the worktree lives as long as its chat, and a revert covering the creation
+   * rolls back its content and head but never deletes it. `sequence` appears only on records
+   * written before this was so; reconcilePendingGadgets promotes those.
    */
   pending?: {chatId: number, sequence?: number};
 };
@@ -1142,14 +1152,10 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       nextHookId: 0,
       nextAgentCallId: 0,
 
-      // Permanent tombstones for deleted worktrees' workpiece ids, consulted only by the
-      // client-delivery stripping (see stripWorktreeChangeEntries): a revert covering a
-      // worktree's creation deletes its registry record while the reverted "changes" messages
-      // carrying its content stay in the chat log, so without a tombstone a later history read
-      // would deliver that content -- and the pin whose base commit is an entire repository
-      // tree -- to the client. Ids are never reused, so entries never invalidate; each is a
-      // single number, so the list stays cheap.
-      deadWorktreeIds: <WorkpieceId[]>[],
+      // OBSOLETE: deadWorktreeIds existed to facilitate hiding worktrees from clients, but we
+      // no longer do that. Noted here since old workspaces may still have a singleton by this
+      // name in storage.
+      // deadWorktreeIds: <WorkpieceId[]>[],
 
       // True if any past observation was authorized that had the `containsRestrictedData` flag
       // set in its `ObservationDescription`. The key on disk predates the flag's rename.
@@ -2288,19 +2294,9 @@ class OverseerImpl implements AgentHooks {
     return record;
   }
 
-  // Whether the id names a live worktree record. Live paths only (pins, content folds, file
-  // tools): a deleted workpiece is not a worktree here. Client-delivery stripping must use
-  // isEverWorktree instead, since the messages it strips can outlive the record.
+  // Whether the id names a live worktree record (a deleted workpiece is not a worktree here).
   isWorktree(id: WorkpieceId): boolean {
     return this.storage.gadgets.get(id)?.type === "worktree";
-  }
-
-  // Whether the id names a worktree, live or deleted (see deadWorktreeIds). This is the
-  // delivery-stripping predicate: a revert covering a worktree's creation deletes its record
-  // while the reverted "changes" messages carrying its content remain in the chat log, and a
-  // history read must keep stripping them.
-  isEverWorktree(id: WorkpieceId): boolean {
-    return this.isWorktree(id) || this.storage.deadWorktreeIds.get().includes(id);
   }
 
   // Name of the legacy Y.Doc root map that held the given gadget's files in the retired
@@ -2413,8 +2409,9 @@ class OverseerImpl implements AgentHooks {
   // fault. Any locally-present commit works with no gatekeeper at all (a gadget's history,
   // another worktree's commit). Like createGadget, the caller (the agent's createWorktree tool)
   // is responsible for getting the creation recorded in the chat log -- `createdWorktrees` on
-  // the step's "changes" message -- which sequence-stamps the pending record and establishes the
-  // birth pin (see commitAgentStep).
+  // the step's "changes" message -- which makes the pending record permanent. The worktree is
+  // not pinned in the chat by its creation: it reads as its accepted commit (`pinBase`) until
+  // the first modification pins it (see commitAgentStep).
   async createWorktree(title: string, chatId: number, commitRef: string)
       : Promise<{id: WorkpieceId, title: string, baseCommit: string}> {
     title = title.trim();
@@ -2484,6 +2481,8 @@ class OverseerImpl implements AgentHooks {
   //   - A *stamped* record is reaped when the log marks its creation reverted: reverts record
   //     their message before the awaited record deletions (see #revertChanges), so this is both
   //     the tail of every revert and the recovery from one that crashed partway.
+  //   - A *stamped worktree* was written before recording a worktree creation promoted it (see
+  //     WorktreeRecord.pending). It is promoted here instead, reverted or not.
   // Called at agent turn start (before history replay) and turn end, plus from merge and revert
   // (which assert the chat has no active turn) -- never mid-step, when an unstamped record
   // awaiting its barrier legitimately exists.
@@ -2492,7 +2491,16 @@ class OverseerImpl implements AgentHooks {
   async reconcilePendingGadgets(chatId: number): Promise<void> {
     let pending = this.listPendingGadgets(chatId);
     let unstamped = pending.filter(gadget => gadget.pending!.sequence === undefined);
-    let stamped = pending.filter(gadget => gadget.pending!.sequence !== undefined);
+    let stamped: WorkpieceRecord[] = [];
+    for (let record of pending) {
+      if (record.pending!.sequence === undefined) continue;
+      if (record.type === "worktree") {
+        delete record.pending;
+        this.storage.gadgets.put(record);
+      } else {
+        stamped.push(record);
+      }
+    }
 
     // A marking message only affects messages recorded before it, so statuses for the stamped
     // creations need only the log tail from the earliest one on.
@@ -2704,14 +2712,6 @@ class OverseerImpl implements AgentHooks {
       }
     }
 
-    // A worktree's id is tombstoned before the record goes: reverted "changes" messages that
-    // carry its content can outlive the record (a revert of the creation), and the
-    // client-delivery stripping must keep recognizing the id (see deadWorktreeIds).
-    if (record.type === "worktree") {
-      let dead = this.storage.deadWorktreeIds.get();
-      if (!dead.includes(id)) this.storage.deadWorktreeIds.put([...dead, id]);
-    }
-
     let facetName = this.gadgetFacetName(id);
     this.storage.gadgets.delete(id);  // notifies workpiece subscribers
     this.#runningChatIds.delete(id);
@@ -2798,19 +2798,31 @@ class OverseerImpl implements AgentHooks {
         useScopeBefore, "Gadget restarted because a connection's hook was enabled.");
   }
 
-  // Subscribe to the workspace's workpiece list. Only gadget-type workpieces are published:
-  // worktrees are chat-private and have no UI, so they never appear here (a future
-  // WorkpieceSummary variant can surface them once the UI can handle large repos).
-  // When `includePending` is false (non-owner/use-role subscribers), gadgets still provisional to
-  // some chat are withheld entirely: they are proposals within the owner's chats, not part of the
-  // shared workspace until accepted. (Promotion then surfaces them via the collection's update
-  // notification.)
+  // Subscribe to the workspace's workpiece list: gadgets, and -- on subscriptions that include
+  // pending workpieces -- worktrees. When `includePending` is false (non-owner/use-role
+  // subscribers), gadgets still provisional to some chat are withheld entirely, and so is every
+  // worktree, accepted or not: both are proposals within the owner's chats, not part of the
+  // shared workspace (a worktree is its chat's for life). (A gadget's promotion then surfaces it
+  // via the collection's update notification.) Every record write re-delivers the summary, which
+  // is how a worktree's `pinBase` (advanced by an accept) and `headCommit` (an explicit commit,
+  // or its rollback) reach clients.
   subscribeToWorkpieces(subscriber: RpcStub<WorkpiecesSubscriber>,
                         includePending: boolean): RpcStub<{}> {
     let gadgets = this.storage.gadgets;
     subscriber = subscriber.dup();  // keep stub after return
 
-    let toSummary = (record: GadgetRecord): WorkpieceSummary => {
+    let toSummary = (record: WorkpieceRecord): WorkpieceSummary => {
+      if (record.type === "worktree") {
+        return {
+          id: record.id,
+          type: "worktree",
+          title: record.title,
+          chatId: record.chatId,
+          pinBase: record.pinBase,
+          headCommit: record.headCommit,
+          baseCommit: record.baseCommit,
+        };
+      }
       let summary: WorkpieceSummary = {
         id: record.id,
         type: "gadget",
@@ -2836,19 +2848,16 @@ class OverseerImpl implements AgentHooks {
       subscriber[Symbol.dispose]();
     };
 
-    // The record as published to this subscriber, or undefined when withheld (a worktree, or a
-    // pending gadget on a subscription that excludes them).
-    let published = (record: WorkpieceRecord): GadgetRecord | undefined =>
-        record.type === "gadget" && (includePending || !record.pending) ? record : undefined;
+    // Whether the record is published to this subscriber (see above for what is withheld).
+    let published = (record: WorkpieceRecord): boolean =>
+        includePending || (record.type === "gadget" && !record.pending);
 
     let dbSubscriber = {
       add(record: WorkpieceRecord) {
-        let gadget = published(record);
-        if (gadget) subscriber.entry(toSummary(gadget)).catch(unsubscribe);
+        if (published(record)) subscriber.entry(toSummary(record)).catch(unsubscribe);
       },
       update(_oldRecord: WorkpieceRecord, newRecord: WorkpieceRecord) {
-        let gadget = published(newRecord);
-        if (gadget) subscriber.entry(toSummary(gadget)).catch(unsubscribe);
+        if (published(newRecord)) subscriber.entry(toSummary(newRecord)).catch(unsubscribe);
       },
       remove(record: WorkpieceRecord) {
         if (published(record)) subscriber.removed(record.id).catch(unsubscribe);
@@ -2858,8 +2867,7 @@ class OverseerImpl implements AgentHooks {
     subscriber.onRpcBroken(() => unsubscribe());
 
     for (let record of gadgets.list()) {
-      let gadget = published(record);
-      if (gadget) subscriber.entry(toSummary(gadget)).catch(unsubscribe);
+      if (published(record)) subscriber.entry(toSummary(record)).catch(unsubscribe);
     }
     subscriber.ready().catch(unsubscribe);
 
@@ -2901,19 +2909,21 @@ class OverseerImpl implements AgentHooks {
     return meta.codeBase ?? {pins: [], generation: 0, revision: 0};
   }
 
-  // AgentHooks implementation: the chat's current code base, whose pins list the gadgets whose
-  // content lives in the chat's change stream.
-  getChatCodeBase(chatId: number): ChatCodeBase | undefined {
-    return this.storage.chatMeta.get(chatId)?.codeBase;
-  }
-
   // AgentHooks implementation: the gadget's current head commit, or undefined if it has none
   // (still pending, created outside chats and never accepted, or deleted). Worktrees have no
   // mainline head -- their `headCommit` is a different notion -- so this reports undefined for
-  // them, which is exactly what keeps the agent's unpinned-read split off worktrees.
+  // them; getWorktreePinBase is their counterpart.
   getGadgetHead(gadgetId: WorkpieceId): string | undefined {
     let record = this.storage.gadgets.get(gadgetId);
     return record?.type === "gadget" ? record.commitId : undefined;
+  }
+
+  // AgentHooks implementation: a worktree's accepted commit (see WorktreeRecord.pinBase) -- what
+  // an unpinned worktree reads at and what its first modification pins at, the worktree analog
+  // of getGadgetHead -- or undefined for anything that isn't a live worktree.
+  getWorktreePinBase(id: WorkpieceId): string | undefined {
+    let record = this.storage.gadgets.get(id);
+    return record?.type === "worktree" ? record.pinBase : undefined;
   }
 
   // AgentHooks implementation: read a commit's file map (see GitStore.readCommitFiles).
@@ -2922,20 +2932,34 @@ class OverseerImpl implements AgentHooks {
   }
 
   // AgentHooks implementation: lazily read one file of a commit's tree (see
-  // WorkspaceGitCache.readFileAtCommitIfExists) -- the base resolver behind worktree reads.
+  // WorkspaceGitCache.readFileAtCommitIfExists) -- the base resolver behind worktree reads and
+  // the way unpinned gadget reads are served too.
   readFileAtCommit(commit: string, path: string): Promise<string | undefined> {
     return this.gitCache.readFileAtCommitIfExists(commit, path);
+  }
+
+  // AgentHooks implementation: the same read, plus the blob's oid for the read's stamp.
+  readFileAtCommitWithOid(commit: string, path: string)
+      : Promise<{text: string, oid: string} | undefined> {
+    return this.gitCache.readFileAtCommitWithOid(commit, path);
+  }
+
+  // AgentHooks implementation: a regular file's blob oid by path (see
+  // WorkspaceGitCache.fileOidAtCommit), for the agent's read-freshness comparisons.
+  fileOidAtCommit(commit: string, path: string): Promise<string | undefined> {
+    return this.gitCache.fileOidAtCommit(commit, path);
+  }
+
+  // AgentHooks implementation: a blob by oid as text (see WorkspaceGitCache.readTextBlob). A
+  // stamped read's blob was pulled by the read itself, so this is a local read.
+  readBlobText(oid: string, path: string): Promise<string> {
+    return this.gitCache.readTextBlob(oid, undefined, path);
   }
 
   // AgentHooks implementation: the write side of the tree-entry modes rules (see
   // WorkspaceGitCache.assertWorktreePathWritable).
   assertWorktreePathWritable(commit: string, path: string): Promise<void> {
     return this.gitCache.assertWorktreePathWritable(commit, path);
-  }
-
-  // AgentHooks implementation: per-file oid diff between two commits (see GitStore.changedPaths).
-  changedPaths(a: string | undefined, b: string | undefined): Promise<Set<string>> {
-    return this.gitStore.changedPaths(a, b);
   }
 
   // Rebuild a chat's content -- `gadgetId -> (path -> text)` for every gadget whose files live
@@ -2968,10 +2992,10 @@ class OverseerImpl implements AgentHooks {
       if (msg.type === "merge" && msg.epochBoundary) {
         content = new Map();
         worktreeBases.clear();
-        // Worktree pins re-establish immediately at the boundary, from the merge message's own
-        // record of the epoch reset's re-pins (each base is the auto-commit -- or unchanged pin
-        // base -- whose tree is the chat's content at the reset; see mergeChanges). Read from
-        // the message, not current record state, so folds of closed epochs stay deterministic.
+        // Merges from before worktrees pinned on modification re-pinned every worktree at the
+        // boundary and recorded it here (each base the auto-commit -- or unchanged pin base --
+        // whose tree was the chat's content at the reset). Still honored so those epochs fold
+        // as they were written; nothing writes the field anymore (see mergeChanges).
         for (let pin of msg.worktreePins ?? []) {
           worktreeBases.set(pin.worktreeId, pin.baseCommit);
           content.set(pin.worktreeId, new Map());
@@ -3143,12 +3167,17 @@ class OverseerImpl implements AgentHooks {
         }
       }
 
-      // Synchronous tail: apply the live rows and revalidate the snapshot.
+      // Synchronous tail: apply the live rows and revalidate the snapshot. A pin established
+      // during the awaits -- a first modification's row landing, which moves neither token --
+      // is the one change the bases above were computed without (its base tree, or its
+      // worktree's lazy base, would be missing under the row), so it re-resolves too; pins only
+      // ever grow within a generation, so a count change is the whole test.
       let freshMeta = this.getChatMetaOrThrow(chatId);
       let freshBase = this.chatCodeBase(freshMeta);
       let missedSeed = false;
       if (this.nextChatSequencePeek(chatId) !== token ||
-          freshBase.generation !== codeBase.generation) {
+          freshBase.generation !== codeBase.generation ||
+          freshBase.pins.length !== codeBase.pins.length) {
         if (attempt >= 4) throw new Error("The chat is changing too quickly; please retry.");
         meta = freshMeta;
         continue;
@@ -3253,66 +3282,40 @@ class OverseerImpl implements AgentHooks {
     })].filter(row => !row.retired);
   }
 
-  // Strip worktree entries from a change for client delivery, returning the input object when
-  // nothing is stripped. Worktrees have no UI, and beyond mere invisibility their *content* must
-  // never reach the existing client: the frontend's code-sync client consumes the same change
-  // stream the agent writes, and a change entry for a workpiece it doesn't hold makes it fetch
-  // the pin's entire base commit -- for a worktree, a whole repository tree. So every delivery
-  // path strips worktree entries (this helper), worktree pins (stripWorktreePins), while
-  // preserving revision numbering -- a stripped row is delivered with an empty change so the
-  // revision stream stays gapless. Worktree *ids* are not hidden (the delivered createWorktree
-  // tool call carries one by design); only content and fetch triggers are. Deleted worktrees
-  // still strip (isEverWorktree): a revert of the creation deletes the record but leaves the
-  // reverted "changes" messages -- content payloads included -- in the log for history reads.
-  stripWorktreeChangeEntries(change: CodeChange): CodeChange {
-    let worktreeKeys = Object.keys(change)
-        .filter(key => this.isEverWorktree(Number(key)));
-    if (worktreeKeys.length === 0) return change;
-    let stripped = {...change};
-    for (let key of worktreeKeys) delete stripped[Number(key)];
-    return stripped;
-  }
-
-  // The pin-list half of the client-delivery stripping (see stripWorktreeChangeEntries): a
-  // delivered worktree pin is exactly what would trigger the client's base-commit fetch.
-  stripWorktreePins<T extends ChatGadgetPin>(pins: T[]): T[] {
-    return pins.some(pin => this.isEverWorktree(pin.gadgetId))
-        ? pins.filter(pin => !this.isEverWorktree(pin.gadgetId)) : pins;
-  }
-
-  // The gadgets this chat currently proposes changes to: pinned in the chat's current epoch (a
-  // gadget joins the pin stream when its code is first modified -- see ChatCodeBase), created
-  // provisionally by the chat, or targeted by a provisional binding edge the chat added (which
-  // changes the gadget's env even though its code is untouched). Purely derived: pins and
-  // pending records are maintained transactionally with the changes themselves (established
-  // with their rows, rolled back by revert/discard, evaporated by the accept's epoch reset), so
-  // there is no cached flag to drift out of step -- this replaces the stored
-  // `hasProposedChanges` bit and the recompute machinery that existed to fight exactly that.
+  // The workpieces this chat currently proposes changes to: pinned in the chat's current epoch
+  // (a gadget or worktree joins the pin stream when its code is first modified -- see
+  // ChatCodeBase), or -- gadgets only -- created provisionally by the chat or targeted by a
+  // provisional binding edge the chat added (which changes the gadget's env even though its code
+  // is untouched). Purely derived: pins and pending records are maintained transactionally with
+  // the changes themselves (established with their rows, rolled back by revert/discard,
+  // evaporated by the accept's epoch reset), so there is no cached flag to drift out of step --
+  // this replaces the stored `hasProposedChanges` bit and the recompute machinery that existed
+  // to fight exactly that. (A chat from before worktree pins meant modification can hold a
+  // worktree pin that proves nothing, which reads as proposed here until its first accept drops
+  // it -- see mergeChanges. Accepted: few such chats exist, and one click clears it.)
   //
-  // Deliberately gadgets-only: a worktree is *born* pinned and re-pinned at every epoch reset,
-  // so a worktree pin proves nothing about pending content -- and worktrees have no UI yet, so
-  // worktree-only changes must not prompt the user to accept or discard changes they cannot
-  // see. When worktree UI lands, worktree entries must be derived differently: from the current
-  // epoch's rows touching the worktree (the dirtiness the accept's auto-commit planning
-  // computes), pending creations, and proposed head advancements -- never from pins.
+  // A worktree's *creation* alone proposes nothing, unlike a gadget's: accepting adds a pending
+  // gadget to the workspace, whereas a worktree stays private to its chat either way, so an
+  // agent that checks a repository out only to read it would otherwise raise the pending-changes
+  // banner over a chat with nothing to accept. For the same reason no revert deletes a worktree
+  // (see WorktreeRecord.pending).
   proposedChangeWorkpieceIds(chatId: number, meta: AiChatMetadata): WorkpieceId[] {
     let ids = new Set<WorkpieceId>();
     for (let pin of meta.codeBase?.pins ?? []) {
-      if (!this.isWorktree(pin.gadgetId)) ids.add(pin.gadgetId);
+      ids.add(pin.gadgetId);
     }
-    for (let gadget of this.storage.gadgets.list()) {
-      if (gadget.type !== "gadget" || ids.has(gadget.id)) continue;
-      if (gadget.pending?.chatId === chatId ||
-          Object.values(gadget.bindings).some(edge => edge.pending?.chatId === chatId)) {
-        ids.add(gadget.id);
+    for (let record of this.storage.gadgets.list()) {
+      if (ids.has(record.id) || record.type !== "gadget") continue;
+      if (record.pending?.chatId === chatId ||
+          Object.values(record.bindings).some(edge => edge.pending?.chatId === chatId)) {
+        ids.add(record.id);
       }
     }
     return [...ids].toSorted((a, b) => a - b);
   }
 
   // A chat metadata record as delivered to clients: the stored row with the derived
-  // `proposedChangeWorkpieces` list attached (see proposedChangeWorkpieceIds), worktree pins
-  // stripped from `codeBase` (see stripWorktreeChangeEntries), and the retired
+  // `proposedChangeWorkpieces` list attached (see proposedChangeWorkpieceIds) and the retired
   // `hasProposedChanges` flag dropped (see StoredChatMetadata). Never mutates the input.
   chatMetaForClient(stored: StoredChatMetadata): AiChatMetadata {
     let meta: StoredChatMetadata = {...stored};
@@ -3321,22 +3324,13 @@ class OverseerImpl implements AgentHooks {
     if (proposed.length > 0) {
       meta.proposedChangeWorkpieces = proposed;
     }
-    if (meta.codeBase !== undefined) {
-      let pins = this.stripWorktreePins(meta.codeBase.pins);
-      if (pins !== meta.codeBase.pins) {
-        meta.codeBase = {...meta.codeBase, pins};
-      }
-    }
     return meta;
   }
 
   // Broadcast one accepted row to chat subscribers (see AiChatSubscriber.changeApplied).
-  // Worktree entries are stripped (revision numbering preserved); see
-  // stripWorktreeChangeEntries.
   emitChatChangeApplied(row: ChatChangeRecord): void {
-    let change = this.stripWorktreeChangeEntries(row.change);
     for (let subscriber of this.#chatSubscribers) {
-      subscriber.changeApplied(row.chatId, row.generation, row.revision, row.author, change,
+      subscriber.changeApplied(row.chatId, row.generation, row.revision, row.author, row.change,
                                row.submission).catch(() => {
         subscriber[Symbol.dispose]();
         this.#chatSubscribers.delete(subscriber);
@@ -3448,10 +3442,11 @@ class OverseerImpl implements AgentHooks {
     for (let msg of messages) {
       if (msg.type === "merge" && msg.epochBoundary) {
         declared.clear();
-        // The merge's own worktree re-pins are declarations in the new epoch: nothing may
-        // re-declare them (a duplicate declaration would reset the worktree's content
-        // mid-fold), and a revert must not drop them (they root content that survived the
-        // accept; merges themselves are never reverted).
+        // An older merge's worktree re-pins (see AiChatMessageBody.worktreePins) are
+        // declarations in the new epoch: nothing may re-declare them (a duplicate declaration
+        // would reset the worktree's content mid-fold), and a revert must not drop them (they
+        // root content that survived the accept; merges themselves are never reverted) -- the
+        // next accept's epoch reset is what retires such a pin.
         for (let pin of msg.worktreePins ?? []) declared.add(pin.worktreeId);
       } else if (msg.type === "changes" && statuses.get(msg.sequence) !== "reverted") {
         if (msg.conversionBoundary) declared.clear();
@@ -3693,7 +3688,8 @@ class OverseerImpl implements AgentHooks {
   // suffix revert can never erase a call while keeping its edits). Each change's `pin` is
   // validated against the gadget's *current* head and mirrored into the chat's code base with
   // its row -- head movement after the barrier merely leaves the chat stale for the accept
-  // gate to catch, never retroactively fails the turn.
+  // gate to catch, never retroactively fails the turn. Worktrees the step first modifies are
+  // pinned here too, derived rather than declared (see below).
   //
   // The transaction protects server-side storage only: broadcasts fire on write and ignore
   // rollback (deliberate -- rerouting the subscription path through commit is out of scope),
@@ -3718,23 +3714,34 @@ class OverseerImpl implements AgentHooks {
       validateCodeChangeSchema(change);
     }
 
+    // The worktrees this step pins: every worktree of this chat its rows or commits touch that
+    // the chat holds no pin for yet. A worktree pins at its accepted commit -- the only base it
+    // can have, since only an accept moves it and none can run mid-turn -- so unlike a gadget's
+    // head pin there is nothing for the agent to declare or the barrier to validate: the barrier
+    // derives the pin from the record (the agent mirrors it in its turn state; see
+    // pinWorktreeInSession in agent.ts).
+    let codeBasePins = this.chatCodeBase(meta).pins;
+    let worktreePins = new Map<WorkpieceId, string>();
+    for (let id of [...step.changes.flatMap(({change}) => changedGadgets(change)),
+                    ...step.worktreeCommits.map(({worktreeId}) => worktreeId)]) {
+      let record = this.storage.gadgets.get(id);
+      if (record?.type === "worktree" && record.chatId === chatId &&
+          !codeBasePins.some(pin => pin.gadgetId === id)) {
+        worktreePins.set(id, record.pinBase);
+      }
+    }
+
     // Prefetch (awaits) before the synchronous transaction: current content (warming the cache
-    // the tail below requires to be current), each new pin's base tree, and the base texts of
-    // any worktree paths the buffered changes edit (worktree bases are lazy; see
-    // seedWorktreeEditBases). Worktrees created this step aren't pinned yet, so their pending
-    // records supply their bases.
+    // the tail below requires to be current), each new gadget pin's base tree, and the base
+    // texts of any worktree paths the buffered changes edit (worktree bases are lazy; see
+    // seedWorktreeEditBases), resolved against the chat's worktree pins plus the ones this step
+    // establishes.
     let baseFilesByCommit = new Map<string, Map<string, string>>();
     let worktreeBases = new Map<WorkpieceId, string>();
     let worktreeSeeds = new Map<string, string | null>();
     if (step.changes.length > 0) {
       let content = await this.getCurrentChatContent(chatId, meta);
-      worktreeBases = this.worktreePinBases(meta);
-      for (let {worktreeId} of step.createdWorktrees) {
-        let record = this.storage.gadgets.get(worktreeId);
-        if (record?.type === "worktree" && record.chatId === chatId) {
-          worktreeBases.set(worktreeId, record.pinBase);
-        }
-      }
+      worktreeBases = new Map([...this.worktreePinBases(meta), ...worktreePins]);
       if (worktreeBases.size > 0) {
         // The probe simulates only the changes' worktree entries: that is all the seed lookups
         // depend on (workpiece entries are independent), and gadget entries may not apply
@@ -3763,21 +3770,20 @@ class OverseerImpl implements AgentHooks {
         let fresh = this.storage.chatMeta.get(chatId);
         if (!fresh) return false;  // chat deleted during the prefetches
 
-        // Establish each created worktree's birth pin before the rows and the message: the pin
-        // is what buildChatContent roots the worktree's changes at, and materializeChatChanges'
+        // Establish the step's worktree pins before the rows and the message: the pin is what
+        // buildChatContent roots the worktree's changes at, and materializeChatChanges'
         // undeclared-pin stamping is what makes it durable log history on this same step's
-        // "changes" message. (A record missing here was reaped mid-step; its creation is then
-        // absent from the message too, since the tool call that recorded it died with the step.)
-        for (let {worktreeId} of step.createdWorktrees) {
-          let record = this.storage.gadgets.get(worktreeId);
-          if (record?.type !== "worktree" || record.chatId !== chatId) continue;
+        // "changes" message -- the one that records the rows or the commit() that pinned, so
+        // reverting that message unpins the worktree along with them.
+        if (worktreePins.size > 0) {
           let codeBase = this.chatCodeBase(fresh);
-          if (!codeBase.pins.some(p => p.gadgetId === worktreeId)) {
-            codeBase.pins.push({gadgetId: worktreeId, baseCommit: record.pinBase,
-                                mergedCommit: record.pinBase});
-            fresh.codeBase = codeBase;
-            this.storage.chatMeta.put(fresh);
+          for (let [gadgetId, baseCommit] of worktreePins) {
+            if (!codeBase.pins.some(p => p.gadgetId === gadgetId)) {
+              codeBase.pins.push({gadgetId, baseCommit, mergedCommit: baseCommit});
+            }
           }
+          fresh.codeBase = codeBase;
+          this.storage.chatMeta.put(fresh);
         }
 
         if (step.changes.length > 0) {
@@ -3960,8 +3966,17 @@ class OverseerImpl implements AgentHooks {
       // Prefetch any worktree edit bases the change needs (worktree content is lazy; see
       // seedWorktreeEditBases). Transforms only ever drop file changes, so prefetching for the
       // submitted change covers the transformed one; the synchronous tail re-checks against
-      // fresh content and retries on a miss.
+      // fresh content and retries on a miss. A touched worktree the chat holds no pin for yet
+      // has exactly one possible base -- its accepted commit, which the tail requires the
+      // submission's declaration (or the bridge's boundary) to name -- so it is resolved here
+      // from the record.
       let worktreeBases = this.worktreePinBases(meta);
+      for (let id of changedGadgets(submission.change)) {
+        let record = this.storage.gadgets.get(id);
+        if (record?.type === "worktree" && record.chatId === chatId && !worktreeBases.has(id)) {
+          worktreeBases.set(id, record.pinBase);
+        }
+      }
       let worktreeSeeds = new Map<string, string | null>();
       if (worktreeBases.size > 0) {
         await this.#prefetchWorktreeSeeds(content, submission.change, worktreeBases,
@@ -4107,8 +4122,8 @@ class OverseerImpl implements AgentHooks {
     }
 
     // Establish pins: validate each declaration against the gadget's current head (tolerating a
-    // parent-of-head base -- the client raced exactly one merge), idempotent against an
-    // identical existing pin, conflicting against a different one.
+    // parent-of-head base -- the client raced exactly one merge) or the worktree's accepted
+    // commit, idempotent against an identical existing pin, conflicting against a different one.
     let newPins: ChatGadgetPinState[] = [];
     let validationContent = content;
     for (let [gadgetId, baseCommit] of declarations) {
@@ -4121,10 +4136,24 @@ class OverseerImpl implements AgentHooks {
         continue;  // identical declaration: idempotent-accept
       }
       let record = this.storage.gadgets.get(gadgetId);
+      if (record?.type === "worktree") {
+        // A worktree pins at its accepted commit (WorktreeRecord.pinBase), which only an accept
+        // moves -- and an accept bumps the generation, which the tail's generation check already
+        // caught -- so an exact match is the whole rule: no parent tolerance, no retry. The
+        // content entry starts empty; edits seed their bases lazily (worktreeBases covers this
+        // worktree; see the prefetch).
+        if (record.chatId !== chatId) {
+          throw new Error(`Code change touches another chat's worktree: ${gadgetId}`);
+        }
+        if (baseCommit !== record.pinBase) {
+          throw new Error("Pin declaration does not match the worktree's accepted commit.");
+        }
+        newPins.push({gadgetId, baseCommit, mergedCommit: baseCommit});
+        continue;
+      }
       if (record?.type !== "gadget" || record.commitId === undefined) {
         // Only a pending gadget lacks a head (every permanent gadget has one, possibly the
         // empty tree -- see GadgetRecord.commitId); a pending gadget's changes need no pin.
-        // A worktree is born pinned, so a client declaration for one is likewise rejected.
         throw new Error("Cannot pin a gadget that has no committed code.");
       }
       let prefetched = pinData.get(`${gadgetId}:${baseCommit}`);
@@ -4147,12 +4176,15 @@ class OverseerImpl implements AgentHooks {
       if (record === undefined) {
         throw new Error(`Code change touches a nonexistent gadget: ${gadgetId}`);
       }
-      if (record.type === "worktree" && record.chatId !== chatId) {
-        // Worktrees are chat-private. (This chat's own worktree passes: its birth pin is in the
-        // stream, so a hand-rolled client may target it -- though stripping means it edits blind.)
-        throw new Error(`Code change touches another chat's worktree: ${gadgetId}`);
-      }
-      if (record.pending !== undefined) {
+      if (record.type === "worktree") {
+        // Worktrees are chat-private. (This chat's own worktree passes -- though until worktree
+        // deliveries reach clients, a hand-rolled client edits it blind.) Pending or not, a
+        // worktree's content is its accepted commit's tree, never built up from nothing, so
+        // the pin requirement below applies to it from creation.
+        if (record.chatId !== chatId) {
+          throw new Error(`Code change touches another chat's worktree: ${gadgetId}`);
+        }
+      } else if (record.pending !== undefined) {
         if (record.pending.chatId !== chatId) {
           throw new Error(`Code change touches a gadget pending in another chat: ${gadgetId}`);
         }
@@ -4370,9 +4402,14 @@ class OverseerImpl implements AgentHooks {
 
     // Get the proposed updates for the thread. Each covered gadget creation or binding addition
     // sits on one of these "changes" messages (see addChatMessages), so an empty list also
-    // means there is nothing to promote.
+    // means there is nothing to promote -- unless the chat still holds a worktree pin. Today a
+    // worktree pin is established only by a modification, whose message is proposed; but chats
+    // from before that carry pins their worktree was born with or re-pinned at by an earlier
+    // accept, which are never dropped by anything else. Running the epoch reset drops them
+    // (the auto-commit planning finds the worktree clean), which is how one accept moves such a
+    // chat into the current regime.
     let updates = this.getProposedChanges(chatId);
-    if (updates.length === 0) {
+    if (updates.length === 0 && !entryCodeBase.pins.some(pin => this.isWorktree(pin.gadgetId))) {
       // Nothing to merge, so this is a no-op.
       return {outcome: "merged"};
     }
@@ -4421,9 +4458,9 @@ class OverseerImpl implements AgentHooks {
     for (let record of Array.from(this.storage.gadgets.list())) {
       if (record.type === "worktree") {
         // Worktrees never gate an accept and get no head-commit work here: their content stays
-        // in the chat's change stream (their head lifecycle is their own), and the promotion
-        // sweep below still clears a covered creation's `pending`. The epoch reset preserves
-        // their content by re-pinning -- see the re-pin plan below.
+        // in the chat's change stream (their head lifecycle is their own), and recording their
+        // creation already made them permanent (see WorktreeRecord.pending). The epoch reset
+        // preserves their content by advancing their accepted commits -- see the plan below.
         continue;
       }
       if (record.pending &&
@@ -4472,17 +4509,19 @@ class OverseerImpl implements AgentHooks {
       });
     }
 
-    // Plan the worktree re-pins (see AiChatMessageBody.worktreePins): the epoch reset below
-    // evaporates every pin, so each live worktree re-pins in the new generation -- at a fresh
-    // local auto-commit capturing its uncommitted overlay when the closed epoch left it dirty,
-    // at its existing headCommit when the flattened tree happens to equal that commit's (the
-    // agent committed and then made no further edits; no new commit needed), and at its
-    // unchanged pinBase when clean. Auto-commits parent on the old pinBase and use the
-    // accepting user's identity, which is cosmetic: they are squashed out of explicit history
-    // (reported HEAD stays the last explicit commit, and a later commit() parents on it), so
-    // this identity never appears in anything pushed. Like the gadget commits above, these are
+    // Plan the worktree accepts: the commit each pinned worktree's accepted commit
+    // (WorktreeRecord.pinBase) advances to when the epoch reset below evaporates its pin, so
+    // that the content the chat accepted survives as the tree an unpinned worktree reads. That
+    // is a fresh local auto-commit capturing the uncommitted overlay when the closed epoch left
+    // the worktree dirty, its existing headCommit when the flattened tree happens to equal that
+    // commit's (the agent committed and then made no further edits; no new commit needed), and
+    // the unchanged pinBase when clean (a commit()-only epoch, or a pin from before pinning
+    // meant modification). Auto-commits parent on the old pinBase and use the accepting user's
+    // identity, which is cosmetic: they are squashed out of explicit history (reported HEAD
+    // stays the last explicit commit, and a later commit() parents on it), so this identity
+    // never appears in anything pushed. Like the gadget commits above, these are
     // content-addressed object writes -- harmless if the accept turns out stale below.
-    let worktreeRepins = new Map<WorkpieceId, string>();
+    let worktreeAccepts = new Map<WorkpieceId, string>();
     if (entryCodeBase.pins.some(pin => this.isWorktree(pin.gadgetId))) {
       let touchedByWorktree = this.#worktreeTouchedPaths(messages, statuses);
       for (let pin of entryCodeBase.pins) {
@@ -4509,7 +4548,7 @@ class OverseerImpl implements AgentHooks {
                   });
           }
         }
-        worktreeRepins.set(pin.gadgetId, newPinBase);
+        worktreeAccepts.set(pin.gadgetId, newPinBase);
       }
     }
 
@@ -4610,15 +4649,9 @@ class OverseerImpl implements AgentHooks {
       commits,
       // The merge closes the chat's epoch (see the reset below); content reconstruction
       // restarts here. Historical (pre-git) merges lack this, which is how replay tells them
-      // apart.
+      // apart. (Merges from before worktrees pinned on modification also carry `worktreePins`,
+      // which readers still honor; nothing writes it anymore.)
       epochBoundary: true,
-      // The worktree re-pins planned above: the durable record content reconstruction and
-      // compaction checkpoints re-establish worktree bases from (see
-      // AiChatMessageBody.worktreePins).
-      ...(worktreeRepins.size > 0
-          ? {worktreePins: [...worktreeRepins].map(
-                ([worktreeId, baseCommit]) => ({worktreeId, baseCommit}))}
-          : {}),
     });
 
     // The boundary map for the straggler bridge: per gadget, the commit whose tree equals the
@@ -4634,13 +4667,14 @@ class OverseerImpl implements AgentHooks {
     let discontinuousGadgets: WorkpieceId[] = [];
     for (let pin of freshCodeBase.pins) {
       if (committedIds.has(pin.gadgetId)) continue;
-      // A worktree's re-pin base is by construction the commit whose tree equals the chat's
-      // content at this reset, so it is bridge-eligible and never discontinuous: content
-      // carries across the boundary via the re-pin. (A worktree pin whose record has vanished
-      // -- a reverted creation surviving a failed reap -- falls through to the null branch.)
-      let repin = worktreeRepins.get(pin.gadgetId);
-      if (repin !== undefined) {
-        boundaries.push({gadgetId: pin.gadgetId, commitId: repin});
+      // A worktree's new accepted commit is by construction the commit whose tree equals the
+      // chat's content at this reset, so it is bridge-eligible and never discontinuous: a
+      // bridged row re-pins the worktree at it (the base submitCodeChange requires). (A
+      // worktree pin whose record has vanished -- a reverted creation surviving a failed reap
+      // -- falls through to the null branch.)
+      let accepted = worktreeAccepts.get(pin.gadgetId);
+      if (accepted !== undefined) {
+        boundaries.push({gadgetId: pin.gadgetId, commitId: accepted});
         continue;
       }
       let record = this.storage.gadgets.get(pin.gadgetId);
@@ -4655,11 +4689,9 @@ class OverseerImpl implements AgentHooks {
 
     // Close the epoch: everything the chat proposed now lives in commits, so the chat's code
     // base resets to empty -- every pin evaporates, the change stream restarts at revision 0 under
-    // a new generation, and subsequent edits re-pin lazily against the new heads. Worktrees are
-    // the one exception: they have no head for a later write to re-pin against, so their re-pins
-    // (planned above, recorded on the merge message) re-establish immediately in the new
-    // generation, with their records' pinBase advanced to match. The bump is
-    // content-preserving: the closed generation's rows are retired (not deleted) as the
+    // a new generation, and subsequent edits re-pin lazily against the new heads -- for a
+    // worktree, against its accepted commit, advanced here to the commit planned above. The
+    // bump is content-preserving: the closed generation's rows are retired (not deleted) as the
     // transform window, the boundary record above opens the straggler bridge, and `prior` tells
     // clients how to hand off (see ChatCodeBase.prior). The reset lands on the freshly-read
     // meta so concurrent changes to other fields (e.g. a title rename during the awaits)
@@ -4670,8 +4702,7 @@ class OverseerImpl implements AgentHooks {
         {chatId, generation: generationToken, finalRevision: revisionToken, boundaries});
     this.#chatContentCache.delete(chatId);
     freshMeta.codeBase = {
-      pins: [...worktreeRepins].map(([gadgetId, baseCommit]) =>
-          ({gadgetId, baseCommit, mergedCommit: baseCommit})),
+      pins: [],
       generation: generationToken + 1,
       revision: 0,
       epoch: mergeSequence,
@@ -4679,7 +4710,7 @@ class OverseerImpl implements AgentHooks {
     };
     freshMeta.lastActive = timestamp;
     this.storage.chatMeta.put(freshMeta);
-    for (let [worktreeId, newPinBase] of worktreeRepins) {
+    for (let [worktreeId, newPinBase] of worktreeAccepts) {
       let record = this.storage.gadgets.get(worktreeId);
       if (record?.type === "worktree" && record.pinBase !== newPinBase) {
         record.pinBase = newPinBase;
@@ -4857,8 +4888,9 @@ class OverseerImpl implements AgentHooks {
     // entries are ordered within a message and messages by sequence, so the first one seen per
     // worktree is the state before any reverted commit, however many the range covers. The
     // commit objects themselves remain (content-addressed, now dangling, like auto-commits), so
-    // e.g. a queued push naming a rolled-back commit id stays valid. Worktrees whose creation
-    // the revert covers are deleted below regardless.
+    // e.g. a queued push naming a rolled-back commit id stays valid. This applies equally to a
+    // worktree whose creation the revert covers: the worktree itself survives (see
+    // WorktreeRecord.pending).
     let rolledBackWorktrees = new Set<WorkpieceId>();
     for (let msg of messages) {
       if (msg.type !== "changes" || !stillProposed(msg)) continue;
@@ -5188,7 +5220,8 @@ class OverseerImpl implements AgentHooks {
       : Promise<ReadonlyMap<string, string>> {
     if (this.storage.gadgets.get(gadgetId)?.type === "worktree") {
       // Defense in depth: callers reach this through validated gadget handles, but a worktree id
-      // here would materialize chat-private worktree content into a client-facing read.
+      // here would materialize a whole repository tree into a gadget-only read -- some of which
+      // (the UI bundle) serve use-role clients, who never see worktrees.
       throw new Error(`Workpiece ${gadgetId} is a worktree, not a gadget.`);
     }
     let meta = chatId !== undefined ? this.getChatMetaOrThrow(chatId) : undefined;
@@ -5662,25 +5695,11 @@ class OverseerImpl implements AgentHooks {
   // (non-image attachments are fetched on demand via getChatAttachmentContent()), strip the
   // retired Yjs payload from pre-conversion "changes" messages -- it is kept on disk as
   // rollback insurance (see git-migration.ts) but nothing can apply it, so it must not ship as
-  // dead weight on the wire (it is not part of the message's API type) -- and strip worktree
-  // content and pins (see stripWorktreeChangeEntries; `createdWorktrees` stays, ids being
-  // deliberately visible).
+  // dead weight on the wire (it is not part of the message's API type).
   hydrateChatMessageForClient(msg: AiChatMessage): AiChatMessage {
     if (msg.type === "changes" && "update" in msg) {
       let {update: _, ...rest} = msg as AiChatMessage & {update?: Uint8Array};
       msg = rest as AiChatMessage;
-    }
-    if (msg.type === "changes") {
-      let change = msg.change && this.stripWorktreeChangeEntries(msg.change);
-      let pins = msg.pins && this.stripWorktreePins(msg.pins);
-      if (change !== msg.change || pins !== msg.pins) {
-        msg = {...msg};
-        // An emptied container is dropped outright, matching how the writer omits empty fields.
-        if (change === undefined || Object.keys(change).length === 0) delete msg.change;
-        else msg.change = change;
-        if (pins === undefined || pins.length === 0) delete msg.pins;
-        else msg.pins = pins;
-      }
     }
     if (msg.type !== "message" || !msg.attachments?.length) return msg;
     let attachments = msg.attachments.map((a) => {
@@ -6405,11 +6424,12 @@ class OverseerImpl implements AgentHooks {
   // proposed change.
   #hasPendingStructure(chatId: number, compactedTo: number): boolean {
     for (let gadget of this.storage.gadgets.list()) {
+      // Worktrees have no binding edges, and their creation proposes nothing.
+      if (gadget.type !== "gadget") continue;
       let stamped = (pending: {chatId: number, sequence?: number} | undefined) =>
           pending?.chatId === chatId && pending.sequence !== undefined &&
           pending.sequence < compactedTo;
-      if (stamped(gadget.pending)) return true;  // gadget or worktree creation alike
-      if (gadget.type !== "gadget") continue;    // worktrees have no binding edges
+      if (stamped(gadget.pending)) return true;
       for (let edge of Object.values(gadget.bindings)) {
         if (stamped(edge.pending)) return true;
       }
@@ -8415,10 +8435,14 @@ class OverseerImpl implements AgentHooks {
             this.storage.gadgets.put(gadget);
           }
         }
+        // A recorded worktree creation is permanent at once rather than stamped: creating a
+        // worktree proposes nothing (see proposedChangeWorkpieceIds), so neither an accept nor a
+        // revert has anything to decide about it -- a revert rolls back its content and head,
+        // never the worktree itself (see WorktreeRecord.pending).
         for (let {worktreeId} of msg.createdWorktrees ?? []) {
           let worktree = this.storage.gadgets.get(worktreeId);
           if (worktree?.pending?.chatId === chatId && worktree.pending.sequence === undefined) {
-            worktree.pending.sequence = sequence;
+            delete worktree.pending;
             this.storage.gadgets.put(worktree);
           }
         }
@@ -10866,10 +10890,19 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
   // --- Commit-backed code reads ---
 
-  async getCodeAtCommit(commitId: string): Promise<{files: [path: string, content: string][]}> {
-    // A list of pairs, not a path-keyed object: a file named "__proto__" is a legitimate tree
-    // entry, and RPC would drop it from an object (see Overseer.getCodeAtCommit).
-    return {files: [...await this.impl.gitStore.readCommitFiles(validateOid(commitId))]};
+  // The reads go through the git cache and so may fault-pull through a gatekeeper on the
+  // client's behalf -- reaching only commits the workspace's gatekeepers advertised or proved,
+  // nothing an agent couldn't already trigger.
+  async listTree(commitId: string): Promise<TreeNode[]> {
+    return await this.impl.gitCache.readCommitTree(validateOid(commitId));
+  }
+
+  async readFilesAtCommit(commitId: string, paths: string[])
+      : Promise<[path: string, FileAtCommit][]> {
+    if (paths.length > MAX_READ_FILES_PER_CALL) {
+      throw new Error(`Too many paths: at most ${MAX_READ_FILES_PER_CALL} per call.`);
+    }
+    return await this.impl.gitCache.readFilesAtCommit(validateOid(commitId), paths);
   }
 
   async getCommitLog(fromCommit: string, depth?: number): Promise<CommitInfo[]> {
@@ -11533,9 +11566,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       compacted: checkpoint && {
         to: checkpoint.compactedTo,
         summary: checkpoint.summary,
-        // Stripped like every delivered change payload (see stripWorktreeChangeEntries).
-        proposedChange: checkpoint.proposedChange &&
-            this.impl.stripWorktreeChangeEntries(checkpoint.proposedChange),
+        proposedChange: checkpoint.proposedChange,
       },
     };
   }
@@ -11639,12 +11670,9 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // delivered after the message catch-up above, matching their position in the stream (rows
     // are strictly newer than every materialized message of their generation). Delivered
     // unconditionally (no startAfter filtering): the client dedupes by (generation, revision).
-    // Worktree entries are stripped exactly as the live broadcast strips them (see
-    // stripWorktreeChangeEntries), revision numbering preserved.
     for (let row of this.impl.storage.chatChanges.list()) {
       if (row.retired) continue;
-      subscriber.changeApplied(row.chatId, row.generation, row.revision, row.author,
-                               impl.stripWorktreeChangeEntries(row.change),
+      subscriber.changeApplied(row.chatId, row.generation, row.revision, row.author, row.change,
                                row.submission).catch(unsubscribe);
       ++replayCount;
     }
@@ -12212,7 +12240,8 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   // The gadget list is visible to "use" collaborators (v1 shares the whole workspace), and each
   // gadget is exposed through a restricted UseGadgetClientInterface that only permits rendering
   // its deployed UI. Gadgets still provisional to a chat are withheld: they are proposals within
-  // the owner's chats, and their mainline code is empty anyway.
+  // the owner's chats, and their mainline code is empty anyway. Worktrees are withheld likewise,
+  // being chat-private (and readable only through the build-only commit reads).
   async subscribeToWorkpieces(subscriber: RpcStub<WorkpiecesSubscriber>): Promise<RpcStub<{}>> {
     return this.#subscriptionLease(this.impl.subscribeToWorkpieces(subscriber, false));
   }
@@ -12236,7 +12265,9 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
       : Promise<{generation: number, revision: number}> {
     this.#deny();
   }
-  async getCodeAtCommit(_commitId: string): Promise<{files: [path: string, content: string][]}> {
+  async listTree(_commitId: string): Promise<TreeNode[]> { this.#deny(); }
+  async readFilesAtCommit(_commitId: string, _paths: string[])
+      : Promise<[path: string, FileAtCommit][]> {
     this.#deny();
   }
   async getCommitLog(_fromCommit: string, _depth?: number): Promise<CommitInfo[]> {

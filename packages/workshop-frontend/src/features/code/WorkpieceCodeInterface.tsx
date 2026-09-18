@@ -1,52 +1,82 @@
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react'
 import { useKumoToastManager } from '@cloudflare/kumo'
-import { DownloadSimple, List } from '@phosphor-icons/react'
-import { Overseer, WorkpieceId } from '@gadgets/workshop-shared/api'
-import type { CodeChange, FileChange, TextChange } from '@gadgets/workshop-shared/code-change'
+import { DownloadSimple, GitBranch, List } from '@phosphor-icons/react'
+import type {
+  FileAtCommit, Overseer, WorkpieceId, WorkpieceSummary,
+} from '@gadgets/workshop-shared/api'
+import {
+  MAX_FILE_TEXT_LENGTH, type CodeChange, type FileChange, type TextChange,
+} from '@gadgets/workshop-shared/code-change'
 import { RpcStub } from 'capnweb'
-import FileSidebar from './FileSidebar'
-import type { FileChangeStatus, FileSidebarHandle } from './FileSidebar'
-import { WorkshopButton, WorkshopIconButton } from './components/WorkshopControls'
+import FileBrowser, { isOpenableKind, type ExpandedDirs, type FileBrowserHandle } from './FileBrowser'
+import { WorkshopButton, WorkshopIconButton } from '../../components/WorkshopControls'
 import CodeEditor, { type EditSession } from './CodeEditor'
 import CodeDiffEditor from './CodeDiffEditor'
 import type {
   ChatCodeChanges, ChatLiveChangeRows, ChatLiveEditPreviews, EditPreviewEvent,
-} from './ChatInterface'
+} from '../../ChatInterface'
 import { ChatOtClient, type RemoteFileEvent } from './otClient'
-import { reportIssue } from './errorReporting'
-import { saveTextToFile } from './fileTransfers'
-import { isTransientRpcError } from './rpcErrors'
+import { commitFileStore, type CommitFileReader } from './commitFileStore'
+import { useCommitTree, useFilesAtCommit } from './useCommitContent'
+import {
+  EMPTY_BROWSER_TREE, browserTreePaths, buildBrowserTree, deriveChanges, type ChangedFile,
+  type FileChangeStatus,
+} from './workpieceTree'
+import { reportIssue } from '../../errorReporting'
+import { saveTextToFile } from '../../fileTransfers'
+import { isTransientRpcError } from '../../rpcErrors'
 
-// The code view over git-backed gadget code.
+// The code view over a workpiece's git-backed files -- a gadget's code or a worktree's checkout.
+// The two differ here in exactly two places: which summary field names the *accepted commit*
+// (a gadget's `commitId`, a worktree's `pinBase`; see acceptedCommitOf), and what the workpiece
+// is called in copy. Everything else is one code path.
 //
-// Committed code is git commits; the gadget's head commit (`headCommitId`, from
-// WorkpieceSummary.commitId) is fetched with Overseer.getCodeAtCommit() -- immutable, so cached
-// by oid -- and is both the read-only view outside any chat and the "original" side of in-chat
-// diffs. A chat's uncommitted changes are a revisioned stream of code changes (see ChatCodeBase in
-// the API), tracked here by a per-chat ChatOtClient (see otClient.ts): the chat's content is
-// its pins' base trees plus the epoch's recorded changes plus live rows, and the user's edits are
-// composed locally and submitted through Overseer.submitCodeChange().
+// Committed content is git commits, read lazily through the per-commit file store (see
+// commitFileStore.ts): Overseer.listTree() for a commit's tree, Overseer.readFilesAtCommit()
+// for content by path, both immutable and cached by oid. Two commits matter here and are kept
+// apart:
+//  - The *content base* is what the chat's content is built on: the chat pin's base commit when
+//    the workpiece is pinned in the selected chat, else the accepted commit. The tree, an
+//    untouched file's text, and the seed for a local edit all come from it -- what the agent
+//    reads.
+//  - The *review base* is what "changed" means: the diff's original side and the statuses are
+//    computed against it. It is the pin's `mergedCommit` -- the mainline commit whose content
+//    has been merged into the chat -- else the accepted commit. That is exactly what accepting
+//    would apply: a chat not updated from mainline diffs against its pin, so mainline's later
+//    commits never show up (accepting doesn't revert them, it is blocked until they are merged
+//    in); once updateChatFromMainline has imported them as rows, `mergedCommit` has advanced
+//    past the pin and those rows compare equal and vanish, rather than being listed as this
+//    chat's own changes. Accept requires `mergedCommit === head`, so where it is enabled the
+//    two agree.
+// The two coincide except for a gadget chat that has been updated from mainline. For a worktree
+// they always coincide (it has no mainline), and in particular the worktree's own `headCommit`
+// -- the agent's last explicit commit -- plays no role: an agent that edits and immediately
+// commits still shows its work against the last *accepted* commit.
 //
-// A gadget not pinned in the chat tracks mainline head live. The user can start editing it
-// without any round trip: the editor shows the head tree, and the first local edit seeds the
-// client's content from that same tree and declares the pin on its next submission (the
-// first-keystroke pin flow; see ChatOtClient.ensureGadgetEditable). If the server refuses a
-// submission -- the chat's generation moved destructively under a revert/draft-discard, or the
-// pin declaration lost a race -- the queued local edits are discarded with a notice and the
-// view rebuilds from server state, per ChatCodeBase.generation's contract. Merges don't
-// discard anything: the client rides the epoch reset (and the server's straggler bridge)
-// seamlessly.
+// A chat's uncommitted changes are a revisioned stream of code changes (see ChatCodeBase in the
+// API), tracked here by a per-chat ChatOtClient (see otClient.ts). Its content is sparse: for
+// a pinned workpiece it holds only the paths the epoch touched (plus tombstones for removals),
+// so "touched" is exactly "in the client's files or removed paths", and the view reads
+// everything else from the content base. The user's edits are composed locally and submitted
+// through Overseer.submitCodeChange().
 //
-// There is no standalone (out-of-chat) editing: gadget heads only advance when a chat's
+// A workpiece not pinned in the chat tracks its accepted commit live. The user can start editing
+// it without any extra round trip: the editor shows the base text the store already loaded, and
+// the first local edit seeds the client with just that path's base text and declares the pin
+// on its next submission (the first-keystroke pin flow; see ChatOtClient.ensureFileEditable).
+// If the server refuses a submission -- the chat's generation moved destructively under a
+// revert/draft-discard, or the pin declaration lost a race -- the queued local edits are
+// discarded with a notice and the view rebuilds from server state, per
+// ChatCodeBase.generation's contract. Merges don't discard anything: the client rides the
+// epoch reset (and the server's straggler bridge) seamlessly.
+//
+// There is no standalone (out-of-chat) editing: accepted commits only advance when a chat's
 // changes are accepted.
 
-interface GadgetCodeInterfaceProps {
+interface WorkpieceCodeInterfaceProps {
   overseer: RpcStub<Overseer>
-  // The selected workpiece: the gadget whose files the editor shows.
-  workpieceId: WorkpieceId
-  // The selected workpiece's head commit (WorkpieceSummary.commitId). Absent while the gadget
-  // is still pending in a chat, which reads as an empty committed file set.
-  headCommitId?: string
+  // The selected workpiece, whose files the editor shows.
+  summary: WorkpieceSummary
   height?: string | number
   selectedChatId?: number | null
   // The selected chat's durable code state (see ChatCodeChanges): its ChatCodeBase plus the
@@ -68,28 +98,20 @@ interface GadgetCodeInterfaceProps {
   onHasCodeChange?: (hasCode: boolean) => void
 }
 
-const EMPTY_FILES: ReadonlyMap<string, string> = new Map()
 const NO_PENDING_GADGETS: ReadonlySet<WorkpieceId> = new Set()
+const NO_PATHS: readonly string[] = []
+const NO_REMOVED: ReadonlySet<string> = new Set()
+const NO_CHANGES: readonly ChangedFile[] = []
 
-// Commit trees are immutable, so their file maps are cached by oid for the page's lifetime --
-// across chat switches, workpiece switches, and component remounts. Failures are evicted so a
-// later attempt retries.
-const commitFilesCache = new Map<string, Promise<ReadonlyMap<string, string>>>()
-
-function fetchCommitFiles(
-  overseer: RpcStub<Overseer>, commitId: string,
-): Promise<ReadonlyMap<string, string>> {
-  let cached = commitFilesCache.get(commitId)
-  if (!cached) {
-    cached = overseer.getCodeAtCommit(commitId).then(
-      ({ files }) => new Map(files) as ReadonlyMap<string, string>)
-    cached.catch(() => commitFilesCache.delete(commitId))
-    commitFilesCache.set(commitId, cached)
-  }
-  return cached
+// The workpiece's accepted commit -- the content and review base while it is unpinned in the
+// selected chat. The one place the two workpiece types are told apart for content: a gadget's
+// mainline head, a worktree's last-accepted commit. Absent while a gadget is still pending in a
+// chat, which reads as an empty committed file set.
+function acceptedCommitOf(summary: WorkpieceSummary): string | undefined {
+  return summary.type === 'worktree' ? summary.pinBase : summary.commitId
 }
 
-function areArraysEqual(left: string[], right: string[]) {
+function areArraysEqual(left: readonly string[], right: readonly string[]) {
   if (left.length !== right.length) return false
   for (let i = 0; i < left.length; i++) {
     if (left[i] !== right[i]) return false
@@ -106,10 +128,14 @@ function areArraysEqual(left: string[], right: string[]) {
 // arrives (rows land in call order; see the interception in the client's onRemoteChange) or an
 // editPreviewClear withdraws it. Same-file previews stack: a later call's span is located in the
 // text of the finished preview beneath it, mirroring how the agent computes each edit against
-// content that includes its earlier edits.
+// content that includes its earlier edits. A preview targets a file whose text may not be
+// loaded yet (content is read lazily): attachment then waits for the read, deltas accumulating
+// meanwhile, and a preview that finishes streaming before the read lands is *deferred* and
+// joins its file's pending chain once it does -- never dropped.
 
 // The call whose content is currently streaming, attached to the display or not (attachment
 // waits for the target's content to load; `text` is cumulative, so attaching can happen late).
+// Also the shape of a deferred preview (see deferredPreviewsRef).
 type StreamingPreview = {
   toolCallId: string
   gadgetId: WorkpieceId
@@ -118,6 +144,19 @@ type StreamingPreview = {
   textToReplace?: string
   // The streamed text received so far.
   text: string
+}
+
+// Where a preview's streamed text goes in `fileText`: the whole file for writeFile, editFile's
+// uniquely matched span otherwise. Null when there is no unique match -- the tool call itself
+// will fail the same test (or our copy has diverged, and anchoring the preview would show it in
+// the wrong place), so no preview is shown.
+function locatePreviewSpan(
+  preview: StreamingPreview, fileText: string | undefined,
+): { from: number; to: number } | null {
+  if (preview.textToReplace === undefined) return { from: 0, to: fileText?.length ?? 0 }
+  const matchPos = fileText !== undefined ? fileText.indexOf(preview.textToReplace) : -1
+  if (matchPos < 0 || fileText!.indexOf(preview.textToReplace, matchPos + 1) >= 0) return null
+  return { from: matchPos, to: matchPos + preview.textToReplace.length }
 }
 
 // The streaming preview's rendering: the streamed `text` replaces [from, to) of `base` -- the
@@ -168,15 +207,18 @@ function replaceSpanTextChange(
   return change
 }
 
-export default function GadgetCodeInterface({
-  overseer, workpieceId, headCommitId, height = '100%', selectedChatId = null, chatChanges,
+export default function WorkpieceCodeInterface({
+  overseer, summary, height = '100%', selectedChatId = null, chatChanges,
   liveRows, liveEditPreviews, pendingGadgetIds, streamingActiveFile, isAgentActive,
   isVisible = true, onHasCodeChange,
-}: GadgetCodeInterfaceProps) {
+}: WorkpieceCodeInterfaceProps) {
   const toasts = useKumoToastManager()
   const toastsRef = useRef(toasts)
   toastsRef.current = toasts
   const branchMode = selectedChatId !== null
+  const workpieceId = summary.id
+  const acceptedCommit = acceptedCommitOf(summary)
+  const workpieceNoun = summary.type === 'worktree' ? 'worktree' : 'gadget'
 
   // Keep refs to the current props so long-lived callbacks (the OT client delegate, editor
   // sessions) always read the latest values.
@@ -184,45 +226,37 @@ export default function GadgetCodeInterface({
   currentOverseerRef.current = overseer
   const workpieceIdRef = useRef(workpieceId)
   workpieceIdRef.current = workpieceId
-  const headCommitIdRef = useRef(headCommitId)
-  headCommitIdRef.current = headCommitId
 
-  // The committed head's file map, fetched by oid (see fetchCommitFiles). `commitId` records
-  // which commit the entry is for, so a switch to a different gadget or a head advance reads as
-  // "loading" rather than briefly showing the previous commit's files.
-  const [headFilesState, setHeadFilesState] =
-    useState<{ commitId: string, files: ReadonlyMap<string, string> } | null>(null)
-  // A failed head fetch renders an error state with a retry (fetchCommitFiles evicts failures
-  // from its cache, so bumping the token genuinely refetches); without this the pane would sit
-  // in its loading state forever, since nothing else re-triggers the fetch.
-  const [headLoadFailed, setHeadLoadFailed] = useState(false)
-  const [headRetryToken, setHeadRetryToken] = useState(0)
+  // The store reads through the current stub; the adapter's identity follows it so the hooks'
+  // effects re-run on a reconnect.
+  const reader = useMemo<CommitFileReader>(() => ({
+    listTree: commitId => overseer.listTree(commitId),
+    readFilesAtCommit: (commitId, paths) => overseer.readFilesAtCommit(commitId, paths),
+  }), [overseer])
+  const readerRef = useRef(reader)
+  readerRef.current = reader
+
+  // The content and review bases (see the module comment), from the selected chat's pin for
+  // this workpiece, else the accepted commit. Both undefined for a pending (chat-created)
+  // gadget, whose content is the overlay alone.
+  const chatPin = branchMode && chatChanges !== undefined && chatChanges.chatId === selectedChatId
+    ? chatChanges.codeBase?.pins.find(pin => pin.gadgetId === workpieceId)
+    : undefined
+  const contentBase = chatPin?.baseCommit ?? acceptedCommit
+  const contentBaseRef = useRef(contentBase)
+  contentBaseRef.current = contentBase
+  const reviewBase = chatPin?.mergedCommit ?? acceptedCommit
+
+  // The content base's tree. A failed fetch renders an error state with a retry (the store
+  // evicts failures, so bumping the token genuinely refetches); without it the pane would sit
+  // in its loading state forever.
+  const [treeRetryToken, setTreeRetryToken] = useState(0)
+  const { tree: baseTree, error: treeError } = useCommitTree(reader, contentBase, treeRetryToken)
   useEffect(() => {
-    setHeadLoadFailed(false)
-    if (headCommitId === undefined) return
-    let cancelled = false
-    fetchCommitFiles(overseer, headCommitId)
-      .then(files => {
-        if (!cancelled) setHeadFilesState({ commitId: headCommitId, files })
-      })
-      .catch(err => {
-        if (cancelled) return
-        console.error('Failed to load committed code:', err)
-        reportIssue('code-view.head-commit', err, { handled: true })
-        setHeadLoadFailed(true)
-      })
-    return () => { cancelled = true }
-  }, [headCommitId, overseer, headRetryToken])
-
-  // The committed files currently applicable: an absent head reads as an empty committed file
-  // set (the gadget is still pending in a chat); null while the head's tree is still loading.
-  const headFiles: ReadonlyMap<string, string> | null = headCommitId === undefined
-    ? EMPTY_FILES
-    : headFilesState !== null && headFilesState.commitId === headCommitId
-      ? headFilesState.files
-      : null
-  const headFilesRef = useRef(headFiles)
-  headFilesRef.current = headFiles
+    if (treeError === null) return
+    console.error('Failed to load committed code:', treeError)
+    reportIssue('code-view.commit-tree', treeError, { handled: true })
+  }, [treeError])
 
   // ---- OT client (one per selected chat) --------------------------------------------------
 
@@ -242,15 +276,20 @@ export default function GadgetCodeInterface({
 
   // Streaming edit-preview state (see the module comment above PreviewOverlay): the call whose
   // content is streaming, its display overlay once attached, finished previews awaiting their
-  // durable rows (per file, in call order), and the call whose preview could not attach (no
-  // unique textToReplace match) and stays skipped. `retryPreviewAttachRef` is the attach
-  // function, installed by the subscription effect (it closes over the OT client) so readiness
-  // changes and the row interception can retry/re-anchor attachment.
+  // durable rows (per file, in call order), finished previews that could not attach because
+  // their file's base text was still loading (in call order; they join the pending chains once
+  // it lands -- see attachDeferred), and the call whose preview could not attach (no unique
+  // textToReplace match) and stays skipped. `retryPreviewAttachRef` is the attach function,
+  // installed by the subscription effect (it closes over the OT client) so readiness changes
+  // and the row interception can retry/re-anchor attachment. `previewBaseReadsRef` dedupes the
+  // base reads attachment kicks off, keyed like the previews.
   const streamingPreviewRef = useRef<StreamingPreview | null>(null)
   const activeOverlayRef = useRef<PreviewOverlay | null>(null)
   const pendingPreviewsRef = useRef(new Map<string, PendingPreview[]>())
+  const deferredPreviewsRef = useRef<StreamingPreview[]>([])
   const skippedPreviewRef = useRef<string | null>(null)
   const retryPreviewAttachRef = useRef<(() => void) | null>(null)
+  const previewBaseReadsRef = useRef(new Set<string>())
 
   const dispatchFileChange = useCallback(
     (gadgetId: WorkpieceId, path: string, change: FileChange) => {
@@ -278,7 +317,17 @@ export default function GadgetCodeInterface({
     }
     const chatId = selectedChatId
     const client = new ChatOtClient({
-      fetchCommitFiles: commitId => fetchCommitFiles(currentOverseerRef.current, commitId),
+      fetchFilesAtCommit: async (commitId, paths) => {
+        const files = await commitFileStore.readFiles(readerRef.current, commitId, paths)
+        const texts = new Map<string, string | null>()
+        for (const [path, file] of files) {
+          if (file.kind === 'unreadable') {
+            throw new Error(`base of an edited file is unreadable: ${path}: ${file.message}`)
+          }
+          texts.set(path, file.kind === 'text' ? file.text : null)
+        }
+        return texts
+      },
       submitCodeChange: submission =>
         currentOverseerRef.current.submitCodeChange(chatId, submission),
       isTransientError: isTransientRpcError,
@@ -289,6 +338,7 @@ export default function GadgetCodeInterface({
           streamingPreviewRef.current = null
           activeOverlayRef.current = null
           pendingPreviewsRef.current.clear()
+          deferredPreviewsRef.current.length = 0
           setResetToken(token => token + 1)
         } else {
           for (const event of events) {
@@ -317,7 +367,28 @@ export default function GadgetCodeInterface({
               retryPreviewAttachRef.current?.()
               continue
             }
+            // A finished preview still waiting for its base text is resolved by its row the
+            // same way -- except that nothing was ever displayed for it, so the row applies as
+            // an ordinary change. Left in place, it would attach later against the post-row
+            // text and show the edit twice (or fail to match and be skipped).
+            const deferred = deferredPreviewsRef.current
+            const deferredIndex = deferred.findIndex(preview =>
+              preview.gadgetId === event.gadgetId && preview.path === event.path)
+            if (deferredIndex >= 0) {
+              deferred.splice(deferredIndex, 1)
+              dispatchFileChange(event.gadgetId, event.path, event.change)
+              continue
+            }
             const overlay = activeOverlayRef.current
+            const streaming = streamingPreviewRef.current
+            if (overlay === null && streaming !== null && streaming.gadgetId === event.gadgetId &&
+                streaming.path === event.path) {
+              // The streaming call completed before its preview could attach (its base text
+              // was still loading): its row is the whole of its effect.
+              streamingPreviewRef.current = null
+              dispatchFileChange(event.gadgetId, event.path, event.change)
+              continue
+            }
             if (overlay !== null && overlay.gadgetId === event.gadgetId &&
                 overlay.path === event.path) {
               activeOverlayRef.current = null
@@ -369,6 +440,8 @@ export default function GadgetCodeInterface({
   const client = clientState !== null && clientState.chatId === selectedChatId
     ? clientState.client
     : null
+  const clientRef = useRef(client)
+  clientRef.current = client
 
   // Feed live rows to the client by subscribing to the chat's row stream: retained rows are
   // replayed at subscribe time (the client dedupes by (generation, revision)) and new rows
@@ -410,13 +483,37 @@ export default function GadgetCodeInterface({
     if (client === null || liveEditPreviews === undefined ||
         liveEditPreviews.chatId !== selectedChatId) return
 
-    // The file's real (non-previewed) content source: the chat's content when it covers the
-    // gadget, the committed head otherwise. `undefined` while still loading.
-    const resolveRealFiles = (gadgetId: WorkpieceId): ReadonlyMap<string, string> | undefined => {
+    // The file's real (non-previewed) text: the chat's content when it holds the path (or shows
+    // it removed), else the path's text at the selected gadget's content base. `undefined`
+    // while still loading -- a base text not yet in the store is fetched, and attachment
+    // retried when it lands (`text` is cumulative, so attaching late loses nothing). Only the
+    // selected gadget's base is known here; another gadget's preview attaches once selected.
+    const resolveRealText = (gadgetId: WorkpieceId, path: string): { text?: string } | undefined => {
       if (!client.isReady()) return undefined
-      if (client.hasGadget(gadgetId)) return client.getFiles(gadgetId)
-      if (gadgetId === workpieceIdRef.current) return headFilesRef.current ?? undefined
-      return undefined
+      const files = client.getFiles(gadgetId)
+      if (files !== undefined) {
+        const text = files.get(path)
+        if (text !== undefined) return { text }
+        if (client.getRemovedPaths(gadgetId).has(path)) return {}
+      }
+      if (gadgetId !== workpieceIdRef.current) return undefined
+      const base = contentBaseRef.current
+      if (base === undefined) return {}  // a pending gadget: nothing but the overlay
+      const known = commitFileStore.peekFile(base, path)
+      if (known === undefined) {
+        const readKey = fileKey(gadgetId, path)
+        if (!previewBaseReadsRef.current.has(readKey)) {
+          previewBaseReadsRef.current.add(readKey)
+          commitFileStore.readFiles(readerRef.current, base, [path]).then(
+            () => {
+              previewBaseReadsRef.current.delete(readKey)
+              retryPreviewAttachRef.current?.()
+            },
+            () => { previewBaseReadsRef.current.delete(readKey) })
+        }
+        return undefined
+      }
+      return known.kind === 'text' ? { text: known.text } : {}
     }
 
     // Restore one file's open editors to what the display shows without the streaming overlay:
@@ -428,48 +525,72 @@ export default function GadgetCodeInterface({
       if (chain !== undefined && chain.length > 0) {
         text = chain[chain.length - 1].text
       } else {
-        const files = resolveRealFiles(gadgetId)
-        if (files === undefined) return
-        text = files.get(path)
+        const real = resolveRealText(gadgetId, path)
+        if (real === undefined) return
+        text = real.text
       }
       dispatchFileChange(gadgetId, path, text !== undefined ? { set: text } : { remove: true })
     }
 
+    // The text a preview of `path` stacks on: the newest finished preview of the file (the
+    // agent computed its edit against content that includes that call's edit, whose row hasn't
+    // landed yet), else the real text. Undefined while the real text is still loading.
+    const previewBaseText = (gadgetId: WorkpieceId, path: string): { text?: string } | undefined => {
+      const chain = pendingPreviewsRef.current.get(fileKey(gadgetId, path))
+      if (chain !== undefined && chain.length > 0) return { text: chain[chain.length - 1].text }
+      return resolveRealText(gadgetId, path)
+    }
+
+    // Move finished previews whose base text has since arrived onto their files' pending
+    // chains, in call order, dispatching each file's resulting text to its open editors. A
+    // preview whose base is still loading blocks only the later previews of its own file (they
+    // stack on it); other files' previews proceed.
+    const attachDeferred = () => {
+      const deferred = deferredPreviewsRef.current
+      const blocked = new Set<string>()
+      for (let i = 0; i < deferred.length;) {
+        const preview = deferred[i]
+        const key = fileKey(preview.gadgetId, preview.path)
+        const base = blocked.has(key) ? undefined : previewBaseText(preview.gadgetId, preview.path)
+        if (base === undefined) {
+          blocked.add(key)
+          i++
+          continue
+        }
+        deferred.splice(i, 1)
+        const span = locatePreviewSpan(preview, base.text)
+        if (span === null) continue  // no unique match: nothing to show (see locatePreviewSpan)
+        const fileText = base.text ?? ''
+        const text = fileText.slice(0, span.from) + preview.text + fileText.slice(span.to)
+        let chain = pendingPreviewsRef.current.get(key)
+        if (chain === undefined) {
+          chain = []
+          pendingPreviewsRef.current.set(key, chain)
+        }
+        chain.push({ toolCallId: preview.toolCallId, text })
+        dispatchFileChange(preview.gadgetId, preview.path, { set: text })
+        bumpContentVersion()
+      }
+    }
+
     // Attach the streaming preview's overlay, if its base content is available. Idempotent and
     // late-callable (`text` is cumulative): retried on every delta, on readiness changes (the
-    // client's first snapshot, the head tree arriving), and by the row interception's
-    // re-anchoring.
+    // client's first snapshot, a base text arriving), and by the row interception's
+    // re-anchoring. Deferred previews go first: the streaming one may stack on them.
     const tryAttach = () => {
+      attachDeferred()
       const streaming = streamingPreviewRef.current
       if (streaming === null || activeOverlayRef.current !== null) return
       if (skippedPreviewRef.current === streaming.toolCallId) return
-      const chain = pendingPreviewsRef.current.get(fileKey(streaming.gadgetId, streaming.path))
-      let fileText: string | undefined
-      if (chain !== undefined && chain.length > 0) {
-        // Stack on the finished preview beneath: the agent computed this edit against content
-        // that includes that call's edit, whose row hasn't landed yet.
-        fileText = chain[chain.length - 1].text
-      } else {
-        const files = resolveRealFiles(streaming.gadgetId)
-        if (files === undefined) return // still loading; retried per the note above
-        fileText = files.get(streaming.path)
+      const streamingBase = previewBaseText(streaming.gadgetId, streaming.path)
+      if (streamingBase === undefined) return // still loading; retried per the note above
+      const fileText = streamingBase.text
+      const span = locatePreviewSpan(streaming, fileText)
+      if (span === null) {
+        skippedPreviewRef.current = streaming.toolCallId
+        return
       }
-      let from: number
-      let to: number
-      if (streaming.textToReplace !== undefined) {
-        const matchPos = fileText !== undefined ? fileText.indexOf(streaming.textToReplace) : -1
-        if (matchPos < 0 || fileText!.indexOf(streaming.textToReplace, matchPos + 1) >= 0) {
-          // No unique match: the tool call itself will fail the same test (or our copy has
-          // diverged, and anchoring the preview would show it in the wrong place). No preview.
-          skippedPreviewRef.current = streaming.toolCallId
-          return
-        }
-        from = matchPos
-        to = matchPos + streaming.textToReplace.length
-      } else {
-        from = 0
-        to = fileText?.length ?? 0
-      }
+      const { from, to } = span
       const base = fileText ?? ''
       activeOverlayRef.current = {
         toolCallId: streaming.toolCallId,
@@ -492,11 +613,19 @@ export default function GadgetCodeInterface({
     // End the streaming preview's delta stream, keeping its final text displayed as a pending
     // entry until its durable row (or a clear) resolves it -- restoring the file here would
     // make each edit vanish until the calls execute, which happens only after the whole model
-    // response has streamed.
+    // response has streamed. One that never attached because its base text is still loading
+    // is deferred rather than dropped: with content read lazily, a short edit followed by the
+    // next call routinely finishes inside that read's round trip.
     const finalizeStreaming = () => {
+      const streaming = streamingPreviewRef.current
       streamingPreviewRef.current = null
       const overlay = activeOverlayRef.current
-      if (overlay === null) return // never attached: nothing is displayed to keep
+      if (overlay === null) {
+        if (streaming !== null && skippedPreviewRef.current !== streaming.toolCallId) {
+          deferredPreviewsRef.current.push(streaming)
+        }
+        return
+      }
       activeOverlayRef.current = null
       const key = fileKey(overlay.gadgetId, overlay.path)
       let chain = pendingPreviewsRef.current.get(key)
@@ -556,6 +685,13 @@ export default function GadgetCodeInterface({
             }
             break
           }
+          // A finished preview still waiting for its base: nothing is displayed for it.
+          const deferred = deferredPreviewsRef.current
+          const deferredIndex = deferred.findIndex(entry => entry.toolCallId === event.toolCallId)
+          if (deferredIndex >= 0) {
+            deferred.splice(deferredIndex, 1)
+            break
+          }
           // A finished preview: remove its pending entry. Only a tail removal changes the
           // display; a mid-chain removal leaves the later previews' stacked text visible, and
           // the row interception's mismatch check self-heals when their rows arrive.
@@ -592,14 +728,14 @@ export default function GadgetCodeInterface({
           streamingPreviewRef.current = null
           activeOverlayRef.current = null
           pendingPreviewsRef.current.clear()
+          deferredPreviewsRef.current.length = 0
           if (affected.size > 0) {
             for (const key of affected) {
               const [gadgetId, path] = splitFileKey(key)
-              const files = resolveRealFiles(gadgetId)
-              if (files === undefined) continue
-              const text = files.get(path)
+              const real = resolveRealText(gadgetId, path)
+              if (real === undefined) continue
               dispatchFileChange(gadgetId, path,
-                text !== undefined ? { set: text } : { remove: true })
+                real.text !== undefined ? { set: real.text } : { remove: true })
             }
             bumpContentVersion()
           }
@@ -615,6 +751,8 @@ export default function GadgetCodeInterface({
       streamingPreviewRef.current = null
       activeOverlayRef.current = null
       pendingPreviewsRef.current.clear()
+      deferredPreviewsRef.current.length = 0
+      previewBaseReadsRef.current.clear()
     }
   }, [client, liveEditPreviews, selectedChatId, dispatchFileChange, bumpContentVersion])
 
@@ -625,19 +763,21 @@ export default function GadgetCodeInterface({
   void contentVersion
 
   // A preview that couldn't attach while its base content was unavailable retries when that
-  // changes -- the client's first snapshot folds, the committed head's tree arrives, or the
-  // selection switches to the previewed gadget (the head fallback in resolveRealFiles applies
-  // only to the selected gadget, and headFiles alone doesn't signal such a switch: between two
-  // headless gadgets it stays the same EMPTY_FILES instance). Without this, a short edit (whose
-  // whole preview streams before the base is available) would deliver no further delta to retry
-  // on and never appear.
+  // changes -- the client's first snapshot folds, the content base moves, or the selection
+  // switches to the previewed gadget (the base fallback in resolveRealText applies only to the
+  // selected gadget). Without this, a short edit (whose whole preview streams before the base
+  // is available) would deliver no further delta to retry on and never appear.
   useEffect(() => {
     retryPreviewAttachRef.current?.()
-  }, [clientReady, headFiles, workpieceId])
+  }, [clientReady, contentBase, workpieceId])
 
-  // The chat's uncommitted files for the selected gadget, or undefined when the gadget is not
-  // part of the chat's content (it then tracks mainline head live).
+  // The chat's content for the selected gadget -- its touched paths' text and its removed
+  // paths -- or undefined when the gadget is not part of the chat's content (it then tracks
+  // mainline head live).
   const chatFiles = clientReady ? client!.getFiles(workpieceId) : undefined
+  const removedPaths: ReadonlySet<string> =
+    clientReady && chatFiles !== undefined ? client!.getRemovedPaths(workpieceId) : NO_REMOVED
+  const removedSignature = [...removedPaths].toSorted().join('\u0000')
 
   // The preview state's display overrides for the selected gadget: each previewed file shows
   // its preview text -- the streaming overlay's, or its newest finished (pending) preview's --
@@ -656,35 +796,43 @@ export default function GadgetCodeInterface({
     }
   }
 
-  // What the view displays for the selected gadget: chat content when the chat owns it, the
-  // committed head otherwise, with the edit previews overlaid on their target files. Null
-  // while loading.
-  const baseDisplayFiles: ReadonlyMap<string, string> | null =
-    branchMode ? (chatFiles ?? headFiles) : headFiles
-  let displayFiles = baseDisplayFiles
-  if (previewOverrides.size > 0 && baseDisplayFiles !== null) {
-    const overlaid = new Map(baseDisplayFiles)
-    for (const [path, text] of previewOverrides) overlaid.set(path, text)
-    displayFiles = overlaid
+  // The text the view displays for a path, without reading any base content: a preview's, the
+  // chat's, or -- for a path the chat removed -- null. Undefined means the path is untouched
+  // and its text is the content base's (readDisplayedText and the active-file resolution below
+  // complete the picture).
+  const overlayText = (path: string): string | undefined | null => {
+    const preview = previewOverrides.get(path)
+    if (preview !== undefined) return preview
+    if (chatFiles !== undefined) {
+      const text = chatFiles.get(path)
+      if (text !== undefined) return text
+      if (removedPaths.has(path)) return null
+    }
+    return undefined
   }
 
-  // An unpinned gadget's editor shows head content; when the head advances (another chat's
-  // accept), open editors must reload from the new tree.
-  const prevUnpinnedHeadRef = useRef(headCommitId)
+  // An unpinned workpiece's editor shows the accepted commit's content; when that advances (a
+  // gadget: another chat's accept; a worktree: this chat's), open editors must reload from the
+  // new base.
+  const prevUnpinnedBaseRef = useRef(acceptedCommit)
   useEffect(() => {
     if (!clientReady) return
-    if (!client!.hasGadget(workpieceId) && prevUnpinnedHeadRef.current !== headCommitId) {
+    if (!client!.hasGadget(workpieceId) && prevUnpinnedBaseRef.current !== acceptedCommit) {
       setResetToken(token => token + 1)
     }
-    prevUnpinnedHeadRef.current = headCommitId
-  }, [client, clientReady, headCommitId, workpieceId])
+    prevUnpinnedBaseRef.current = acceptedCommit
+  }, [client, clientReady, acceptedCommit, workpieceId])
 
   // ---- file selection ----------------------------------------------------------------------
 
   const [activeFile, setActiveFile] = useState<string | null>(null)
   const [fileDrawerOpen, setFileDrawerOpen] = useState(false)
   const [compactLayout, setCompactLayout] = useState(false)
-  const fileSidebarRef = useRef<FileSidebarHandle | null>(null)
+  const fileBrowserRef = useRef<FileBrowserHandle | null>(null)
+  // Which directories the user opened or closed in each workpiece's tree, kept for as long as
+  // this view is mounted (the workspace's session): the browser remounts on a workpiece switch,
+  // and switching back should find the tree as it was left rather than at its defaults.
+  const expandedDirsByWorkpieceRef = useRef(new Map<WorkpieceId, ExpandedDirs>())
   const fileDrawerRef = useRef<HTMLDivElement | null>(null)
   const fileDrawerTriggerRef = useRef<HTMLButtonElement | null>(null)
 
@@ -749,54 +897,132 @@ export default function GadgetCodeInterface({
     wasAgentActiveRef.current = isAgentActive
   }, [isAgentActive, selectedChatId])
 
-  // When the selected workpiece changes, the previous gadget's file selection and per-turn
-  // state are meaningless; reset so the auto-select effect picks a file from the new gadget.
-  const prevWorkpieceRef = useRef(workpieceId)
-  useEffect(() => {
-    if (prevWorkpieceRef.current === workpieceId) return
-    prevWorkpieceRef.current = workpieceId
+  // When the selected workpiece changes, the previous workpiece's file selection and per-turn
+  // state are meaningless; reset so the auto-select effect picks a file from the new one. Done
+  // during render, not in an effect: the file browser remounts in this same render (keyed by
+  // workpiece) and reveals the active file's directories, so an effect would let it open -- and
+  // remember, as the new workpiece's expansion state -- the old workpiece's path.
+  const [activeFileWorkpiece, setActiveFileWorkpiece] = useState(workpieceId)
+  if (activeFileWorkpiece !== workpieceId) {
+    setActiveFileWorkpiece(workpieceId)
     setActiveFile(null)
     hasUserSwitchedFilesThisTurnRef.current = false
-  }, [workpieceId])
+  }
 
-  // Sorted list of files the view shows: the union of committed and chat files (plus the
-  // previewed files, which may be mid-creation), so deletions remain visible (marked
-  // "deleted") and additions appear.
+  // The paths whose text differs (or may differ) from the content base: the chat's touched
+  // paths plus the previewed ones. Everything else displays the base's text and needs no
+  // review-base read.
   const previewedNamesSignature = [...previewOverrides.keys()].toSorted().join('\u0000')
-  const displayedFiles = useMemo(() => {
-    const names = new Set<string>(headFiles !== null ? headFiles.keys() : [])
-    if (branchMode && chatFiles !== undefined) {
-      for (const name of chatFiles.keys()) names.add(name)
-    }
+  const touchedPaths: readonly string[] = useMemo(() => {
+    const names = new Set<string>(chatFiles !== undefined ? chatFiles.keys() : [])
+    if (removedSignature !== '') for (const name of removedSignature.split('\u0000')) names.add(name)
     if (previewedNamesSignature !== '') {
       for (const name of previewedNamesSignature.split('\u0000')) names.add(name)
     }
     return [...names].toSorted()
-  }, [headFiles, chatFiles, branchMode, previewedNamesSignature])
+  }, [chatFiles, removedSignature, previewedNamesSignature])
+
+  // Review-base content for the touched paths and the open file: the "original" side of diffs
+  // and the source of the statuses. One coalesced read per render that adds paths.
+  const reviewPaths = useMemo(() => {
+    if (activeFile === null || touchedPaths.includes(activeFile)) return touchedPaths
+    return [...touchedPaths, activeFile].toSorted()
+  }, [touchedPaths, activeFile])
+  // A failed read of either leaves the open file's pane in an error state with a retry; the
+  // token re-runs both reads.
+  const [fileRetryToken, setFileRetryToken] = useState(0)
+  const { files: reviewFiles, error: reviewError } =
+    useFilesAtCommit(reader, branchMode ? reviewBase : undefined, reviewPaths, fileRetryToken)
+  // Content-base text for the open file, when the overlay doesn't cover it.
+  const activeBasePaths = useMemo(
+    () => (activeFile !== null ? [activeFile] : NO_PATHS), [activeFile])
+  const { files: activeBaseFiles, error: activeBaseError } =
+    useFilesAtCommit(reader, contentBase, activeBasePaths, fileRetryToken)
+
+  // ---- the tree and the changes list -------------------------------------------------------
+
+  // The displayed tree (see buildBrowserTree): the content base's tree less the chat's removals,
+  // plus the chat's and the previews' files (which may be mid-creation). Null while the base
+  // tree is loading. A removed file is not in the tree; it is reviewable from the Changes list
+  // below, which lists it as deleted while it exists at the review base.
+  //
+  // Keyed on the *set* of overlaid paths (as signatures), not on the content maps: the tree is
+  // proportional to the repository, and a keystroke must not rebuild it.
+  const presentSignature = branchMode
+    ? touchedPaths.filter(path => !removedPaths.has(path)).join('\u0000')
+    : ''
+  const browserTree = useMemo(() => {
+    if (baseTree === null) return null
+    const present = presentSignature === '' ? NO_PATHS : presentSignature.split('\u0000')
+    const removed = removedSignature === '' ? NO_REMOVED : new Set(removedSignature.split('\u0000'))
+    return buildBrowserTree(baseTree, present, removed)
+  }, [baseTree, presentSignature, removedSignature])
+
+  // Statuses against the review base. Only touched paths can differ from it: an untouched path
+  // displays the content base's text, and every path where the review base differs from the
+  // content base was touched by the rows that imported the difference. A touched path whose
+  // review-base read is still in flight has no status yet; a removed one is listed as pending
+  // meanwhile (see deriveChanges), so that if the read fails the deletion candidate is still
+  // there to select and its pane shows the error and retry. `changes` is in path order.
+  const isDiffMode = branchMode
+  let fileChangeStatuses: Map<string, FileChangeStatus> | undefined
+  let changes: readonly ChangedFile[] = NO_CHANGES
+  if (isDiffMode) {
+    const derived = deriveChanges(touchedPaths, overlayText, reviewFiles, reviewBase !== undefined)
+    fileChangeStatuses = derived.statuses
+    changes = derived.changes
+  }
+
+  // Every path the view can show, changed files first (so the auto-selection below lands on
+  // one) and then the tree's leaves in display order. Empty while the tree is loading.
+  const treePaths = useMemo(
+    () => (browserTree !== null ? browserTreePaths(browserTree.roots) : NO_PATHS), [browserTree])
+  const changedSignature = changes.map(change => change.path).join('\u0000')
+  const displayedFiles: readonly string[] = useMemo(() => {
+    if (browserTree === null) return NO_PATHS
+    const names = changedSignature === '' ? [] : changedSignature.split('\u0000')
+    const seen = new Set(names)
+    for (const path of treePaths) {
+      if (!seen.has(path)) names.push(path)
+    }
+    return names
+  }, [browserTree, treePaths, changedSignature])
   const displayedFilesRef = useRef(displayedFiles)
-  const prevDisplayedFilesRef = useRef<string[]>([])
-  // Stabilize identity so downstream memos don't churn per contentVersion bump.
+  const prevDisplayedFilesRef = useRef<readonly string[]>(NO_PATHS)
+  // Stabilize identity so downstream effects don't churn per contentVersion bump.
   const stableDisplayedFiles = areArraysEqual(prevDisplayedFilesRef.current, displayedFiles)
     ? prevDisplayedFilesRef.current
     : displayedFiles
   prevDisplayedFilesRef.current = stableDisplayedFiles
   displayedFilesRef.current = stableDisplayedFiles
+  // A displayed path's entry kind; a path not in the tree (a deleted file, listed only under
+  // Changes) opens as a file.
+  const browserTreeRef = useRef(browserTree)
+  browserTreeRef.current = browserTree
+  const leafKindOf = (path: string) => browserTreeRef.current?.leaves.get(path) ?? 'file'
+  // Whether a path currently names a file: a leaf of the displayed tree. Not the same as being
+  // listed -- a deleted (or pending) path is listed under Changes but is free to be created or
+  // renamed onto again.
+  const fileExists = (path: string) => browserTreeRef.current?.leaves.has(path) ?? false
 
-  // Auto-select the first file when files appear and nothing is selected.
+  // Auto-select a file when files appear and nothing is selected: the first changed file when
+  // there is one, else the first leaf that can open (a symlink or submodule cannot).
   useEffect(() => {
-    if (activeFile === null && stableDisplayedFiles.length > 0) {
-      setActiveFile(stableDisplayedFiles[0])
-    }
+    if (activeFile !== null) return
+    const first = stableDisplayedFiles.find(path => isOpenableKind(leafKindOf(path)))
+    if (first !== undefined) setActiveFile(first)
   }, [activeFile, stableDisplayedFiles])
 
-  // Avoid reporting an empty state before the committed files have loaded.
+  // Avoid reporting an empty state before the committed tree has loaded. The content base's
+  // tree stands in for the accepted commit's: they differ only for a chat pinned at an older
+  // commit, and whether the workpiece has code at all doesn't turn on that.
   const onHasCodeChangeRef = useRef(onHasCodeChange)
   onHasCodeChangeRef.current = onHasCodeChange
   useEffect(() => {
-    if (headFiles !== null) {
-      onHasCodeChangeRef.current?.(headFiles.size > 0)
+    if (baseTree !== null) {
+      onHasCodeChangeRef.current?.(baseTree.length > 0)
     }
-  }, [headFiles])
+  }, [baseTree])
 
   // Select the file currently being edited by the agent, unless the user has manually switched
   // files during this turn.
@@ -811,34 +1037,6 @@ export default function GadgetCodeInterface({
     }
   }, [isAgentActive, selectedChatId, streamingActiveFile, stableDisplayedFiles])
 
-  // ---- statuses ----------------------------------------------------------------------------
-
-  const isDiffMode = branchMode
-  const { changedFiles, fileChangeStatuses } = useMemo(() => {
-    const changed = new Set<string>()
-    if (!isDiffMode || headFiles === null || displayFiles === null) {
-      return { changedFiles: changed, fileChangeStatuses: undefined }
-    }
-    const statuses = new Map<string, FileChangeStatus>()
-    for (const name of stableDisplayedFiles) {
-      const original = headFiles.get(name)
-      const preview = displayFiles.get(name)
-      if (original === undefined && preview !== undefined) {
-        statuses.set(name, 'added')
-        changed.add(name)
-      } else if (original !== undefined && preview === undefined) {
-        statuses.set(name, 'deleted')
-        changed.add(name)
-      } else if (original !== preview) {
-        statuses.set(name, 'modified')
-        changed.add(name)
-      } else {
-        statuses.set(name, 'unchanged')
-      }
-    }
-    return { changedFiles: changed, fileChangeStatuses: statuses }
-  }, [isDiffMode, headFiles, displayFiles, stableDisplayedFiles])
-
   // ---- editing -----------------------------------------------------------------------------
 
   // Editing is locked outside a chat (committed code only changes through a chat's accept),
@@ -846,27 +1044,31 @@ export default function GadgetCodeInterface({
   // content has loaded.
   const isEditingLocked = !branchMode || isAgentActive || !clientReady
 
-  // Make the selected gadget part of the chat's content if it isn't yet: the first local edit
-  // to an unpinned gadget pins it at the head tree the user is looking at.
-  const ensureEditable = useCallback(() => {
-    const activeClient = client
-    if (activeClient === null) return false
-    if (!activeClient.hasGadget(workpieceIdRef.current)) {
-      activeClient.ensureGadgetEditable(
-        workpieceIdRef.current, headCommitIdRef.current, headFilesRef.current ?? EMPTY_FILES)
-    }
-    return true
-  }, [client])
-
+  // Apply whole-file operations (create / delete / rename) as local changes. `set` and `remove`
+  // need no base text; the seeding call matters for an unpinned gadget, which it makes part of
+  // the chat's content (with nothing held) so the pin is declared on submission.
   const applyLocalFileChanges = useCallback((changes: [string, FileChange][]) => {
-    if (!ensureEditable() || client === null) return false
+    if (client === null) return false
+    for (const [path] of changes) {
+      client.ensureFileEditable(workpieceIdRef.current, contentBaseRef.current, path, undefined)
+    }
     const change: CodeChange = { [workpieceIdRef.current]: changes }
     client.applyLocalChange(change)
     // Local edits get no client notification (our own echo is silent -- see
     // ChatOtClientDelegate.onRemoteChange), so re-derive the file list and statuses here.
     bumpContentVersion()
     return true
-  }, [client, ensureEditable, bumpContentVersion])
+  }, [client, bumpContentVersion])
+
+  // The text of a path at the content base, read through the store (for operations on files
+  // the overlay doesn't cover, whose text may not be loaded yet). Null when it has none.
+  const readBaseText = useCallback(async (path: string): Promise<string | null> => {
+    const base = contentBaseRef.current
+    if (base === undefined) return null
+    const files = await commitFileStore.readFiles(readerRef.current, base, [path])
+    const file = files.get(path)
+    return file?.kind === 'text' ? file.text : null
+  }, [])
 
   // The active file's editing session (see EditSession in CodeEditor). Identity is stable
   // across content changes -- the editor patches its document from remote deltas -- and rolls
@@ -890,24 +1092,40 @@ export default function GadgetCodeInterface({
         if (chain !== undefined && chain.length > 0) {
           return chain[chain.length - 1].text
         }
-        // Fall back to the committed head only when the chat's content doesn't cover the
-        // gadget at all (it then tracks head live). A gadget the chat owns but whose file is
-        // absent is a *deleted* file: surface it as empty (the diff view's original side shows
-        // the removed content), not as the head text masquerading as unchanged.
+        // The chat's text when it holds the path; a path the chat removed is *deleted* and
+        // surfaces as empty (the diff view's original side shows the removed content), not as
+        // the base text masquerading as unchanged; anything else is untouched and reads from
+        // the content base, which the store has loaded (the editor renders only once it has).
         const files = client.getFiles(gadgetId)
-        return files !== undefined ? files.get(path) : headFilesRef.current?.get(path)
+        if (files !== undefined) {
+          const text = files.get(path)
+          if (text !== undefined) return text
+          if (client.getRemovedPaths(gadgetId).has(path)) return undefined
+        }
+        const base = contentBaseRef.current
+        const known = base !== undefined ? commitFileStore.peekFile(base, path) : undefined
+        return known?.kind === 'text' ? known.text : undefined
       },
       applyLocal: (change: FileChange, docText: string) => {
         try {
-          if (!client.hasGadget(gadgetId)) {
-            client.ensureGadgetEditable(
-              gadgetId, headCommitIdRef.current, headFilesRef.current ?? EMPTY_FILES)
+          const files = client.getFiles(gadgetId)
+          let fileChange: FileChange
+          if (files?.has(path)) {
+            fileChange = change
+          } else if (files !== undefined && client.getRemovedPaths(gadgetId).has(path)) {
+            // Editing a file the chat's content removed (e.g. it was deleted in the chat while
+            // its editor stayed open) re-creates it with the editor's text.
+            fileChange = { set: docText }
+          } else {
+            // An untouched path (or an unpinned gadget): seed its base text -- the text this
+            // editor was built from -- so the edit has something to apply to, pinning the
+            // gadget on its first edit if need be.
+            const base = contentBaseRef.current
+            const known = base !== undefined ? commitFileStore.peekFile(base, path) : undefined
+            const baseText = known?.kind === 'text' ? known.text : undefined
+            client.ensureFileEditable(gadgetId, base, path, baseText)
+            fileChange = baseText !== undefined ? change : { set: docText }
           }
-          // Editing a file the chat's content no longer has (e.g. it was deleted in the chat
-          // while its editor stayed open) re-creates it with the editor's text.
-          const fileChange: FileChange = client.getFiles(gadgetId)?.has(path)
-            ? change
-            : { set: docText }
           client.applyLocalChange({ [gadgetId]: [[path, fileChange]] })
           // Local edits get no client notification (our own echo is silent -- see
           // ChatOtClientDelegate.onRemoteChange), so re-derive the sidebar's diff statuses here.
@@ -939,15 +1157,25 @@ export default function GadgetCodeInterface({
   // ---- file management (create / delete / rename / download) --------------------------------
 
   const handleFileSelect = (filename: string) => {
+    if (!isOpenableKind(leafKindOf(filename))) return
     if (activeFile !== filename) {
       hasUserSwitchedFilesThisTurnRef.current = true
     }
     setActiveFile(filename)
   }
 
+  // A displayed file's text: the overlay's when it covers the path, else read from the content
+  // base (async: the store may not hold it yet). Null for a file with no text (removed, absent,
+  // unreadable).
+  const readDisplayedText = async (filename: string): Promise<string | null> => {
+    const overlaid = overlayText(filename)
+    if (overlaid !== undefined) return overlaid
+    return readBaseText(filename)
+  }
+
   const handleFileCreate = (filename: string) => {
-    if (isEditingLocked || displayFiles === null) return
-    if (displayFiles.has(filename)) {
+    if (isEditingLocked) return
+    if (fileExists(filename)) {
       toasts.add({ title: `File already exists: ${filename}`, variant: 'error' })
       return
     }
@@ -958,8 +1186,8 @@ export default function GadgetCodeInterface({
   }
 
   const handleFileDelete = (filename: string) => {
-    if (isEditingLocked || displayFiles === null) return
-    if (!displayFiles.has(filename)) {
+    if (isEditingLocked) return
+    if (!fileExists(filename)) {
       toasts.add({ title: 'File not found', variant: 'error' })
       return
     }
@@ -972,14 +1200,37 @@ export default function GadgetCodeInterface({
     }
   }
 
-  const handleFileRename = (oldName: string, newName: string) => {
-    if (isEditingLocked || displayFiles === null) return
-    const text = displayFiles.get(oldName)
-    if (text === undefined) {
+  const handleFileRename = async (oldName: string, newName: string) => {
+    if (isEditingLocked) return
+    // Only a plain file can be renamed: the browser withholds the action from other kinds (see
+    // FileBrowser for why an executable is among them), and this is the backstop.
+    if (leafKindOf(oldName) !== 'file') return
+    if (fileExists(newName)) {
+      toasts.add({ title: `File already exists: ${newName}`, variant: 'error' })
+      return
+    }
+    const target = { client, gadgetId: workpieceId, contentBase }
+    const baseText = fileExists(oldName)
+      ? await readDisplayedText(oldName).catch(() => null)
+      : null
+    // The read may have outlasted the selection: applyLocalFileChanges targets the *current*
+    // gadget, and this rename belongs to the one it started on.
+    if (target.client === null || clientRef.current !== target.client ||
+        workpieceIdRef.current !== target.gadgetId ||
+        contentBaseRef.current !== target.contentBase) {
+      return
+    }
+    // The gadget's own files may have moved meanwhile too (a collaborator's rows): take the
+    // source text as the chat holds it *now* -- the read is only right while the path is still
+    // untouched -- and refuse a destination that has since come to exist.
+    const chatFilesNow = target.client.getFiles(target.gadgetId)
+    const text = chatFilesNow?.get(oldName) ??
+      (target.client.getRemovedPaths(target.gadgetId).has(oldName) ? null : baseText)
+    if (text === null) {
       toasts.add({ title: 'File not found', variant: 'error' })
       return
     }
-    if (displayFiles.has(newName)) {
+    if (chatFilesNow?.has(newName) || fileExists(newName)) {
       toasts.add({ title: `File already exists: ${newName}`, variant: 'error' })
       return
     }
@@ -991,21 +1242,21 @@ export default function GadgetCodeInterface({
     }
   }
 
-  const handleFileDownload = useCallback((filename: string) => {
-    const text = displayFiles?.get(filename)
-    if (text === undefined) {
+  const handleFileDownload = async (filename: string) => {
+    const text = await readDisplayedText(filename).catch(() => null)
+    if (text === null) {
       toasts.add({ title: `Could not download ${filename}`, variant: 'error' })
       return
     }
     saveTextToFile(filename, text)
-  }, [displayFiles, toasts])
+  }
 
   // ---- render ------------------------------------------------------------------------------
 
-  // Outside a chat, ready means the committed files have loaded; within one, the chat's
-  // content must be in too.
-  const isReady = headFiles !== null && (!branchMode || clientReady)
-  const loading = !isReady && !clientError && !headLoadFailed
+  // Outside a chat, ready means the content base's tree has loaded; within one, the chat's
+  // content must be in too. File content loads per file, under the tree.
+  const isReady = browserTree !== null && (!branchMode || clientReady)
+  const loading = !isReady && !clientError && treeError === null
 
   // Repair the file selection when the active file stops existing anywhere it could live --
   // e.g. a head advance (another chat's accept) deleted it, or the user left the chat whose
@@ -1019,19 +1270,19 @@ export default function GadgetCodeInterface({
     }
   }, [activeFile, isReady, stableDisplayedFiles])
 
-  if (headLoadFailed && headFiles === null) {
+  if (treeError !== null && browserTree === null) {
     return (
       <div
         className="flex flex-col justify-center items-center gap-3 px-6 text-center"
         style={{ height }}
       >
         <p className="m-0 text-sm text-kumo-danger">
-          Failed to load this gadget&apos;s code.
+          Failed to load this {workpieceNoun}&apos;s code.
         </p>
         <WorkshopButton
           tone="secondary"
           className="!h-8"
-          onClick={() => setHeadRetryToken(token => token + 1)}
+          onClick={() => setTreeRetryToken(token => token + 1)}
         >
           Try again
         </WorkshopButton>
@@ -1065,15 +1316,42 @@ export default function GadgetCodeInterface({
     return <div style={{ height, width: '100%' }} />
   }
 
-  const activeFileText = activeFile !== null
-    ? displayFiles?.get(activeFile) ?? null
-    : null
-  // The committed side of the diff; null = the file doesn't exist at head (an added file).
-  const activeFileOriginal = activeFile !== null
-    ? headFiles?.get(activeFile) ?? null
-    : null
-  const activeFileDownloadable =
-    activeFile !== null && displayFiles?.get(activeFile) !== undefined
+  // The open file's text as displayed -- what the agent reads: the overlay's (preview, chat
+  // content, or removed), else the content base's. Undefined while the base read is in flight.
+  let activeResolved: FileAtCommit | undefined = { kind: 'absent' }
+  if (activeFile !== null) {
+    const overlaid = overlayText(activeFile)
+    if (overlaid !== undefined) {
+      activeResolved = overlaid !== null ? { kind: 'text', text: overlaid } : { kind: 'absent' }
+    } else if (contentBase !== undefined) {
+      activeResolved = activeBaseFiles.get(activeFile)
+    }
+  }
+  const activeFileText = activeResolved?.kind === 'text' ? activeResolved.text : null
+  // A base entry with no readable text (symlink, binary, oversized) shows its reason in place
+  // of content, read-only; a readable file beyond the change size cap is viewable but not
+  // editable, since no change could carry its new text.
+  const activeFileUnreadable = activeResolved?.kind === 'unreadable'
+    ? activeResolved.message : null
+  const activeFileOversized = activeFileText !== null && activeFileText.length > MAX_FILE_TEXT_LENGTH
+  // The diff's original side: the review base's text (null = absent there: an added file). The
+  // diff waits for that read too, so a file never opens as "added" for the round trip before
+  // its original arrives. An original with no readable text (a binary the chat replaced or
+  // deleted) is stood in for by its explanation, so the diff reads as a change to an existing
+  // file -- what the Changes list reports it as -- rather than as an addition or an empty
+  // deletion.
+  const activeReview = activeFile !== null ? reviewFiles.get(activeFile) : undefined
+  const activeReviewLoading = isDiffMode && activeFile !== null && reviewBase !== undefined &&
+    activeReview === undefined
+  const activeFileOriginal = activeReview === undefined || activeReview.kind === 'absent'
+    ? null
+    : activeReview.kind === 'text'
+      ? activeReview.text
+      : `(${activeReview.message}; its previous content cannot be shown)`
+  // Either of the open file's two reads failing is shown in its pane, with a retry.
+  const activeFileError = (activeResolved === undefined ? activeBaseError : null) ??
+    (activeReviewLoading ? reviewError : null)
+  const activeFileDownloadable = activeFileText !== null
   const activeFileModeLabel = !branchMode
     ? 'Viewing'
     : isEditingLocked
@@ -1111,16 +1389,21 @@ export default function GadgetCodeInterface({
               : 'max-md:invisible max-md:-translate-x-full'
           }`}
         >
-          <FileSidebar
-            ref={fileSidebarRef}
-            files={stableDisplayedFiles}
+          <FileBrowser
+            // Expansion state is per workpiece: a switch remounts the browser, which picks up
+            // where that workpiece's tree was left (or its defaults, the first time).
+            key={workpieceId}
+            ref={fileBrowserRef}
+            tree={browserTree ?? EMPTY_BROWSER_TREE}
+            changes={changes}
+            statuses={fileChangeStatuses}
             activeFile={activeFile}
             streamingActiveFile={streamingActiveFile}
-            dirtyFiles={new Set()}
-            changedFiles={changedFiles}
-            fileChangeStatuses={fileChangeStatuses}
             isDiffMode={isDiffMode}
             editLocked={isEditingLocked}
+            workpieceNoun={workpieceNoun}
+            initialExpanded={expandedDirsByWorkpieceRef.current.get(workpieceId)}
+            onExpandedChange={expanded => expandedDirsByWorkpieceRef.current.set(workpieceId, expanded)}
             onFileSelect={(filename) => {
               handleFileSelect(filename)
               setFileDrawerOpen(false)
@@ -1154,6 +1437,20 @@ export default function GadgetCodeInterface({
                 <>{activeFileModeLabel} <span className="font-mono font-medium text-kumo-default">{activeFile}</span></>
               ) : 'Files'}
             </div>
+            {summary.type === 'worktree' && (
+              // The worktree's HEAD -- the agent's last explicit commit. Display only: what the
+              // view shows as changed is relative to the accepted commit, never to this.
+              <span
+                className="flex shrink-0 items-center gap-1 rounded bg-kumo-tint px-1.5 py-0.5 font-mono text-[11px] leading-4 text-kumo-subtle"
+                title={summary.headCommit === summary.baseCommit
+                  ? `HEAD ${summary.headCommit} (no commits since the worktree was created)`
+                  : `HEAD ${summary.headCommit}\nCreated at ${summary.baseCommit}`}
+              >
+                <GitBranch size={11} aria-hidden="true" />
+                <span className="sr-only">HEAD </span>
+                {summary.headCommit.slice(0, 7)}
+              </span>
+            )}
             {activeFile && (
               <WorkshopIconButton
                 aria-label={`Download ${activeFile}`}
@@ -1181,7 +1478,7 @@ export default function GadgetCodeInterface({
                   {branchMode && (
                     <div className="mt-4 flex justify-center">
                       <WorkshopButton
-                        onClick={() => fileSidebarRef.current?.openCreateModal()}
+                        onClick={() => fileBrowserRef.current?.openCreateModal()}
                         disabled={isEditingLocked}
                         tone="primary"
                         className="!h-8"
@@ -1192,13 +1489,37 @@ export default function GadgetCodeInterface({
                   )}
                 </div>
               </div>
+            ) : activeResolved === undefined || activeReviewLoading ? (
+              activeFileError !== null ? (
+                <div className="flex h-full flex-col items-center justify-center gap-3 bg-kumo-base px-6 text-center">
+                  <p className="m-0 text-sm text-kumo-danger">Failed to load this file.</p>
+                  <WorkshopButton
+                    tone="secondary"
+                    className="!h-8"
+                    onClick={() => setFileRetryToken(token => token + 1)}
+                  >
+                    Try again
+                  </WorkshopButton>
+                </div>
+              ) : (
+                <div className="flex h-full items-center justify-center bg-kumo-base text-kumo-subtle">
+                  Loading file...
+                </div>
+              )
+            ) : activeFileUnreadable !== null ? (
+              <CodeEditor
+                filename={activeFile}
+                text={activeFileUnreadable}
+                readOnly
+                height="100%"
+              />
             ) : isDiffMode ? (
               <CodeDiffEditor
                 filename={activeFile}
                 original={activeFileOriginal}
                 text={activeFileText}
                 session={activeSession}
-                readOnly={isEditingLocked}
+                readOnly={isEditingLocked || activeFileOversized}
                 height="100%"
               />
             ) : (

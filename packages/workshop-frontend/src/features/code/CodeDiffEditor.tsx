@@ -12,11 +12,11 @@ import { searchKeymap, highlightSelectionMatches } from '@codemirror/search'
 import {
   connectSessionRemote, sessionChangeListener, setDocText, type EditSession,
 } from './CodeEditor'
-import { codeEditorTheme, monoFont } from './components/codeTheme'
+import { codeEditorTheme, monoFont } from './codeTheme'
 import { buildDiffModel, type DiffStatus } from './diff/diffModel'
 import { diffRenderExtension, setDiffRender } from './diff/diffRenderer'
 import { getLanguage } from './getLanguage'
-import { useTheme } from './ThemeContext'
+import { useTheme } from '../../ThemeContext'
 import './CodeDiffEditor.css'
 
 /**

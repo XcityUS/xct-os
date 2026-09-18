@@ -8,7 +8,7 @@ import { EditorView } from '@codemirror/view'
 import type { FileChange } from '@gadgets/workshop-shared/code-change'
 import CodeDiffEditor from './CodeDiffEditor'
 import type { EditSession } from './CodeEditor'
-import { ThemeProvider } from './ThemeContext'
+import { ThemeProvider } from '../../ThemeContext'
 
 // Mounts the diff editor with a fake EditSession to cover the component wiring: the
 // rAF-coalesced diff recompute, the -N +N pill, the deletion zones, and remote changes flowing

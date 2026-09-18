@@ -18,6 +18,8 @@ function flush(ms = 5): Promise<void> {
 
 class TestHarness {
   commits = new Map<string, Map<string, string>>()
+  // Every base fetch the client made: which commit, which paths.
+  fetches: { commitId: string; paths: string[] }[] = []
   submissions: CodeChangeSubmission[] = []
   submitResult:
       (submission: CodeChangeSubmission) => Promise<{ generation: number; revision: number }> =
@@ -28,10 +30,11 @@ class TestHarness {
   dirty: boolean[] = []
 
   readonly delegate: ChatOtClientDelegate = {
-    fetchCommitFiles: async (commitId: string) => {
+    fetchFilesAtCommit: async (commitId: string, paths: readonly string[]) => {
+      this.fetches.push({ commitId, paths: [...paths] })
       const files = this.commits.get(commitId)
       if (!files) throw new Error(`no such commit: ${commitId}`)
-      return files
+      return new Map(paths.map(path => [path, files.get(path) ?? null]))
     },
     submitCodeChange: submission => {
       this.submissions.push(submission)
@@ -98,7 +101,7 @@ describe('ChatOtClient', () => {
     h.client.setDurableState({ rowsThrough: 0 })
     await flush()
 
-    h.client.ensureGadgetEditable(1, 'head', new Map([['a.txt', 'abc']]))
+    h.client.ensureFileEditable(1, 'head', 'a.txt', 'abc')
     h.client.applyLocalChange({ 1: [['a.txt', { edit: [3, [0, 'd']] }]] })  // append "d"
     expect(filesOf(h.client.getContent(), 1)).toEqual({ 'a.txt': 'abcd' })
 
@@ -182,7 +185,7 @@ describe('ChatOtClient', () => {
     // The submission is accepted, but its broadcast row is never delivered (e.g. it was
     // materialized while the client was disconnected, so no replay carries it).
     h.submitResult = async () => ({ generation: 0, revision: 1 })
-    h.client.ensureGadgetEditable(1, 'head', new Map([['a.txt', 'abc']]))
+    h.client.ensureFileEditable(1, 'head', 'a.txt', 'abc')
     h.client.applyLocalChange({ 1: [['a.txt', { edit: [3, [0, 'd']] }]] })
     await flush()
 
@@ -271,15 +274,18 @@ describe('ChatOtClient', () => {
     })
     await flush()
 
-    // Local: insert "X" at the start. Hold the ack so the change stays in flight.
+    // Local: insert "X" at the start. Hold the ack so the change stays in flight. The path is
+    // untouched so far, so the view seeds its base text first (the pinned-gadget seed path).
     let releaseSubmit: () => void = () => {}
     h.submitResult = () => new Promise(resolve => {
       releaseSubmit = () => resolve({ generation: 0, revision: 2 })
     })
+    h.client.ensureFileEditable(1, 'head', 'a.txt', 'abc')
     h.client.applyLocalChange({ 1: [['a.txt', { edit: [[0, 'X'], 3] }]] })
     await flush()
     expect(h.submissions).toHaveLength(1)
     const local = h.submissions[0]
+    expect(local.pins).toBeUndefined()  // already pinned: nothing to declare
 
     // A remote row (ordered first by the server): append "Y".
     const remote: CodeChange = { 1: [['a.txt', { edit: [3, [0, 'Y']] }]] }
@@ -325,7 +331,7 @@ describe('ChatOtClient', () => {
     h.client.setDurableState({ rowsThrough: 0 })
     await flush()
     h.submitResult = () => new Promise(() => {})  // never acked
-    h.client.ensureGadgetEditable(1, 'head', new Map([['a.txt', 'abc']]))
+    h.client.ensureFileEditable(1, 'head', 'a.txt', 'abc')
     h.client.applyLocalChange({ 1: [['a.txt', { edit: [3, [0, 'd']] }]] })
     await flush()
 
@@ -446,9 +452,11 @@ describe('ChatOtClient', () => {
     })
     await flush()
     h.submitResult = () => new Promise(() => {})
+    h.client.ensureFileEditable(2, 'h2', 'b.txt', 'xyz')
     h.client.applyLocalChange({ 2: [['b.txt', { edit: [3, [0, 'w']] }]] })
     await flush()  // the gadget-2 edit is now in flight...
     // ...so this gadget-1 edit stays pending behind it.
+    h.client.ensureFileEditable(1, 'h1', 'a.txt', 'abc')
     h.client.applyLocalChange({ 1: [['a.txt', { edit: [3, [0, 'd']] }]] })
     await flush()
 
@@ -481,6 +489,7 @@ describe('ChatOtClient', () => {
     })
     await flush()
     h.submitResult = () => new Promise(() => {})
+    h.client.ensureFileEditable(1, 'head', 'a.txt', 'abc')
     h.client.applyLocalChange({ 1: [['a.txt', { edit: [3, [0, 'd']] }]] })
     await flush()
 
@@ -515,7 +524,7 @@ describe('ChatOtClient', () => {
       resolveDone()
       return { generation: 0, revision: 1 }
     }
-    h.client.ensureGadgetEditable(1, 'head', new Map([['a.txt', 'abc']]))
+    h.client.ensureFileEditable(1, 'head', 'a.txt', 'abc')
     h.client.applyLocalChange({ 1: [['a.txt', { edit: [3, [0, 'd']] }]] })
     await flush()
     expect(h.dirty).toContain(true)
@@ -534,7 +543,7 @@ describe('ChatOtClient', () => {
     await flush()
 
     h.submitResult = async () => { throw new Error('pin conflict') }
-    h.client.ensureGadgetEditable(1, 'head', new Map([['a.txt', 'abc']]))
+    h.client.ensureFileEditable(1, 'head', 'a.txt', 'abc')
     h.client.applyLocalChange({ 1: [['a.txt', { edit: [3, [0, 'd']] }]] })
     await flush()
     expect(h.discards).toBe(1)
@@ -542,7 +551,7 @@ describe('ChatOtClient', () => {
 
     // The next local edit starts a fresh client session.
     h.submitResult = async () => ({ generation: 0, revision: 1 })
-    h.client.ensureGadgetEditable(1, 'head', new Map([['a.txt', 'abc']]))
+    h.client.ensureFileEditable(1, 'head', 'a.txt', 'abc')
     h.client.applyLocalChange({ 1: [['a.txt', { edit: [3, [0, 'x']] }]] })
     await flush()
     expect(h.submissions).toHaveLength(2)
@@ -569,6 +578,417 @@ describe('ChatOtClient', () => {
     await flush()
     expect(filesOf(h.client.getContent(), 1)).toEqual({ 'a.txt': 'abc!' })
   })
+  // ---- sparse content ------------------------------------------------------------------------
+
+  it('applies set/remove rows without fetching and fetches exactly an edit row\'s paths', async () => {
+    const h = new TestHarness()
+    h.commits.set('c1', new Map([['a.txt', 'abc'], ['b.txt', 'B'], ['c.txt', 'C']]))
+    h.client.setDurableState({
+      codeBase: {
+        pins: [{ gadgetId: 1, baseCommit: 'c1', mergedCommit: 'c1' }],
+        generation: 0, revision: 0,
+      },
+      rowsThrough: 0,
+    })
+    await flush()
+    expect(h.fetches).toEqual([])  // a pin alone reads nothing
+    expect(h.client.hasGadget(1)).toBe(true)
+    expect(filesOf(h.client.getContent(), 1)).toEqual({})
+
+    h.client.pushRow(row(0, 1, { 1: [['new.txt', { set: 'n' }], ['c.txt', { remove: true }]] }))
+    await flush()
+    expect(h.fetches).toEqual([])
+    expect(filesOf(h.client.getContent(), 1)).toEqual({ 'new.txt': 'n' })
+    expect([...h.client.getRemovedPaths(1)]).toEqual(['c.txt'])
+
+    h.client.pushRow(row(0, 2, { 1: [['a.txt', { edit: [3, [0, '!']] }], ['new.txt', { edit: [1, [0, '!']] }]] }))
+    await flush()
+    // Only the path the content didn't hold was fetched, and only from this pin's base.
+    expect(h.fetches).toEqual([{ commitId: 'c1', paths: ['a.txt'] }])
+    expect(filesOf(h.client.getContent(), 1)).toEqual({ 'a.txt': 'abc!', 'new.txt': 'n!' })
+    // Seeding surfaces no `set` event for the base text: editors read untouched paths from
+    // the base commit already, so only the edit itself is delivered.
+    expect(h.remoteEvents.at(-1)).toEqual([
+      { gadgetId: 1, path: 'a.txt', change: { edit: [3, [0, '!']] } },
+      { gadgetId: 1, path: 'new.txt', change: { edit: [1, [0, '!']] } },
+    ])
+  })
+
+  it('rebuilds by fetching the epoch change\'s edit paths, one call per pin', async () => {
+    const h = new TestHarness()
+    h.commits.set('c1', new Map([['a.txt', 'abc'], ['b.txt', 'B'], ['untouched.txt', 'u']]))
+    h.commits.set('c2', new Map([['x.txt', 'x']]))
+    h.client.setDurableState({
+      codeBase: {
+        pins: [
+          { gadgetId: 1, baseCommit: 'c1', mergedCommit: 'c1' },
+          { gadgetId: 2, baseCommit: 'c2', mergedCommit: 'c2' },
+          { gadgetId: 3, baseCommit: 'c3', mergedCommit: 'c3' },
+        ],
+        generation: 0, revision: 2,
+      },
+      epochChange: {
+        1: [['a.txt', { edit: [3, [0, '!']] }], ['b.txt', { edit: [1, [0, '!']] }],
+            ['gone.txt', { remove: true }], ['made.txt', { set: 'm' }]],
+        2: [['x.txt', { edit: [1, [0, '!']] }]],
+      },
+      rowsThrough: 2,
+    })
+    await flush()
+    expect(h.fatal).toBe(null)
+    expect(h.fetches.toSorted((l, r) => l.commitId.localeCompare(r.commitId))).toEqual([
+      { commitId: 'c1', paths: ['a.txt', 'b.txt'] },
+      { commitId: 'c2', paths: ['x.txt'] },
+    ])
+    expect(filesOf(h.client.getContent(), 1))
+      .toEqual({ 'a.txt': 'abc!', 'b.txt': 'B!', 'made.txt': 'm' })
+    expect([...h.client.getRemovedPaths(1)]).toEqual(['gone.txt'])
+    expect(filesOf(h.client.getContent(), 2)).toEqual({ 'x.txt': 'x!' })
+    // A pin the epoch never touched is covered (pinned) with nothing held, and nothing fetched.
+    expect(h.client.hasGadget(3)).toBe(true)
+    expect(filesOf(h.client.getContent(), 3)).toEqual({})
+  })
+
+  it('clears a tombstone when the path is set again', async () => {
+    const h = new TestHarness()
+    h.client.setDurableState({
+      codeBase: {
+        pins: [{ gadgetId: 1, baseCommit: 'c1', mergedCommit: 'c1' }],
+        generation: 0, revision: 0,
+      },
+      rowsThrough: 0,
+    })
+    await flush()
+    h.client.pushRow(row(0, 1, { 1: [['a.txt', { remove: true }]] }))
+    await flush()
+    expect([...h.client.getRemovedPaths(1)]).toEqual(['a.txt'])
+    h.client.pushRow(row(0, 2, { 1: [['a.txt', { set: 'again' }]] }))
+    await flush()
+    expect([...h.client.getRemovedPaths(1)]).toEqual([])
+    expect(filesOf(h.client.getContent(), 1)).toEqual({ 'a.txt': 'again' })
+  })
+
+  it('keeps a displayed tombstone when a remote edit lands under a local delete in flight', async () => {
+    const h = new TestHarness()
+    h.commits.set('c1', new Map([['a.txt', 'abc']]))
+    h.client.setDurableState({
+      codeBase: {
+        pins: [{ gadgetId: 1, baseCommit: 'c1', mergedCommit: 'c1' }],
+        generation: 0, revision: 0,
+      },
+      rowsThrough: 0,
+    })
+    await flush()
+
+    h.submitResult = () => new Promise(() => {})  // our delete stays in flight
+    h.client.ensureFileEditable(1, 'c1', 'a.txt', undefined)
+    h.client.applyLocalChange({ 1: [['a.txt', { remove: true }]] })
+    await flush()
+    expect(h.submissions).toHaveLength(1)
+    expect([...h.client.getRemovedPaths(1)]).toEqual(['a.txt'])
+
+    // Another author's edit of the same file is ordered first: it applies to the acked content
+    // (seeding a.txt's base there) but transforms to nothing against our remove, so the display
+    // still shows the file deleted -- and must still say so.
+    h.remoteEvents.length = 0
+    h.client.pushRow(row(0, 1, { 1: [['a.txt', { edit: [3, [0, '!']] }]] }))
+    await flush()
+    expect(h.fetches).toEqual([{ commitId: 'c1', paths: ['a.txt'] }])
+    expect(filesOf(h.client.getContent(), 1)).toEqual({})
+    expect([...h.client.getRemovedPaths(1)]).toEqual(['a.txt'])
+    expect(h.remoteEvents).toEqual([])
+  })
+
+  it('shows a locally re-created file over an acknowledged remote remove', async () => {
+    const h = new TestHarness()
+    h.client.setDurableState({
+      codeBase: {
+        pins: [{ gadgetId: 1, baseCommit: 'c1', mergedCommit: 'c1' }],
+        generation: 0, revision: 0,
+      },
+      rowsThrough: 0,
+    })
+    await flush()
+    h.client.pushRow(row(0, 1, { 1: [['a.txt', { remove: true }]] }))
+    await flush()
+    expect([...h.client.getRemovedPaths(1)]).toEqual(['a.txt'])
+
+    h.submitResult = () => new Promise(() => {})
+    h.client.applyLocalChange({ 1: [['a.txt', { set: 'back' }]] })
+    expect(filesOf(h.client.getContent(), 1)).toEqual({ 'a.txt': 'back' })
+    expect([...h.client.getRemovedPaths(1)]).toEqual([])
+  })
+
+  it('seeds a first local edit sparsely and later paths one at a time, declaring once', async () => {
+    const h = new TestHarness()
+    h.client.setDurableState({ rowsThrough: 0 })
+    await flush()
+
+    // First keystroke to an unpinned gadget: only the edited path is seeded, nothing fetched.
+    h.submitResult = () => new Promise(() => {})
+    h.client.ensureFileEditable(1, 'head', 'a.txt', 'abc')
+    expect(filesOf(h.client.getContent(), 1)).toEqual({ 'a.txt': 'abc' })
+    h.client.applyLocalChange({ 1: [['a.txt', { edit: [3, [0, 'd']] }]] })
+    await flush()
+    expect(h.fetches).toEqual([])
+    expect(h.submissions).toHaveLength(1)
+    expect(h.submissions[0].pins).toEqual([{ gadgetId: 1, baseCommit: 'head' }])
+
+    // The pin lands (metadata + echo).
+    h.client.setDurableState({
+      codeBase: {
+        pins: [{ gadgetId: 1, baseCommit: 'head', mergedCommit: 'head' }],
+        generation: 0, revision: 1,
+      },
+      rowsThrough: 0,
+    })
+    h.client.pushRow(row(0, 1, h.submissions[0].change,
+                         { clientId: h.submissions[0].clientId, seq: h.submissions[0].seq }))
+    await flush()
+    expect(h.fetches).toEqual([])
+
+    // A later edit to another path seeds just that path into the pinned content and declares
+    // nothing: the gadget is already pinned.
+    h.client.ensureFileEditable(1, 'head', 'b.txt', 'xyz')
+    expect(filesOf(h.client.getContent(), 1)).toEqual({ 'a.txt': 'abcd', 'b.txt': 'xyz' })
+    h.client.applyLocalChange({ 1: [['b.txt', { edit: [3, [0, 'w']] }]] })
+    await flush()
+    expect(h.submissions).toHaveLength(2)
+    expect(h.submissions[1].pins).toBeUndefined()
+    expect(h.submissions[1].change).toEqual({ 1: [['b.txt', { edit: [3, [0, 'w']] }]] })
+    expect(filesOf(h.client.getContent(), 1)).toEqual({ 'a.txt': 'abcd', 'b.txt': 'xyzw' })
+  })
+
+  it('keeps a path seeded while a base fetch was out for the same gadget', async () => {
+    const h = new TestHarness()
+    h.commits.set('head', new Map([['a.txt', 'abc'], ['b.txt', 'xyz'], ['c.txt', 'C']]))
+    h.client.setDurableState({ rowsThrough: 0 })
+    await flush()
+
+    // Our first edit's declaration is in flight; the pin's metadata has landed.
+    h.submitResult = () => new Promise(() => {})
+    h.client.ensureFileEditable(1, 'head', 'a.txt', 'abc')
+    h.client.applyLocalChange({ 1: [['a.txt', { edit: [3, [0, 'd']] }]] })
+    await flush()
+    h.client.setDurableState({
+      codeBase: {
+        pins: [{ gadgetId: 1, baseCommit: 'head', mergedCommit: 'head' }],
+        generation: 0, revision: 1,
+      },
+      rowsThrough: 0,
+    })
+    await flush()
+
+    // Another client's edit of c.txt needs a base fetch. While it is out, the user starts
+    // editing b.txt -- a path neither the row nor the seed knew about.
+    let releaseFetch: () => void = () => {}
+    const original = h.delegate.fetchFilesAtCommit
+    h.delegate.fetchFilesAtCommit = async (commitId, paths) => {
+      await new Promise<void>(resolve => { releaseFetch = resolve })
+      return original(commitId, paths)
+    }
+    h.client.pushRow(row(0, 1, { 1: [['c.txt', { edit: [1, [0, '!']] }]] }))
+    await flush()
+    h.client.ensureFileEditable(1, 'head', 'b.txt', 'xyz')
+    h.client.applyLocalChange({ 1: [['b.txt', { edit: [3, [0, 'w']] }]] })
+    releaseFetch()
+    await flush()
+
+    // The seeded b.txt survived the fetch's completion: the pending edit still applies.
+    expect(h.fatal).toBe(null)
+    expect(h.discards).toBe(0)
+    expect(filesOf(h.client.getContent(), 1))
+      .toEqual({ 'a.txt': 'abcd', 'b.txt': 'xyzw', 'c.txt': 'C!' })
+  })
+
+  it('discards a first local edit made at the wrong base while a remote seed fetch was out', async () => {
+    const h = new TestHarness()
+    h.commits.set('newer', new Map([['a.txt', 'abc'], ['b.txt', 'xyz']]))
+    h.client.setDurableState({ rowsThrough: 0 })
+    await flush()
+
+    // Another client pinned the gadget at `newer` and edited a.txt; the fetch of a.txt's base
+    // is held. Meanwhile our first keystroke to b.txt assumes the (stale) head we know of.
+    let releaseFetch: () => void = () => {}
+    const original = h.delegate.fetchFilesAtCommit
+    h.delegate.fetchFilesAtCommit = async (commitId, paths) => {
+      await new Promise<void>(resolve => { releaseFetch = resolve })
+      return original(commitId, paths)
+    }
+    h.client.setDurableState({
+      codeBase: {
+        pins: [{ gadgetId: 1, baseCommit: 'newer', mergedCommit: 'newer' }],
+        generation: 0, revision: 1,
+      },
+      rowsThrough: 0,
+    })
+    h.client.pushRow(row(0, 1, { 1: [['a.txt', { edit: [3, [0, '!']] }]] }))
+    await flush()
+    h.submitResult = () => new Promise(() => {})
+    h.client.ensureFileEditable(1, 'stale', 'b.txt', 'xyz')
+    h.client.applyLocalChange({ 1: [['b.txt', { edit: [3, [0, 'w']] }]] })
+    h.delegate.fetchFilesAtCommit = original  // the rebuild's own fetch must not be held
+    releaseFetch()
+    await flush()
+
+    // The mismatch is caught in the tail: local edits discarded, content rebuilt at the pin.
+    expect(h.fatal).toBe(null)
+    expect(h.discards).toBe(1)
+    expect(h.client.hasLocalEdits()).toBe(false)
+    expect(filesOf(h.client.getContent(), 1)).toEqual({ 'a.txt': 'abc!' })
+  })
+
+  it('seeds a closing generation\'s straggling row from that generation\'s pin', async () => {
+    const h = new TestHarness()
+    h.commits.set('old', new Map([['a.txt', 'abc'], ['b.txt', 'xyz']]))
+    h.commits.set('new', new Map([['a.txt', 'abcd'], ['b.txt', 'CHANGED']]))
+    h.client.setDurableState({
+      codeBase: {
+        pins: [{ gadgetId: 1, baseCommit: 'old', mergedCommit: 'old' }],
+        generation: 0, revision: 1,
+      },
+      epochChange: { 1: [['a.txt', { edit: [3, [0, 'd']] }]] },
+      rowsThrough: 1,
+    })
+    await flush()
+    h.submitResult = () => new Promise(() => {})
+    h.client.ensureFileEditable(1, 'old', 'a.txt', 'abcd')
+    h.client.applyLocalChange({ 1: [['a.txt', { edit: [4, [0, 'e']] }]] })
+    await flush()
+
+    // The merge's metadata (closing generation 0 at revision 2) arrives before generation 0's
+    // last row, which edits a path the content never held.
+    h.client.setDurableState({
+      codeBase: {
+        pins: [], generation: 1, revision: 0,
+        prior: { generation: 0, finalRevision: 2, discontinuousGadgets: [] },
+      },
+      rowsThrough: 0,
+    })
+    await flush()
+    h.client.pushRow(row(0, 2, { 1: [['b.txt', { edit: [3, [0, '!']] }]] }))
+    await flush()
+
+    // Seeded from the closing generation's base (the new snapshot has no pin for it, and the
+    // new base's b.txt would not even fit the edit), and the switch then completed.
+    expect(h.fetches.at(-1)).toEqual({ commitId: 'old', paths: ['b.txt'] })
+    expect(h.fatal).toBe(null)
+    expect(h.discards).toBe(0)
+    expect(filesOf(h.client.getContent(), 1)).toEqual({ 'a.txt': 'abcde' })
+  })
+
+  it('leaves a displayed or removed path alone when asked to seed it', async () => {
+    const h = new TestHarness()
+    h.client.setDurableState({
+      codeBase: {
+        pins: [{ gadgetId: 1, baseCommit: 'c1', mergedCommit: 'c1' }],
+        generation: 0, revision: 0,
+      },
+      rowsThrough: 0,
+    })
+    await flush()
+    h.client.pushRow(row(0, 1, { 1: [['a.txt', { set: 'live' }], ['b.txt', { remove: true }]] }))
+    await flush()
+
+    h.client.ensureFileEditable(1, 'c1', 'a.txt', 'stale base')
+    h.client.ensureFileEditable(1, 'c1', 'b.txt', 'resurrected?')
+    expect(filesOf(h.client.getContent(), 1)).toEqual({ 'a.txt': 'live' })
+    expect([...h.client.getRemovedPaths(1)]).toEqual(['b.txt'])
+  })
+
+  it('carries only locally touched paths across a content-preserving epoch reset', async () => {
+    const h = new TestHarness()
+    h.commits.set('head', new Map([['a.txt', 'abc'], ['b.txt', 'B']]))
+    h.client.setDurableState({
+      codeBase: {
+        pins: [{ gadgetId: 1, baseCommit: 'head', mergedCommit: 'head' }],
+        generation: 0, revision: 2,
+      },
+      // The epoch edited a.txt and b.txt, and removed c.txt.
+      epochChange: { 1: [['a.txt', { edit: [3, [0, 'd']] }], ['b.txt', { edit: [1, [0, '!']] }],
+                         ['c.txt', { remove: true }]] },
+      rowsThrough: 2,
+    })
+    await flush()
+    expect(filesOf(h.client.getContent(), 1)).toEqual({ 'a.txt': 'abcd', 'b.txt': 'B!' })
+
+    // Only a.txt is touched locally when the accept lands.
+    h.submitResult = () => new Promise(() => {})
+    h.client.applyLocalChange({ 1: [['a.txt', { edit: [4, [0, 'e']] }]] })
+    await flush()
+    h.client.setDurableState({
+      codeBase: {
+        pins: [], generation: 1, revision: 0,
+        prior: { generation: 0, finalRevision: 2, discontinuousGadgets: [] },
+      },
+      rowsThrough: 0,
+    })
+    await flush()
+
+    // b.txt and the c.txt tombstone were the closed epoch's changes, now part of the new base:
+    // in the new epoch nothing but a.txt counts as touched.
+    expect(h.discards).toBe(0)
+    expect(filesOf(h.client.getContent(), 1)).toEqual({ 'a.txt': 'abcde' })
+    expect([...h.client.getRemovedPaths(1)]).toEqual([])
+  })
+
+  it('fails fatally when an edit\'s base is absent or unreadable', async () => {
+    const absent = new TestHarness()
+    absent.commits.set('c1', new Map())  // a.txt does not exist here
+    absent.client.setDurableState({
+      codeBase: {
+        pins: [{ gadgetId: 1, baseCommit: 'c1', mergedCommit: 'c1' }],
+        generation: 0, revision: 0,
+      },
+      rowsThrough: 0,
+    })
+    absent.client.pushRow(row(0, 1, { 1: [['a.txt', { edit: [3, [0, '!']] }]] }))
+    await flush()
+    expect(absent.fatal).toBeInstanceOf(Error)
+    expect(absent.client.isReady()).toBe(false)
+
+    const unreadable = new TestHarness()
+    unreadable.delegate.fetchFilesAtCommit = async () => { throw new Error('binary content') }
+    unreadable.client.setDurableState({
+      codeBase: {
+        pins: [{ gadgetId: 1, baseCommit: 'c1', mergedCommit: 'c1' }],
+        generation: 0, revision: 1,
+      },
+      epochChange: { 1: [['a.bin', { edit: [3, [0, '!']] }]] },
+      rowsThrough: 1,
+    })
+    await flush()
+    expect(unreadable.fatal).toBeInstanceOf(Error)
+    expect(unreadable.client.isReady()).toBe(false)
+  })
+
+  it('discards and rebuilds when a pin lands at a base other than the local seed\'s', async () => {
+    const h = new TestHarness()
+    h.commits.set('newer', new Map([['a.txt', 'abcX']]))
+    h.client.setDurableState({ rowsThrough: 0 })
+    await flush()
+
+    h.submitResult = () => new Promise(() => {})
+    h.client.ensureFileEditable(1, 'head', 'a.txt', 'abc')
+    h.client.applyLocalChange({ 1: [['a.txt', { edit: [3, [0, 'd']] }]] })
+    await flush()
+
+    // Another client pinned the gadget first, at a head we hadn't seen.
+    h.client.setDurableState({
+      codeBase: {
+        pins: [{ gadgetId: 1, baseCommit: 'newer', mergedCommit: 'newer' }],
+        generation: 0, revision: 1,
+      },
+      rowsThrough: 0,
+    })
+    h.client.pushRow(row(0, 1, { 1: [['a.txt', { edit: [4, [0, '!']] }]] }))
+    await flush()
+
+    expect(h.discards).toBe(1)
+    expect(h.client.hasLocalEdits()).toBe(false)
+    expect(filesOf(h.client.getContent(), 1)).toEqual({ 'a.txt': 'abcX!' })
+  })
+
   it('waits for metadata that covers a materialized change before rebuilding', async () => {
     const h = new TestHarness()
     h.commits.set('c1', new Map([['a.txt', 'abc']]))

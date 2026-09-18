@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createTypedStorage } from "@gadgets/typed-storage";
 import type { GitPullHints, GitOid } from "@gadgets/workshop-shared/gatekeeper";
+import { READ_FILES_RESPONSE_BUDGET } from "@gadgets/workshop-shared/api";
 import { makeMockStorage } from "./mock-storage";
 import {
   EAGER_BLOB_LIMIT,
@@ -10,7 +11,7 @@ import {
   WorkspaceGitCache,
   gitObjectMetadataCollection,
 } from "../src/git-cache";
-import { GitStore, gitObjectsCollection } from "../src/git-store";
+import { GitStore, blobOid, gitObjectsCollection } from "../src/git-store";
 import {
   buildPackBytes,
   concatBytes,
@@ -23,6 +24,7 @@ import {
 import {
   BAD_NAME_TREE,
   COMMIT_1,
+  COMMIT_2,
   COMMIT_3,
   FIXTURE_OBJECTS,
   GITLINK_TARGET,
@@ -1014,6 +1016,168 @@ describe("lazy walker reads", () => {
 
 // =======================================================================================
 
+describe("client-facing reads (readCommitTree / readFilesAtCommit)", () => {
+  // The fixture repo with its trees local and every blob still remote, as after a
+  // creation-style filtered pull; blob faults are what the tests count.
+  async function fixtureWithRemoteBlobs(): Promise<TestCache> {
+    let t = makeCache();
+    t.sources.set(G1, fixtureSource(t, G1));
+    for (let object of FIXTURE_OBJECTS.filter(o => o.type !== "blob")) {
+      if (PACKED_OIDS.includes(object.oid)) {
+        await t.cache.putFromGatekeeper(G1, object.type, b64Bytes(object.payload));
+      }
+    }
+    return t;
+  }
+
+  it("nests the tree in git order with all five kinds, touching no blobs", async () => {
+    let t = await fixtureWithRemoteBlobs();
+    expect(await t.cache.readCommitTree(COMMIT_1)).toStrictEqual([
+      { name: "README.md", kind: "file" },
+      { name: "docs", kind: "dir", children: [{ name: "naïve.md", kind: "file" }] },
+      { name: "link.md", kind: "symlink" },
+      { name: "run.sh", kind: "executable" },
+      { name: "src", kind: "dir", children: [
+        { name: "big.txt", kind: "file" },
+        { name: "main.js", kind: "file" },
+        { name: "util.js", kind: "file" },
+      ] },
+      { name: "vendored", kind: "submodule" },
+    ]);
+    expect(t.pulls).toHaveLength(0);
+  });
+
+  it("faults missing trees eagerly, still without blobs", async () => {
+    let t = makeCache();
+    t.sources.set(G1, fixtureSource(t, G1));
+    await t.cache.putFromGatekeeper(G1, "commit", fixture(COMMIT_1).payload);
+    let tree = await t.cache.readCommitTree(COMMIT_1);
+    expect(tree.map(node => node.name))
+        .toStrictEqual(["README.md", "docs", "link.md", "run.sh", "src", "vendored"]);
+    expect(t.pulls.length).toBeGreaterThan(0);
+    expect(t.pulls.every(pull => pull.hints.type === "tree")).toBe(true);
+  });
+
+  it("answers every requested path in request order, pulling all blobs in one batch",
+      async () => {
+    let t = await fixtureWithRemoteBlobs();
+    let paths = ["src/util.js", "nope.txt", "src", "link.md", "vendored", "docs/naïve.md",
+                 "no/such/dir/file.txt", "README.md/child", "README.md", "src/util.js"];
+    let result = await t.cache.readFilesAtCommit(COMMIT_1, paths);
+    expect(result).toStrictEqual([
+      ["src/util.js", { kind: "text", text: "export const answer = 42;\n" }],
+      ["nope.txt", { kind: "absent" }],
+      ["src", { kind: "absent" }],
+      ["link.md", { kind: "unreadable", message: "link.md is a symlink to README.md" }],
+      ["vendored", { kind: "unreadable", message:
+          `vendored is a submodule (gitlink) pointing at commit ${GITLINK_TARGET}` }],
+      ["docs/naïve.md", { kind: "text", text: "naïve UTF-8 name\n" }],
+      ["no/such/dir/file.txt", { kind: "absent" }],
+      ["README.md/child", { kind: "absent" }],
+      ["README.md", { kind: "text", text: "# Fixture\n" }],
+      // A duplicate answers twice.
+      ["src/util.js", { kind: "text", text: "export const answer = 42;\n" }],
+    ]);
+    // One blob pull for the four blobs (util.js, the symlink target, naïve.md, README.md).
+    expect(t.pulls).toHaveLength(1);
+    expect(t.pulls[0].hints.type).toBe("blob");
+    expect([...t.pulls[0].oids].toSorted()).toStrictEqual([
+      "42061c01a1c70097d1e4579f29a5adf40abdec95",  // link.md -> "README.md"
+      "64a32fd291e405a963aacf964a021809dd206c46",  // src/util.js
+      "78a3978560a66a1d3c14215ecbf2be19d70c5c43",  // docs/naïve.md
+      "ca69e6d08b5b8bb4f11a74f9695e329c203cbfd8",  // README.md
+    ]);
+    // Everything is local now: a second read faults nothing.
+    await t.cache.readFilesAtCommit(COMMIT_1, ["README.md", "src/main.js"]);
+    expect(t.pulls).toHaveLength(2);  // main.js was not in the first batch
+    await t.cache.readFilesAtCommit(COMMIT_1, ["README.md", "src/main.js"]);
+    expect(t.pulls).toHaveLength(2);
+  });
+
+  it("reports binary and oversized content per file, tolerating oversized blobs in the batch",
+      async () => {
+    let t = makeCache();
+    // Three blobs: one measured oversized (a rejected put recorded its size), one the source
+    // omits under the pull's filter (never measured), one ordinary; plus a binary one.
+    let measured = new Uint8Array(MAX_GIT_OBJECT_SIZE + 1).fill(0x61);
+    let measuredOid = await t.cache.putFromGatekeeper(G1, "blob", measured).catch(
+        (err: GitObjectTooLargeError) => err.oid);
+    let omitted = new Uint8Array(MAX_GIT_OBJECT_SIZE + 1).fill(0x62);
+    let omittedOid = await gitObjectOid("blob", omitted);
+    let text = new TextEncoder().encode("hello\n");
+    let textOid = await gitObjectOid("blob", text);
+    let binary = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01]);
+    let binaryOid = await gitObjectOid("blob", binary);
+    t.sources.set(G1, async (oids, hints) => {
+      for (let oid of oids) {
+        let payload = oid === omittedOid ? omitted : oid === textOid ? text
+            : oid === binaryOid ? binary : undefined;
+        if (payload === undefined) throw new Error(`test: unexpected want ${oid}`);
+        if (hints.filterBlobSize !== undefined && payload.byteLength >= hints.filterBlobSize) {
+          continue;
+        }
+        await t.cache.putFromGatekeeper(G1, "blob", payload);
+      }
+    });
+    let tree = await t.cache.putFromGatekeeper(G1, "tree", treePayload([
+      { mode: "100644", name: "binary.png", oid: binaryOid },
+      { mode: "100644", name: "huge-measured.txt", oid: measuredOid },
+      { mode: "100644", name: "huge-omitted.txt", oid: omittedOid },
+      { mode: "100644", name: "text.txt", oid: textOid },
+    ]));
+    let commit = await t.cache.putFromGatekeeper(G1, "commit", commitPayload(tree, [], "mixed"));
+    t.pulls.length = 0;
+
+    let result = await t.cache.readFilesAtCommit(
+        commit, ["huge-measured.txt", "text.txt", "huge-omitted.txt", "binary.png"]);
+    expect(result).toStrictEqual([
+      ["huge-measured.txt", { kind: "unreadable", message:
+          `huge-measured.txt is too large to read (over ${MAX_GIT_OBJECT_SIZE} bytes)` }],
+      ["text.txt", { kind: "text", text: "hello\n" }],
+      ["huge-omitted.txt", { kind: "unreadable", message:
+          `huge-omitted.txt is too large to read (over ${MAX_GIT_OBJECT_SIZE} bytes)` }],
+      ["binary.png", { kind: "unreadable", message: "binary.png is not a text file" }],
+    ]);
+    // The measured blob failed fast before any pull; the omitted one dropped out of the one
+    // batch that did go out, and the rest were local after it -- no retry round trip.
+    expect(t.pulls).toHaveLength(1);
+    expect([...t.pulls[0].oids].toSorted())
+        .toStrictEqual([omittedOid, textOid, binaryOid].toSorted());
+  });
+
+  it("stops after the response budget, omitting the rest for the client to re-request",
+      async () => {
+    let t = makeCache();
+    let blob = await storeLocal(t.storage,
+        { type: "blob", payload: new Uint8Array(MAX_GIT_OBJECT_SIZE).fill(0x61) });
+    let names = Array.from({ length: 10 }, (_, i) => `f${i}.txt`);
+    let tree = await storeLocal(t.storage, {
+      type: "tree",
+      payload: treePayload(names.map(name => ({ mode: "100644", name, oid: blob }))),
+    });
+    let commit = await storeLocal(t.storage,
+        { type: "commit", payload: commitPayload(tree, [], "big") });
+
+    // 8 MiB of text is within budget; the ninth file pushes past it and is still delivered;
+    // the tenth is omitted (not reported absent).
+    let result = await t.cache.readFilesAtCommit(commit, names);
+    expect(READ_FILES_RESPONSE_BUDGET).toBe(8 * MAX_GIT_OBJECT_SIZE);
+    expect(result.map(([path]) => path)).toStrictEqual(names.slice(0, 9));
+    expect(result.every(([, file]) =>
+        file.kind === "text" && file.text.length === MAX_GIT_OBJECT_SIZE)).toBe(true);
+    expect(t.pulls).toHaveLength(0);
+  });
+
+  it("fails the whole call on a pull failure rather than answering per file", async () => {
+    let t = await fixtureWithRemoteBlobs();
+    t.sources.delete(G1);  // provenance loss: the only source is gone
+    await expect(t.cache.readFilesAtCommit(COMMIT_1, ["README.md", "nope.txt"]))
+        .rejects.toThrow(/Could not pull git object/);
+  });
+});
+
+// =======================================================================================
+
 describe("worktree read/write helpers", () => {
   it("readFileAtCommitIfExists returns undefined for absent paths and text otherwise", async () => {
     let t = makeCache();
@@ -1033,6 +1197,35 @@ describe("worktree read/write helpers", () => {
         .rejects.toThrow("link.md is a symlink to README.md");
     await expect(t.cache.readFileAtCommitIfExists(COMMIT_1, "vendored"))
         .rejects.toThrow("vendored is a submodule");
+  });
+
+  it("readFileAtCommitWithOid / fileOidAtCommit report the blob's content address", async () => {
+    let t = makeCache();
+    t.sources.set(G1, fixtureSource(t, G1));
+    await t.cache.putFromGatekeeper(G1, "commit", fixture(COMMIT_1).payload);
+
+    // The read's oid is the content's address: computable from the text alone, and equal to
+    // what fileOidAtCommit reports for the same path -- with no blob read on that side.
+    let read = (await t.cache.readFileAtCommitWithOid(COMMIT_1, "README.md"))!;
+    expect(read.text).toBe("# Fixture\n");
+    expect(read.oid).toBe(await blobOid(read.text));
+    expect(await t.cache.fileOidAtCommit(COMMIT_1, "README.md")).toBe(read.oid);
+    expect(t.pulls.some(pull => pull.oids.includes(read.oid))).toBe(true);  // the read pulled it
+    let main = (await t.cache.fileOidAtCommit(COMMIT_1, "src/main.js"))!;
+    expect(t.pulls.some(pull => pull.oids.includes(main))).toBe(false);  // the blob: never read
+    expect(t.cache.hasLocalObject(main)).toBe(false);
+
+    // Commit 2 rewrote README.md and left src/main.js alone: the freshness question an edit
+    // asks, answered per file by oid equality.
+    await t.cache.putFromGatekeeper(G1, "commit", fixture(COMMIT_2).payload);
+    expect(await t.cache.fileOidAtCommit(COMMIT_2, "README.md")).not.toBe(read.oid);
+    expect(await t.cache.fileOidAtCommit(COMMIT_2, "src/main.js")).toBe(main);
+
+    // Only regular files have an oid here: absent, directory, symlink, gitlink are undefined.
+    for (let path of ["nope.txt", "src", "link.md", "vendored"]) {
+      expect(await t.cache.fileOidAtCommit(COMMIT_1, path)).toBeUndefined();
+    }
+    expect(await t.cache.readFileAtCommitWithOid(COMMIT_1, "nope.txt")).toBeUndefined();
   });
 
   it("assertWorktreePathWritable rejects symlink, gitlink, and directory paths, passes the rest",

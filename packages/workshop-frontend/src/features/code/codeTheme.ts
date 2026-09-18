@@ -9,7 +9,7 @@ import { EditorView } from '@codemirror/view'
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language'
 import { tags as t } from '@lezer/highlight'
 import type { Extension } from '@codemirror/state'
-import type { ResolvedThemeMode } from '../theme'
+import type { ResolvedThemeMode } from '../../theme'
 
 export const monoFont =
   'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace'

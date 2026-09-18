@@ -11,16 +11,16 @@ import {
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
 import { searchKeymap, highlightSelectionMatches } from '@codemirror/search'
 import type { FileChange, TextChange } from '@gadgets/workshop-shared/code-change'
-import { codeEditorTheme, monoFont } from './components/codeTheme'
+import { codeEditorTheme, monoFont } from './codeTheme'
 import { getLanguage } from './getLanguage'
-import { useTheme } from './ThemeContext'
+import { useTheme } from '../../ThemeContext'
 
 // The code view's plain editor: CodeMirror 6, either read-only (the committed head view) or
 // bound to the chat's OT client through an EditSession. In-chat diff presentation lives in
 // CodeDiffEditor, which reuses this module's session wiring.
 
 /**
- * An editable file's connection to the chat's OT client (see GadgetCodeInterface): the editor
+ * An editable file's connection to the chat's OT client (see WorkpieceCodeInterface): the editor
  * reads the initial text, pushes locally-authored changes, and receives remote deltas. `key`
  * identifies the document's identity -- when it changes, the editor rebuilds its state from
  * getText() (chat/file switches, client rebuilds); while it is stable, the text evolves only

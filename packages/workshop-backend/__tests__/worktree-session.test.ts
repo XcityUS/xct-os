@@ -63,18 +63,25 @@ async function loadFixtureRepo(impl: any): Promise<void> {
 }
 
 // The turn half of the session: runAgent's worktree closures, mirrored closely enough to drive
-// WorktreeSessionImpl end to end -- a session-content overlay with removal tombstones, an
-// appendChange that applies each change the way the step buffer does, and buffered commit
-// advancements, all drained through the real barrier (impl.commitAgentStep).
+// WorktreeSessionImpl end to end -- a session-content overlay with removal tombstones, the
+// pinned-else-accepted base resolution, an appendChange that applies each change the way the
+// step buffer does (pinning the worktree in the turn on its first write or commit, as the
+// barrier will in the chat), and buffered commit advancements, all drained through the real
+// barrier (impl.commitAgentStep).
 function makeTurn(impl: any, chatId: number) {
   let content = new Map<number, Map<string, string>>();
   let removed = new Map<number, Set<string>>();
   let pins = new Map<number, string>();
   let changes: { change: CodeChange }[] = [];
   let commits: { worktreeId: number, commit: string, previousHead: string }[] = [];
+  let baseCommit = (id: number): string | undefined =>
+      pins.get(id) ?? impl.getWorktreePinBase(id);
+  let pin = (id: number) => {
+    if (!pins.has(id)) pins.set(id, impl.getWorktreePinBase(id));
+  };
 
   let access: WorktreeTurnAccess = {
-    getPinBase: id => pins.get(id),
+    getBaseCommit: baseCommit,
     getBufferedHead: id => commits.findLast(entry => entry.worktreeId === id)?.commit,
     getOverlayFiles: id => content.get(id) ?? new Map(),
     getRemovedPaths: id => removed.get(id) ?? new Set(),
@@ -82,7 +89,7 @@ function makeTurn(impl: any, chatId: number) {
       let existing = content.get(id)?.get(path);
       if (existing !== undefined) return existing;
       if (removed.get(id)?.has(path)) return undefined;
-      let base = pins.get(id);
+      let base = baseCommit(id);
       if (base === undefined) return undefined;
       let text = await impl.readFileAtCommit(base, path);
       if (text === undefined) return undefined;
@@ -103,9 +110,12 @@ function makeTurn(impl: any, chatId: number) {
         removed.get(id)?.delete(path);
       }
       changes.push({ change: one });
+      pin(id);
     },
-    appendCommit: (id, commit, previousHead) =>
-        commits.push({ worktreeId: id, commit, previousHead }),
+    appendCommit: (id, commit, previousHead) => {
+      commits.push({ worktreeId: id, commit, previousHead });
+      pin(id);
+    },
   };
 
   return {
@@ -121,7 +131,8 @@ function makeTurn(impl: any, chatId: number) {
   };
 }
 
-// Creates a worktree through the barrier and returns a session over it.
+// Creates a worktree through the barrier and returns a session over it. The worktree is
+// unpinned: the session resolves against its accepted commit until the first write or commit.
 async function createWorktreeSession(impl: any, chatId: number, commitRef: string) {
   let created = await impl.createWorktree("Repo", chatId, commitRef);
   await impl.commitAgentStep(chatId, AGENT, [{ type: "message", message: "create" }], {
@@ -132,7 +143,6 @@ async function createWorktreeSession(impl: any, chatId: number, commitRef: strin
     worktreeCommits: [],
   });
   let turn = makeTurn(impl, chatId);
-  turn.pins.set(created.id, created.baseCommit);
   return { id: created.id, baseCommit: created.baseCommit, turn,
            session: turn.session(created.id) };
 }
@@ -169,7 +179,7 @@ function makeLocalHarness(
       getWorktreeRecord: () => ({ headCommit: pinBase }),
     };
     let access: WorktreeTurnAccess = {
-      getPinBase: () => pinBase,
+      getBaseCommit: () => pinBase,
       getBufferedHead: () => undefined,
       getOverlayFiles: () => new Map(),
       getRemovedPaths: () => new Set(),
@@ -545,6 +555,34 @@ describe("commit and diff", () => {
 
     await turn.barrier();
     expect(impl.storage.gadgets.get(id)!.headCommit).toBe(commit);
+    // The write was the epoch's first modification: the barrier pinned the worktree at its
+    // accepted commit, declared on the step's message alongside the advancement.
+    expect(impl.storage.chatMeta.get(1)!.codeBase!.pins).toEqual(
+        [{ gadgetId: id, baseCommit: c1, mergedCommit: c1 }]);
+  }));
+
+  it("commit() on an untouched worktree pins it, so the advancement is a revertable change",
+      () => withImpl(async impl => {
+    addChat(impl, 1);
+    let c1 = await commitFiles(impl, { "a.txt": "one\n" });
+    let { id, session, turn } = await createWorktreeSession(impl, 1, c1);
+    expect(impl.storage.chatMeta.get(1)!.codeBase).toBeUndefined();
+
+    // No writes: the commit's tree is the accepted commit's, parented on the head.
+    let commit = await session.commit("empty");
+    expect(await impl.gitStore.commitTree(commit)).toBe(await impl.gitStore.commitTree(c1));
+    await turn.barrier();
+    expect(impl.storage.gadgets.get(id)!.headCommit).toBe(commit);
+    expect(impl.storage.chatMeta.get(1)!.codeBase!.pins).toEqual(
+        [{ gadgetId: id, baseCommit: c1, mergedCommit: c1 }]);
+    let step = [...impl.storage.chats.list()].at(-1)!;
+    expect(step.pins).toEqual([{ gadgetId: id, baseCommit: c1 }]);
+    expect(step.worktreeCommits).toEqual([{ worktreeId: id, commit, previousHead: c1 }]);
+
+    // Reverting the step rolls the head back and unpins.
+    await impl.revertChanges(1, step.sequence, USER);
+    expect(impl.storage.gadgets.get(id)!.headCommit).toBe(c1);
+    expect(impl.storage.chatMeta.get(1)!.codeBase!.pins).toEqual([]);
   }));
 
   it("explicit commits squash out accepts' auto-commits", () => withImpl(async impl => {
@@ -558,7 +596,8 @@ describe("commit and diff", () => {
     await turn.barrier();
 
     // An accept auto-commits the (clean-after-commit... make it dirty first) overlay and
-    // re-pins. Note the pin advanced through an auto-commit while the head stayed `first`.
+    // advances the accepted commit. Note it advanced through an auto-commit while the head
+    // stayed `first`.
     await session.writeFile("a.txt", "three\n");
     await turn.barrier();
     await impl.mergeChanges(1, USER_META, "client-user");
@@ -566,11 +605,12 @@ describe("commit and diff", () => {
     expect(record.headCommit).toBe(first);
     expect(record.pinBase).not.toBe(first);
 
-    // A new turn (fresh overlay over the re-pin): the next explicit commit's parent is the
-    // last explicit commit -- the auto-commit never appears in explicit history.
+    // A new turn (fresh overlay over the unpinned worktree, which resolves against the
+    // advanced accepted commit): the next explicit commit's parent is the last explicit commit
+    // -- the auto-commit never appears in explicit history.
     let turn2 = makeTurn(impl, 1);
-    turn2.pins.set(id, record.pinBase);
     let session2 = turn2.session(id);
+    expect(await session2.readFile("a.txt")).toBe("three\n");
     await session2.writeFile("a.txt", "four\n");
     let second = await session2.commit("second");
     let [info] = await impl.gitStore.readCommitLog(second, { depth: 1 });
@@ -578,6 +618,9 @@ describe("commit and diff", () => {
     expect(await impl.readFileAtCommit(second, "a.txt")).toBe("four\n");
     await turn2.barrier();
     expect(impl.storage.gadgets.get(id)!.headCommit).toBe(second);
+    // ...and the write re-pinned the worktree at the advanced accepted commit.
+    expect(impl.storage.chatMeta.get(1)!.codeBase!.pins).toEqual(
+        [{ gadgetId: id, baseCommit: record.pinBase, mergedCommit: record.pinBase }]);
   }));
 
   it("an edited executable keeps its mode; untouched special entries ride through",

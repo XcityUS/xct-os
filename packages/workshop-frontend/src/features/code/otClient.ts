@@ -1,5 +1,6 @@
 import type {
-  AiChatAuthorInfo, ChatCodeBase, ChatGadgetPin, CodeChangeSubmission, WorkpieceId,
+  AiChatAuthorInfo, ChatCodeBase, ChatGadgetPin, ChatGadgetPinState, CodeChangeSubmission,
+  WorkpieceId,
 } from '@gadgets/workshop-shared/api'
 import {
   applyCodeChange, changedGadgets, composeCodeChange, transformCodeChange,
@@ -10,11 +11,19 @@ import {
 //
 // A chat's uncommitted code is one revisioned stream of code changes per generation (see
 // ChatCodeBase in the API). This client tracks that stream for one chat: it derives the chat's
-// content (per-pin base trees + the epoch's materialized changes + accepted rows), holds at most
-// one in-flight submitCodeChange() plus one pending composition of newer local edits, transforms
-// both over incoming remote rows (the priority pairing lives in code-change.ts), and rebases
-// them. The pending buffer *composes*, so submissions land at ~RTT granularity -- everything
-// typed since the last ack rides one submit -- not per keystroke.
+// content (the epoch's materialized changes + accepted rows, over per-pin base commits), holds
+// at most one in-flight submitCodeChange() plus one pending composition of newer local edits,
+// transforms both over incoming remote rows (the priority pairing lives in code-change.ts), and
+// rebases them. The pending buffer *composes*, so submissions land at ~RTT granularity --
+// everything typed since the last ack rides one submit -- not per keystroke.
+//
+// Content is *sparse*: a pinned workpiece's entry holds only the paths the epoch has touched
+// (plus paths the user began editing), never its base tree. `set` and `remove` rows need no
+// base; an `edit` of a path not yet held seeds exactly that path from the pin's base commit
+// before applying. A per-workpiece tombstone set records removals (a `remove` adds, a `set`
+// clears), since applyCodeChange deletes the key. So "touched" is "in getFiles() or in
+// getRemovedPaths()", and everything untouched is read by the view from the base commit
+// directly (see commitFileStore) -- the same way for a gadget and a worktree.
 //
 // Inputs arrive through three paths, each safe to deliver redundantly or out of order across
 // paths (the client holds rows it cannot apply yet and drains them as knowledge arrives):
@@ -26,16 +35,16 @@ import {
 //    and rebuilds, per ChatCodeBase.generation's contract.
 //  - pushRow(): one AiChatSubscriber.changeApplied() row. Deduped by (generation, revision), so
 //    subscribe-replay after a reconnect is harmless.
-//  - applyLocalChange() (with ensureGadgetEditable() for the first edit to an unpinned gadget):
+//  - applyLocalChange() (with ensureFileEditable() first for a path the content doesn't hold):
 //    locally-authored edits, composed into the pending buffer and submitted under the
 //    client-generated (clientId, seq) idempotency scheme of Overseer.submitCodeChange().
 //
 // Base content is never taken from another client: it always comes from
-// getCodeAtCommit(baseCommit) (the delegate's fetch, cacheable by oid) or, for the first local
-// edit to an unpinned gadget, from the head tree the view is already displaying -- which is
-// byte-identical to what the accompanying pin declaration names. The client mints a fresh
-// clientId whenever local state is rebuilt; a transport failure retries the same seq with an
-// identical payload, never a re-composed change (the server's dedupe digest requires it).
+// readFilesAtCommit(baseCommit, paths) (the delegate's fetch, cacheable by oid) or, for the
+// first local edit to an unpinned workpiece, from the base text the view is already displaying
+// -- which is byte-identical to what the accompanying pin declaration names. The client mints a
+// fresh clientId whenever local state is rebuilt; a transport failure retries the same seq with
+// an identical payload, never a re-composed change (the server's dedupe digest requires it).
 
 /** One accepted row of a chat's change stream, as delivered by AiChatSubscriber.changeApplied(). */
 export interface ChatChangeRow {
@@ -68,8 +77,14 @@ export interface RemoteFileEvent {
 
 /** How the client reaches the world. All callbacks may be invoked from async continuations. */
 export interface ChatOtClientDelegate {
-  /** Read a commit's flattened file map (Overseer.getCodeAtCommit, cacheable by oid). */
-  fetchCommitFiles(commitId: string): Promise<ReadonlyMap<string, string>>
+  /**
+   * Read the named files at a commit (Overseer.readFilesAtCommit, cacheable by oid): one entry
+   * per requested path, `null` for a path absent at the commit. Only ever asked for the paths
+   * an `edit` needs a base for, so an unreadable answer (symlink, binary, oversized) is a
+   * server-invariant violation: throw, and the client reports it through onFatalError.
+   */
+  fetchFilesAtCommit(commitId: string, paths: readonly string[])
+      : Promise<ReadonlyMap<string, string | null>>
   /** Overseer.submitCodeChange for this chat. */
   submitCodeChange(submission: CodeChangeSubmission)
       : Promise<{ generation: number; revision: number }>
@@ -88,7 +103,7 @@ export interface ChatOtClientDelegate {
   onLocalEditsDiscarded(): void
   /** Whether unacknowledged local edits are stuck behind a failing submission. */
   onDirtyState(hasUnsyncedEdits: boolean): void
-  /** Unrecoverable failure (e.g. a base tree fetch failed); the view should show an error. */
+  /** Unrecoverable failure (e.g. a base file fetch failed); the view should show an error. */
   onFatalError(err: unknown): void
 }
 
@@ -96,6 +111,51 @@ const EMPTY_CHANGE: CodeChange = {}
 
 function isEmptyChange(change: CodeChange): boolean {
   return Object.keys(change).length === 0
+}
+
+// The paths a gadget's entries `edit` -- the only file changes that need base content.
+function editPaths(entries: readonly [path: string, change: FileChange][]): string[] {
+  return entries.filter(([, change]) => 'edit' in change).map(([path]) => path)
+}
+
+// The paths one gadget's part of a change touches, added to `into`.
+function collectTouchedPaths(
+  change: CodeChange, into: Map<WorkpieceId, Set<string>>,
+): void {
+  for (const [key, entries] of Object.entries(change)) {
+    const gadgetId = Number(key)
+    let paths = into.get(gadgetId)
+    if (paths === undefined) {
+      paths = new Set()
+      into.set(gadgetId, paths)
+    }
+    for (const [path] of entries) paths.add(path)
+  }
+}
+
+// Fold one gadget's part of a change over a tombstone set: `remove` adds, `set`/`edit` delete.
+function foldRemovals(removed: Set<string>, entries: readonly [string, FileChange][]): void {
+  for (const [path, change] of entries) {
+    if ('remove' in change) removed.add(path)
+    else removed.delete(path)
+  }
+}
+
+// Fetch base text for `paths`, requiring every one to exist: a caller only asks for an `edit`'s
+// base, and an edit of an absent path is a server-invariant violation.
+async function fetchBaseTexts(
+  delegate: ChatOtClientDelegate, commitId: string, paths: readonly string[],
+): Promise<Map<string, string>> {
+  const fetched = await delegate.fetchFilesAtCommit(commitId, paths)
+  const texts = new Map<string, string>()
+  for (const path of paths) {
+    const text = fetched.get(path)
+    if (text === undefined || text === null) {
+      throw new Error(`edit of a path absent at its base commit: ${path} @ ${commitId}`)
+    }
+    texts.set(path, text)
+  }
+  return texts
 }
 
 // Drop the given gadgets' entries from a change (an epoch reset marks gadgets discontinuous:
@@ -138,17 +198,21 @@ function isRetryableSubmitRejection(err: unknown): boolean {
 /**
  * The OT client for one chat. Create one per (chat, view) and dispose it on chat switch; feed
  * it durable snapshots and rows as they arrive, and route editor edits through
- * ensureGadgetEditable()/applyLocalChange(). `getContent()` is the chat's uncommitted content as
- * this client sees it -- committed heads still apply for gadgets absent from it (an unpinned
- * gadget tracks mainline head live).
+ * ensureFileEditable()/applyLocalChange(). `getContent()` is the chat's uncommitted content as
+ * this client sees it: sparse (touched paths only) for the workpieces it covers, and silent
+ * about the rest (an unpinned gadget tracks mainline head live; an unpinned worktree its
+ * accepted commit).
  */
 export class ChatOtClient {
   readonly #delegate: ChatOtClientDelegate
 
   // ---- server-acked state ----
-  // Content through (#generation, #appliedRevision): pin base trees + epoch message changes + rows.
-  // Treated as immutable (copy-on-write), like everything code-change functions touch.
+  // Content through (#generation, #appliedRevision): for each covered workpiece, the epoch's
+  // touched paths (base text seeded per path on first `edit`) with message changes and rows
+  // applied. Treated as immutable (copy-on-write), like everything code-change functions touch.
   #applied: CodeContent = new Map()
+  // Acknowledged removals per workpiece (see getRemovedPaths); updated exactly where #applied is.
+  #removed = new Map<WorkpieceId, Set<string>>()
   #generation = 0
   #appliedRevision = 0
 
@@ -167,10 +231,11 @@ export class ChatOtClient {
     accepted?: { generation: number; revision: number }
   } | null = null
   #pending: CodeChange = EMPTY_CHANGE
-  // Local seeds for gadgets this client started editing before any pin existed: the head tree
-  // the first keystroke was made against. Declared as the pin base on the next submission and
-  // dropped once the gadget's content enters #applied (or on any rebuild/reset).
-  #localSeeds = new Map<WorkpieceId, { baseCommit: string; files: ReadonlyMap<string, string> }>()
+  // Local seeds for workpieces this client started editing before any pin existed: the base
+  // commit the first keystroke was made against, with the base text of just the paths edited so
+  // far. Declared as the pin base on the next submission and dropped once the workpiece's
+  // content enters #applied (or on any rebuild/reset).
+  #localSeeds = new Map<WorkpieceId, { baseCommit: string; files: Map<string, string> }>()
 
   // ---- derived ----
   // #applied + local seeds + inflight + pending: what editors display. Kept incrementally so
@@ -185,7 +250,13 @@ export class ChatOtClient {
   // generation before its metadata, a revision gap, a pin we haven't learned yet).
   #heldRows = new Map<number, Map<number, ChatChangeRow>>()
   // Set while waiting out a content-preserving generation switch (see setDurableState).
-  #pendingSwitch: { codeBase: ChatCodeBase; since: number } | null = null
+  // `closingPins` are the closing generation's pins as last delivered: its remaining rows still
+  // seed from those bases, while #latestDurable already describes the new generation.
+  #pendingSwitch: {
+    codeBase: ChatCodeBase
+    since: number
+    closingPins: readonly ChatGadgetPinState[]
+  } | null = null
   // Set while the durable watermark has run ahead of the applied revision (see #checkStalls).
   #watermarkGapSince: number | null = null
   #recheckTimer: ReturnType<typeof setTimeout> | null = null
@@ -222,18 +293,42 @@ export class ChatOtClient {
     return this.#ready && !this.#fatal
   }
 
-  /** The chat's uncommitted content as displayed: server-acked rows plus local edits. */
+  /**
+   * The chat's uncommitted content as displayed: server-acked rows plus local edits, sparse
+   * (see the module comment) -- a covered workpiece's entry holds its touched paths only.
+   */
   getContent(): CodeContent {
     return this.#display
   }
 
-  /** Whether the chat's uncommitted content covers this gadget (else it tracks head live). */
+  /**
+   * Whether the chat's uncommitted content covers this workpiece (else it tracks its accepted
+   * commit live: mainline head for a gadget).
+   */
   hasGadget(gadgetId: WorkpieceId): boolean {
     return this.#display.has(gadgetId)
   }
 
+  /** The workpiece's displayed touched paths and their text; undefined when not covered. */
   getFiles(gadgetId: WorkpieceId): ReadonlyMap<string, string> | undefined {
     return this.#display.get(gadgetId)
+  }
+
+  /**
+   * The paths the display shows as removed from the workpiece's base: the acknowledged
+   * tombstones with the local buffers folded over them in display order (`remove` adds,
+   * `set`/`edit` deletes). Derived per call rather than stored, because the acknowledged and
+   * displayed timelines legitimately disagree: with a local delete in flight, a remote `edit`
+   * of the same file applies to the acked content yet transforms to nothing on the display, so
+   * one set fed from both would lose the tombstone and let the view resurrect the file.
+   */
+  getRemovedPaths(gadgetId: WorkpieceId): ReadonlySet<string> {
+    const removed = new Set(this.#removed.get(gadgetId))
+    const inflight = this.#inflight?.change[gadgetId]
+    if (inflight !== undefined) foldRemovals(removed, inflight)
+    const pending = this.#pending[gadgetId]
+    if (pending !== undefined) foldRemovals(removed, pending)
+    return removed
   }
 
   /** Whether unacknowledged local edits exist (in flight or still pending). */
@@ -261,6 +356,7 @@ export class ChatOtClient {
       const codeBase = durable.codeBase ?? { pins: [], generation: 0, revision: 0 }
       // Messages can arrive before the metadata that covers their materialization watermark.
       if (durable.rowsThrough > codeBase.revision) return
+      const previousPins = this.#latestDurable.codeBase?.pins ?? []
       this.#latestDurable = durable
 
       if (!this.#ready) {
@@ -272,8 +368,10 @@ export class ChatOtClient {
         if (codeBase.generation < this.#generation) return  // stale delivery
         if (codeBase.prior?.generation === this.#generation) {
           // Content-preserving epoch reset: finish the closed generation's tail, then hand the
-          // local buffers across (see #trySwitchGeneration, called from the drain).
-          this.#pendingSwitch ??= { codeBase, since: Date.now() }
+          // local buffers across (see #trySwitchGeneration, called from the drain). The first
+          // new-generation snapshot displaces the closing generation's last one, whose pins the
+          // tail's rows still need.
+          this.#pendingSwitch ??= { codeBase, since: Date.now(), closingPins: previousPins }
           this.#pendingSwitch.codeBase = codeBase
           await this.#drainHeldRows()
           this.#checkStalls()
@@ -415,15 +513,23 @@ export class ChatOtClient {
   // Apply one row (the next in sequence). Returns false if it must wait (a pin the metadata
   // hasn't delivered yet) or if the client's local edits had to be discarded instead.
   async #applyRow(row: ChatChangeRow): Promise<boolean> {
-    // Establish bases for gadgets the row touches that content doesn't cover yet. The pin is
-    // read from the latest metadata; the metadata carrying it is written in the same
-    // synchronous server step as the row, so normally it has already arrived.
-    const seeds = new Map<WorkpieceId, ReadonlyMap<string, string>>()
-    for (const gadgetId of changedGadgets(row.change)) {
-      if (this.#applied.has(gadgetId) || seeds.has(gadgetId)) continue
-      const pin = (this.#latestDurable.codeBase?.pins ?? []).find(p => p.gadgetId === gadgetId)
+    // Seed base text for the `edit` paths the acked content doesn't hold yet -- and an entry
+    // for each gadget it doesn't cover at all, which is what marks the gadget pinned here. The
+    // pin is read from the metadata of the row's own generation: normally the latest, which the
+    // server wrote in the same synchronous step as the row; during a generation switch, the
+    // closing generation's (the latest snapshot already describes the new one, whose pins are
+    // not this row's). A local seed's files cover the paths our own pending edits need and are
+    // folded in at the tail (the seed can grow while a fetch is out); only the rest is fetched.
+    const pins = this.#pendingSwitch?.closingPins ?? this.#latestDurable.codeBase?.pins ?? []
+    const fetched = new Map<WorkpieceId, { pinBase?: string; files: Map<string, string> }>()
+    for (const [gadgetKey, entries] of Object.entries(row.change)) {
+      const gadgetId = Number(gadgetKey)
+      const held = this.#applied.get(gadgetId)
+      const missing = editPaths(entries).filter(path => !held?.has(path))
+      if (held !== undefined && missing.length === 0) continue
+      const pin = pins.find(p => p.gadgetId === gadgetId)
+      const localSeed = this.#localSeeds.get(gadgetId)
       if (pin !== undefined) {
-        const localSeed = this.#localSeeds.get(gadgetId)
         if (localSeed !== undefined && localSeed.baseCommit !== pin.baseCommit) {
           // Another client's first edit pinned this gadget at a different base than our own
           // not-yet-submitted first edit assumed: our declaration would be rejected as a pin
@@ -431,12 +537,20 @@ export class ChatOtClient {
           await this.#discardLocalAndRebuild()
           return false
         }
+        const toFetch = missing.filter(path => !localSeed?.files.has(path))
         // The fetch awaits; the synchronous tail below revalidates the stream position.
-        seeds.set(gadgetId, await this.#delegate.fetchCommitFiles(pin.baseCommit))
-      } else if (this.#localSeeds.has(gadgetId)) {
+        fetched.set(gadgetId, {
+          pinBase: pin.baseCommit,
+          files: toFetch.length > 0
+            ? await fetchBaseTexts(this.#delegate, pin.baseCommit, toFetch)
+            : new Map(),
+        })
+      } else if (localSeed !== undefined) {
         // Our own declaration's echo can arrive before the metadata that mirrors the pin; the
-        // local seed is byte-identical to the declared base by construction.
-        seeds.set(gadgetId, this.#localSeeds.get(gadgetId)!.files)
+        // local seed is byte-identical to the declared base by construction. A path it doesn't
+        // cover is another client's edit, which waits for that metadata like any other.
+        if (missing.some(path => !localSeed.files.has(path))) return false
+        fetched.set(gadgetId, { files: new Map() })
       } else if (!this.#pendingCreations.has(gadgetId)) {
         // No pin known yet: hold until the metadata that declares it arrives
         // (setDurableState / setPendingCreations re-drain).
@@ -450,39 +564,47 @@ export class ChatOtClient {
       return true  // state moved during the fetch; the drain loop re-evaluates
     }
 
-    const events: RemoteFileEvent[] = []
-    if (seeds.size > 0) {
-      const applied = new Map(this.#applied)
-      const display = new Map(this.#display)
-      for (const [gadgetId, files] of seeds) {
-        applied.set(gadgetId, new Map(files))
-        if (!display.has(gadgetId)) {
-          // A newly-visible remote pin: surface its base files so an open editor re-reads.
-          // (When we held a matching local seed, the display already shows this content.)
-          for (const [path, text] of files) events.push({ gadgetId, path, change: { set: text } })
-          display.set(gadgetId, new Map(files))
+    if (fetched.size > 0) {
+      // Local edits kept flowing during the fetch: a seed may have grown (each new path they
+      // touched was seeded into it -- base text the pending buffer relies on), or come into
+      // being. Re-run the base check against the seed as it stands *now* before folding it in,
+      // since a first local edit made meanwhile assumed a base this pin may contradict.
+      for (const [gadgetId, { pinBase }] of fetched) {
+        const seed = this.#localSeeds.get(gadgetId)
+        if (pinBase !== undefined && seed !== undefined && seed.baseCommit !== pinBase) {
+          await this.#discardLocalAndRebuild()
+          return false
         }
+      }
+      const applied = new Map(this.#applied)
+      for (const [gadgetId, { files }] of fetched) {
+        const entry = new Map(applied.get(gadgetId))
+        for (const [path, text] of this.#localSeeds.get(gadgetId)?.files ?? []) entry.set(path, text)
+        for (const [path, text] of files) entry.set(path, text)
+        applied.set(gadgetId, entry)
         this.#localSeeds.delete(gadgetId)
       }
       this.#applied = applied
-      this.#display = display
+      // Seeded paths enter the display silently: nothing was displayed from the client for them
+      // before (open editors read untouched paths from the base commit), and the local buffers
+      // already fit this content.
+      this.#recomputeDisplay()
     }
 
     const own = row.submission !== undefined && row.submission.clientId === this.#clientId &&
       this.#inflight !== null && row.submission.seq === this.#inflight.wire.seq
-    this.#applied = applyCodeChange(this.#applied, row.change)
+    this.#applyAcked(row.change)
     this.#appliedRevision = row.revision
 
     if (own) {
       // Our own echo: the broadcast change is our in-flight change as the server transformed it
       // -- the same transforms we applied locally -- so the display already reflects it and
-      // editors are notified only of the seed events above (usually none). An empty call would
-      // read as a coarse reset (see ChatOtClientDelegate.onRemoteChange).
+      // editors are told nothing. An empty call would read as a coarse reset (see
+      // ChatOtClientDelegate.onRemoteChange).
       this.#inflight = null
       this.#submitBackoffMs = SUBMIT_RETRY_BASE_MS
       this.#delegate.onDirtyState(false)
       this.#scheduleSubmit()
-      if (events.length > 0) this.#delegate.onRemoteChange(events)
       return true
     }
 
@@ -500,15 +622,31 @@ export class ChatOtClient {
       this.#pending = b
     }
     this.#display = applyCodeChange(this.#display, displayChange)
+    const events: RemoteFileEvent[] = []
     for (const [gadgetKey, entries] of Object.entries(displayChange)) {
       for (const [path, change] of entries) {
         events.push({ gadgetId: Number(gadgetKey), path, change })
       }
     }
-    // A row whose doubly-transformed form changed no displayed file (and surfaced no seeds)
-    // is a display no-op: deliver nothing rather than a spurious coarse reset.
+    // A row whose doubly-transformed form changed no displayed file is a display no-op:
+    // deliver nothing rather than a spurious coarse reset.
     if (events.length > 0) this.#delegate.onRemoteChange(events)
     return true
+  }
+
+  // Fold an acknowledged change into the acked content and its tombstones together.
+  #applyAcked(change: CodeChange): void {
+    this.#applied = applyCodeChange(this.#applied, change)
+    for (const [gadgetKey, entries] of Object.entries(change)) {
+      const gadgetId = Number(gadgetKey)
+      let removed = this.#removed.get(gadgetId)
+      if (removed === undefined) {
+        if (!entries.some(([, fileChange]) => 'remove' in fileChange)) continue
+        removed = new Set()
+        this.#removed.set(gadgetId, removed)
+      }
+      foldRemovals(removed, entries)
+    }
   }
 
   // Backstop for a lost echo: the submission was accepted (the RPC response said where it
@@ -538,7 +676,7 @@ export class ChatOtClient {
       this.#applied = applied
     }
 
-    this.#applied = applyCodeChange(this.#applied, inflight.change)
+    this.#applyAcked(inflight.change)
     this.#appliedRevision = accepted.revision
     this.#inflight = null
     this.#submitBackoffMs = SUBMIT_RETRY_BASE_MS
@@ -603,25 +741,35 @@ export class ChatOtClient {
     }
 
     // Every pin evaporated: the merged content now lives in commits, and unpinned gadgets track
-    // head live. Keep entries only for gadgets the local buffers still touch -- for those, the
-    // old content equals the boundary commit's tree (that is what content-preserving means), so
-    // local changes keep composing on identical content until the bridged rows re-pin them. Local
-    // seeds for such gadgets survive too: they were unpinned on both sides, so their base (the
-    // gadget's untouched head) still stands.
-    const touched = new Set<WorkpieceId>([
-      ...changedGadgets(this.#pending),
-      ...(this.#inflight !== null ? changedGadgets(this.#inflight.change) : []),
-    ])
+    // head live. Keep entries only for gadgets the local buffers still touch, and within them
+    // only the paths those buffers touch -- for those, the old content equals the boundary
+    // commit's tree (that is what content-preserving means), so local changes keep composing
+    // on identical content until the bridged rows re-pin them. Carrying the whole entry would
+    // mislabel every path the closed epoch touched as touched again in the new one. Acked
+    // tombstones are gone the same way (the removals are now simply absent from the new base);
+    // locally removed paths stay derived from the buffers. Local seeds for touched gadgets
+    // survive too: they were unpinned on both sides, so their base (the gadget's untouched
+    // head) still stands.
+    const touched = new Map<WorkpieceId, Set<string>>()
+    collectTouchedPaths(this.#pending, touched)
+    if (this.#inflight !== null) collectTouchedPaths(this.#inflight.change, touched)
     const carried: CodeContent = new Map()
-    for (const gadgetId of touched) {
+    for (const [gadgetId, paths] of touched) {
       if (discontinuous.has(gadgetId)) continue
       const files = this.#applied.get(gadgetId)
-      if (files !== undefined) carried.set(gadgetId, files)
+      if (files === undefined) continue
+      const kept = new Map<string, string>()
+      for (const path of paths) {
+        const text = files.get(path)
+        if (text !== undefined) kept.set(path, text)
+      }
+      carried.set(gadgetId, kept)
     }
     for (const gadgetId of this.#localSeeds.keys()) {
       if (!touched.has(gadgetId)) this.#localSeeds.delete(gadgetId)
     }
     this.#applied = carried
+    this.#removed = new Map()
     this.#generation = target.codeBase.generation
     this.#appliedRevision = 0
     this.#recomputeDisplay()
@@ -644,11 +792,16 @@ export class ChatOtClient {
   async #rebuild(durable: ChatDurableCode): Promise<void> {
     const codeBase = durable.codeBase ?? { pins: [], generation: 0, revision: 0 }
 
-    // Prefetch every pin's base tree (oid-cached, so repeats are cheap).
-    const bases = new Map<WorkpieceId, ReadonlyMap<string, string>>()
+    // Every pin gets an entry (that is what marks it pinned here), seeded with the base text of
+    // the paths the epoch change `edit`s -- one fetch per pin (oid-cached, so repeats are cheap).
+    const bases = new Map<WorkpieceId, Map<string, string>>()
     try {
       await Promise.all(codeBase.pins.map(async pin => {
-        bases.set(pin.gadgetId, await this.#delegate.fetchCommitFiles(pin.baseCommit))
+        const entries = durable.epochChange?.[pin.gadgetId]
+        const paths = entries !== undefined ? editPaths(entries) : []
+        bases.set(pin.gadgetId, paths.length > 0
+          ? await fetchBaseTexts(this.#delegate, pin.baseCommit, paths)
+          : new Map())
       }))
     } catch (err) {
       if (!this.#disposed && !this.#fatal) {
@@ -663,11 +816,9 @@ export class ChatOtClient {
     }
 
     // ---- synchronous tail ----
-    let content: CodeContent = new Map()
-    for (const [gadgetId, files] of bases) content.set(gadgetId, new Map(files))
-    if (durable.epochChange !== undefined) content = applyCodeChange(content, durable.epochChange)
-
-    this.#applied = content
+    this.#applied = bases
+    this.#removed = new Map()
+    if (durable.epochChange !== undefined) this.#applyAcked(durable.epochChange)
     this.#generation = codeBase.generation
     this.#appliedRevision = durable.rowsThrough
     this.#inflight = null
@@ -701,28 +852,63 @@ export class ChatOtClient {
   // Local edits out
 
   /**
-   * Seed local editing state for a gadget the chat has no content for yet (the first keystroke
-   * to an unpinned gadget): keep displaying the head tree the user is looking at, and declare
-   * `baseCommit` as the pin base on the next submission. No-op if content already exists. A
-   * pending (chat-created) gadget needs no seed (pass its files straight to applyLocalChange).
+   * Make `path` of a workpiece locally editable before applyLocalChange() touches it. `baseText`
+   * is the path's text at `baseCommit` -- the workpiece's content base as the view displays it
+   * (the chat pin's base when pinned, else its accepted commit) -- or undefined when the path
+   * has none there (a file being created; a `remove` needs no text either).
+   *
+   * For a workpiece the chat has no content for yet (the first keystroke to an unpinned one),
+   * this records a sparse local seed -- just this path's base text -- and declares `baseCommit`
+   * as the pin base on the next submission. For one already covered (or seeded) whose content
+   * doesn't hold the path, it seeds the path's base text into the content, so an `edit` has
+   * something to apply to: an untouched path's acked content *is* its base text. A path the
+   * display already holds, or shows as removed, is left alone. A pending (chat-created) gadget
+   * needs no seed (pass its changes straight to applyLocalChange).
    */
-  ensureGadgetEditable(
-    gadgetId: WorkpieceId, headCommitId: string | undefined,
-    headFiles: ReadonlyMap<string, string>,
+  ensureFileEditable(
+    gadgetId: WorkpieceId, baseCommit: string | undefined, path: string,
+    baseText: string | undefined,
   ): void {
-    if (this.#display.has(gadgetId) || this.#localSeeds.has(gadgetId)) return
-    if (headCommitId === undefined || this.#pendingCreations.has(gadgetId)) return
-    this.#localSeeds.set(gadgetId, { baseCommit: headCommitId, files: headFiles })
+    if (this.#pendingCreations.has(gadgetId)) return
+    const covered = this.#display.has(gadgetId) || this.#localSeeds.has(gadgetId)
+    if (!covered) {
+      if (baseCommit === undefined) return
+      const files = new Map<string, string>()
+      if (baseText !== undefined) files.set(path, baseText)
+      this.#localSeeds.set(gadgetId, { baseCommit, files })
+      const display = new Map(this.#display)
+      display.set(gadgetId, new Map(files))
+      this.#display = display
+      return
+    }
+    if (baseText === undefined) return
+    if (this.#display.get(gadgetId)?.has(path) || this.getRemovedPaths(gadgetId).has(path)) return
+    const applied = this.#applied.get(gadgetId)
+    if (applied !== undefined) {
+      const entry = new Map(applied)
+      entry.set(path, baseText)
+      const content = new Map(this.#applied)
+      content.set(gadgetId, entry)
+      this.#applied = content
+    } else {
+      const seed = this.#localSeeds.get(gadgetId)
+      if (seed === undefined) return  // covered by local buffers alone: nothing to root a seed in
+      seed.files.set(path, baseText)
+    }
+    // The local buffers don't touch the path (it is neither displayed nor removed), so the
+    // display gains exactly the seeded text.
+    const displayEntry = new Map(this.#display.get(gadgetId))
+    displayEntry.set(path, baseText)
     const display = new Map(this.#display)
-    display.set(gadgetId, new Map(headFiles))
+    display.set(gadgetId, displayEntry)
     this.#display = display
   }
 
   /**
    * Apply one locally-authored change (which the editor has already applied to its own document):
    * fold it into the display and the pending buffer, and schedule a submission. The change must fit
-   * the current display content -- call ensureGadgetEditable() first for a gadget the chat has
-   * no content for.
+   * the current display content -- call ensureFileEditable() first for each path the content
+   * doesn't hold.
    */
   applyLocalChange(change: CodeChange): void {
     if (this.#fatal || this.#disposed || !this.#ready || isEmptyChange(change)) return

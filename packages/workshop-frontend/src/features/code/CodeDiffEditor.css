@@ -1,6 +1,6 @@
 /*
- * Diff view styling (see CodeDiffEditor.tsx and src/diff/diffRenderer.ts). The editors are
- * CodeMirror 6; the shared code theme (components/codeTheme.ts) provides the base chrome, and
+ * Diff view styling (see CodeDiffEditor.tsx and diff/diffRenderer.ts). The editors are
+ * CodeMirror 6; the shared code theme (codeTheme.ts) provides the base chrome, and
  * these rules add the diff layer: changed-line tints, the 3px change-bar gutter, char-level
  * highlights, deletion zones (block widgets plus their gutter columns), and the hatched blank
  * zones that keep the split layout aligned.

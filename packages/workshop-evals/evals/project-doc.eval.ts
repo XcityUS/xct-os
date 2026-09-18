@@ -56,10 +56,10 @@ timeline. Put a sentence of placeholder detail under each. I'll replace them as 
       await verifier.check("is-presented-as-a-document-output", async () => {
         const doc = verifier.workpieces.find(workpiece => workpiece.title === TITLE);
         return {
-          pass: doc?.output?.id === "document",
+          pass: doc?.type === "gadget" && doc.output?.id === "document",
           evidence: verifier.workpieces.map(workpiece => ({
             title: workpiece.title,
-            outputId: workpiece.output?.id ?? null,
+            outputId: workpiece.type === "gadget" ? workpiece.output?.id ?? null : null,
           })),
         };
       });

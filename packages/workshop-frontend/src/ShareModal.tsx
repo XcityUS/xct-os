@@ -339,6 +339,12 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
   const peopleInputRef = useRef<HTMLInputElement>(null)
   const wasOpenRef = useRef(false)
   const userSearchEnabled = useServerConfig()?.userSearchEnabled ?? false
+  const isOwner = !metadata.owner
+  const containsRestrictedData = metadata.containsRestrictedData === true
+  // The server refuses share links and non-owner invites once this is set; hide those controls.
+  const ownerInvitesOnly = metadata.ownerInvitesOnly === true
+  const canInvite = !ownerInvitesOnly || isOwner
+  const canUseShareLinks = !ownerInvitesOnly
   const directoryQuery = addUsername.trim()
   // Everyone already on the workspace: the caller, the owner (absent from listCollaborators()
   // when the caller is a collaborator), and every collaborator -- plus everyone already staged.
@@ -352,7 +358,10 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
   const membershipReady = membershipSettled && membershipStatus === 'ready'
   const directorySearching = userSearchEnabled && membershipReady && directoryQuery !== ''
   const directoryCurrent = directory.query === directoryQuery
-  const directoryOpen = directorySearching && directoryCurrent && !directoryDismissed
+  // Gated on canInvite too: a live metadata update can set ownerInvitesOnly while results are
+  // open, unmounting the search field without blurring it, and the popover's scroll lock on the
+  // dialog body must not outlive the field.
+  const directoryOpen = canInvite && directorySearching && directoryCurrent && !directoryDismissed
   const directorySettled = directory.status !== 'loading' && directoryCurrent
   const showDirectDirectoryOption = directory.status === 'ready' && directory.results.length > 0
   const directoryOptionCount = directory.results.length + (showDirectDirectoryOption ? 1 : 0)
@@ -376,7 +385,7 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
   const inviteCount = pendingRecipients.length
   // Nothing is sent while the field holds text that cannot be staged yet (its search is still
   // pending), so the button waits too: Enter already does, and a click would silently drop the name.
-  const canInvite = inviteCount > 0 && (directoryQuery === '' || typedRecipient !== null)
+  const canSubmitInvite = inviteCount > 0 && (directoryQuery === '' || typedRecipient !== null)
   const [addRole, setAddRole] = useState<CollaboratorRole>('use')
   const [adding, setAdding] = useState(false)
   const [newLinkRole, setNewLinkRole] = useState<CollaboratorRole>('use')
@@ -530,9 +539,6 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
     }
   }, [])
 
-  const isOwner = !metadata.owner
-  const containsRestrictedData = metadata.containsRestrictedData === true
-
   const loadData = useCallback(async () => {
     try {
       const [collabs, keys] = await Promise.all([
@@ -626,7 +632,9 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
     [shareLinks],
   )
   let recipientVerification: ReactNode = null
-  if (requirementsFailed) {
+  if (!canInvite) {
+    // Nothing this user can do here admits a recipient, so there is nothing to verify.
+  } else if (requirementsFailed) {
     recipientVerification = (
       <RecipientVerification
         requirements={null}
@@ -637,7 +645,7 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
     )
   } else if (requirements !== null) {
     const inviteRequirements = requirements[addRole]
-    if (!showLinkComposer && !newShareLink) {
+    if (!canUseShareLinks || (!showLinkComposer && !newShareLink)) {
       recipientVerification = (
         <RecipientVerification
           requirements={inviteRequirements}
@@ -1011,7 +1019,9 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
               Share “{metadata.title}”
             </Dialog.Title>
             <Dialog.Description className="mt-1 text-[13px] leading-[18px] tracking-[-0.25px] text-kumo-subtle">
-              Invite people or share a link.
+              {canUseShareLinks
+                ? 'Invite people or share a link.'
+                : canInvite ? 'Invite people.' : 'Manage access.'}
             </Dialog.Description>
           </div>
           <Dialog.Close
@@ -1027,18 +1037,28 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
           className={`chat-panel min-h-0 flex-1 overscroll-contain px-4 pb-6 sm:px-6 ${directoryOpen ? 'overflow-hidden' : 'overflow-y-auto'}`}
           onScroll={(e) => setScrolled(e.currentTarget.scrollTop > 0)}
         >
-          {containsRestrictedData && (
+          {(containsRestrictedData || ownerInvitesOnly) && (
             <div className="mb-3 flex items-start gap-2.5 rounded-2xl bg-kumo-warning-tint px-3 py-2.5">
               <div className="grid h-6 w-6 shrink-0 place-items-center text-kumo-warning">
                 <ShieldWarning size={18} weight="duotone" />
               </div>
-              <p className="text-[12px] leading-[18px] tracking-[-0.1px] text-kumo-default">
-                This workspace has read sensitive data. People you invite are asked to verify their
-                own access to the connections it uses at their access level — some may be unable to
-                open it. Anything the workspace has already saved is visible to everyone who can.
-              </p>
+              {ownerInvitesOnly ? (
+                <p className="text-[12px] leading-[18px] tracking-[-0.1px] text-kumo-default">
+                  This workspace has read data from a connection that doesn’t allow share links, so
+                  only the owner can add people. People the owner invites are asked to verify their
+                  own access to the connections it uses at their access level — some may be unable to
+                  open it. Anything the workspace has already saved is visible to everyone who can.
+                </p>
+              ) : (
+                <p className="text-[12px] leading-[18px] tracking-[-0.1px] text-kumo-default">
+                  This workspace has read sensitive data. People you invite are asked to verify their
+                  own access to the connections it uses at their access level — some may be unable to
+                  open it. Anything the workspace has already saved is visible to everyone who can.
+                </p>
+              )}
             </div>
           )}
+          {canInvite && (
           <div className={`sticky top-0 z-10 bg-kumo-base pb-3 transition-shadow duration-200 ${scrolled ? 'themed-bottom-shadow border-b border-kumo-line/60' : ''}`}>
           <div
             ref={directoryAnchorRef}
@@ -1123,7 +1143,7 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
                 if (directoryOpen) event.preventDefault()
               }}
               onClick={() => void handleInvite(typedRecipient)}
-              disabled={!canInvite || adding}
+              disabled={!canSubmitInvite || adding}
             >
               {adding ? 'Inviting…' : inviteCount > 1 ? `Invite ${inviteCount} people` : 'Invite'}
             </WorkshopButton>
@@ -1246,6 +1266,7 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
             </div>
           )}
 
+          {canUseShareLinks && (
           <div className="mt-2">
             {(showLinkComposer || newShareLink) ? (
               newShareLink ? (
@@ -1315,7 +1336,9 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
               </button>
             )}
           </div>
+          )}
           </div>
+          )}
 
           {recipientVerification}
 
@@ -1450,14 +1473,16 @@ export default function ShareModal({ open, onClose, overseer, metadata, currentU
                         ) : (
                           <>
                             <RoleBadge role={sk.role} />
-                            <WorkshopIconButton
-                              className="!h-7 !w-7"
-                              onClick={() => handleCopyShareLink(sk.linkId)}
-                              aria-label={`Copy ${sk.note || 'share link'}`}
-                              disabled={confirmationBusy || copyingLinkId === sk.linkId}
-                            >
-                              {copiedLinkId === sk.linkId ? <Check size={13} weight="bold" /> : <Copy size={13} />}
-                            </WorkshopIconButton>
+                            {canUseShareLinks && (
+                              <WorkshopIconButton
+                                className="!h-7 !w-7"
+                                onClick={() => handleCopyShareLink(sk.linkId)}
+                                aria-label={`Copy ${sk.note || 'share link'}`}
+                                disabled={confirmationBusy || copyingLinkId === sk.linkId}
+                              >
+                                {copiedLinkId === sk.linkId ? <Check size={13} weight="bold" /> : <Copy size={13} />}
+                              </WorkshopIconButton>
+                            )}
                             <WorkshopIconButton
                               className="!h-7 !w-7 opacity-35 transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
                               onClick={() => startRenameShareLink(sk)}

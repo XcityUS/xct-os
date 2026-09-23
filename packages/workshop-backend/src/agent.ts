@@ -27,6 +27,7 @@ import {
   getModelTokenLimits, isCompactionTurn, protectRetainedReverts, shouldCompactChat,
   type CompactionProjectionMessage,
 } from "./agent-compaction";
+import { formatGrep, type GrepScan } from "./grep";
 
 const logger = createWorkshopLogger("workshop.agent");
 
@@ -63,6 +64,16 @@ export const CHAT_CHANGE_MESSAGE_BUDGET = 1024 * 1024;
  * the budget, but no shipped blueprint comes close.)
  */
 export const STEP_CHANGE_BUDGET = 1536 * 1024;
+
+/**
+ * How much text one tool result may put in front of the model. About 8k tokens: a handful of
+ * results fit inside the compaction headroom of the smallest supported window. Each tool that can
+ * produce more decides for itself how to stay under it in a way the model can read -- readFile
+ * returns a window of whole lines with a continuation note, grep drops whole matches and says how
+ * many, webFetch cuts its body and says so in the frontmatter -- rather than any tool's output
+ * being spliced blindly. Tools not listed are small by construction.
+ */
+export const MAX_TOOL_RESULT_CHARS = 32 * 1024;
 
 /**
  * One buffered agent tool edit: an entry of the step buffer, which the step's persistence
@@ -560,6 +571,15 @@ export interface AgentHooks {
   assertWorktreePathWritable(commit: string, path: string): Promise<void>;
 
   /**
+   * The grep tool's scan: the searchable files under `path` in a workpiece's overlay-over-base
+   * view, with missing base blobs pulled in one batch (see scanWorkpieceForGrep). `base` is the
+   * commit the workpiece's untouched files are read from, or undefined for a gadget with no
+   * committed code.
+   */
+  grepWorkpiece(turn: WorktreeTurnAccess, workpieceId: WorkpieceId, base: string | undefined,
+                path?: string): Promise<GrepScan>;
+
+  /**
    * Describe a workpiece (a gadget or a gatekeeper) reachable as `envName` in the chat's env,
    * for the agent's describeBinding tool. (`envName` is provided here only so that it can be
    * incorporated into the returned description.)
@@ -724,7 +744,7 @@ Draft requested text directly in chat; do not look up blueprints or create a Gad
 
 Note that users rarely ask for "a Gadget" in those words. They ask for a thing: a doc, a deck, a tracker, a tool that does X. "Summarize this doc", "draft an email", or "check these figures" usually asks for an answer or one-off task, not a new Gadget. Work on an existing Gadget when the request refers to it. If a useful answer completes the task, give that answer. Ask a brief clarification when it's unclear whether the user wants something created; otherwise, proceed. When the goal is unclear, ask what the user wants to accomplish before suggesting an application.
 
-Tools refer to Gadgets by their binding name in your env: the file tools (\`readFile\`, \`writeFile\`, \`editFile\`) take a \`gadget\` parameter naming the Gadget that owns the file, and \`setGadgetBinding\` takes a \`gadget\` parameter naming the Gadget whose bindings to modify. Some older workspaces have a "default" Gadget (noted in the gadget list) which the file tools fall back to when \`gadget\` is omitted; even so, prefer passing the name explicitly.
+Tools refer to Gadgets by their binding name in your env: the file tools (\`readFile\`, \`writeFile\`, \`editFile\`, \`grep\`) take a \`workpiece\` parameter naming the Gadget that owns the file, and \`setGadgetBinding\` takes a \`gadget\` parameter naming the Gadget whose bindings to modify. Some older workspaces have a "default" Gadget (noted in the gadget list) which the file tools fall back to when \`workpiece\` is omitted; even so, prefer passing the name explicitly.
 
 # Writing Gadgets
 
@@ -954,6 +974,8 @@ ${types.trim()}
 
 let READ_FILE_TOOL_DESCRIPTION = `
 Read the content of a file owned by one of the workspace's gadgets. If a file changes after you read it, you will either be informed of the change or the outdated result will be replaced with a note telling you to re-read the file; otherwise there is no need to read a file again after you have already read it once. This cannot read chat attachments; attachments are provided directly in the conversation.
+
+For a large file, pass \`startLine\` and \`lineCount\` to read a window of it; the result then ends with a line giving the range shown and the \`startLine\` to continue from. Use \`grep\` to find the lines you need first.
 `.trim();
 
 let CREATE_GADGET_TOOL_DESCRIPTION = `
@@ -965,11 +987,17 @@ By default the new gadget is empty. Pass \`blueprintId\` (discovered with the \`
 `.trim();
 
 let CREATE_WORKTREE_TOOL_DESCRIPTION = `
-Create a worktree: a file tree rooted at a git commit, which you can then read and edit with the regular file tools (\`readFile\`, \`writeFile\`, \`editFile\`) by passing the \`bindingName\` you choose as their \`workpiece\` parameter. Unlike a gadget, a worktree has no runnable code of its own and is private to this conversation.
+Create a worktree: a file tree rooted at a git commit, which you can then read and edit with the regular file tools (\`readFile\`, \`writeFile\`, \`editFile\`, \`grep\`) by passing the \`bindingName\` you choose as their \`workpiece\` parameter. Unlike a gadget, a worktree has no runnable code of its own and is private to this conversation.
 
 \`commitId\` is a git commit id (a full 40-hex SHA-1, or an unambiguous prefix) already known to this workspace — typically one returned by a connection's API (e.g. a repository's branch or commit listing). Look the commit up through the connection first if you only know a branch or tag name.
 
 In \`executeCode\`, the worktree's env binding additionally offers a programmatic API — \`listFiles\`, \`grep\`, \`commit\` (write a git commit of the worktree's content), \`diff\`, and more; use \`describeBinding\` to see it.
+`.trim();
+
+let GREP_TOOL_DESCRIPTION = `
+Search a workpiece's files for lines matching a regular expression (JavaScript syntax, case-sensitive, matched one line at a time). Each match is reported as \`path:line:text\`, like \`grep -n\`. With \`path\` omitted the whole workpiece is searched; a file path searches that file, a directory path searches it recursively. Very long results are cut short and end with a line saying how many matches were left out; narrow the pattern or the path to see them.
+
+Search before reading when you don't know where something lives, especially in a worktree.
 `.trim();
 
 let LIST_BLUEPRINTS_TOOL_DESCRIPTION = `
@@ -989,7 +1017,7 @@ Fetch the contents of a public web URL via HTTPS GET. Use this to look up docume
 
 The Gadget's own code (server.js / client.js) still cannot make network requests at runtime; \`webFetch\` is a tool for *you*, not something you can call from gadget code.
 
-Only https:// URLs to public hosts are allowed; credentials in the URL are not permitted, and the request is sent with no cookies and no authorization headers. Responses are capped at ~1 MiB; if the cap is hit, the result will note that the body was truncated.
+Only https:// URLs to public hosts are allowed; credentials in the URL are not permitted, and the request is sent with no cookies and no authorization headers. Bodies longer than about 32K characters are cut off; the frontmatter's \`truncated\` field says so.
 
 By default, document responses are converted to Markdown for readability: HTML, PDF, DOCX, XLSX, ODT/ODS, CSV, XML, and Apple Numbers files are run through Cloudflare Workers AI's document-conversion service. Plain text, JSON, and other unknown content types are returned as-is. Pass \`raw: true\` to skip conversion and always receive the exact bytes the server sent.
 
@@ -1110,6 +1138,46 @@ function findEditPos(content: string, textToReplace: string): number {
 // tools and history replay so the two can never drift.
 function jsonToolResultText(value: unknown): string {
   return JSON.stringify(value);
+}
+
+/** The line window a readFile call asked for (see AiToolCall's readFile input). */
+export type ReadFileWindow = {startLine?: number, lineCount?: number};
+
+/**
+ * Renders a readFile result as the exact text the model sees, for both the live tool and history
+ * replay. A read with no window returns the file verbatim when it fits MAX_TOOL_RESULT_CHARS;
+ * otherwise, and for any windowed read, the result is the selected lines, a blank line, and
+ * `[lines A-B of N; next startLine: B+1]` (without the continuation when B is the last line).
+ * `lineCount` is an upper bound: a window ends where the next whole line would push the result
+ * past the cap, so the note always says where to continue. Lines are never cut, so a single line
+ * longer than the cap is the one result that exceeds it. Lines are 1-based; a final newline does
+ * not start a line. The tool schema already requires positive integers. Exported for tests.
+ */
+export function readFileWindow(text: string, {startLine, lineCount}: ReadFileWindow): string {
+  if (startLine === undefined && lineCount === undefined &&
+      text.length <= MAX_TOOL_RESULT_CHARS) {
+    return text;
+  }
+  let lines = text.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  let first = startLine ?? 1;
+  if (first > lines.length) {
+    throw new Error(`startLine ${first} is past the end of the file, which has ` +
+        `${lines.length} line${lines.length === 1 ? "" : "s"}.`);
+  }
+  let note = (last: number) => `[lines ${first}-${last} of ${lines.length}` +
+      (last < lines.length ? `; next startLine: ${last + 1}]` : "]");
+  // Whole lines, at least one, while they fit under the cap with the longest note this file can
+  // produce.
+  let limit = lineCount === undefined ? lines.length : Math.min(lines.length, first - 1 + lineCount);
+  let budget = MAX_TOOL_RESULT_CHARS - note(lines.length - 1).length - 2;
+  let last = first;
+  let chars = lines[first - 1].length;
+  while (last < limit && chars + 1 + lines[last].length <= budget) {
+    chars += 1 + lines[last].length;
+    ++last;
+  }
+  return `${lines.slice(first - 1, last).join("\n")}\n\n${note(last)}`;
 }
 
 /**
@@ -1918,7 +1986,8 @@ async function runAgentPass(
                     if (oid === undefined) {
                       throw new Error("File missing from its observed commit.");
                     }
-                    toolOutput = {text: await hooks.readBlobText(oid, toolCall.input.filename)};
+                    toolOutput = {text: readFileWindow(
+                        await hooks.readBlobText(oid, toolCall.input.filename), toolCall.input)};
                     markFileRead(workpieceId, toolCall.input.filename, oid);
                   } else {
                     let {workpieceId} =
@@ -1949,7 +2018,7 @@ async function runAgentPass(
                       throw new Error("File does not exist.");
                     }
 
-                    toolOutput = {text: value};
+                    toolOutput = {text: readFileWindow(value, toolCall.input)};
                     markFileRead(workpieceId, toolCall.input.filename);
                   }
                   break;
@@ -2045,6 +2114,24 @@ async function runAgentPass(
                 case "giveUp":
                   // Obsolete tool: no longer offered, replayed for old chat logs only.
                   toolOutput = {text: jsonToolResultText({rejected: true})};
+                  break;
+                case "grep":
+                  // Recorded rather than re-run: a re-run could pull blobs or match differently.
+                  // A search over content the user later reverted would replay as
+                  // current-looking source; elide it the way a reverted readFile is.
+                  if (sawRevertedContent(msgIndex)) {
+                    toolOutput = {
+                      text: "This call succeeded when the agent first invoked it, but " +
+                          "the results have been elided from the chat history because " +
+                          "the user later reverted the files to an earlier version.",
+                      isError: true,
+                    };
+                  } else {
+                    if (toolCall.output === undefined) {
+                      throw new Error("grep tool call in log is missing output");
+                    }
+                    toolOutput = {text: toolCall.output};
+                  }
                   break;
                 case "webFetch":
                   if (toolCall.output === undefined) {
@@ -2740,14 +2827,20 @@ async function runAgentPass(
       parameters: Type.Object({
         workpiece: workpieceParam,
         filename: Type.String({description: "Name of the file to read."}),
-        // TODO: line range?
-        // TODO: Claude Code apparently presents the code to the agent with line number
-        //   prefixes on each line. Is this worth doing?
+        startLine: Type.Optional(Type.Integer({
+          minimum: 1,
+          description: "First line to return, 1-based. Omit to start at the top.",
+        })),
+        lineCount: Type.Optional(Type.Integer({
+          minimum: 1,
+          description: "Number of lines to return from startLine. Omit for all remaining lines.",
+        })),
       }),
-      execute: async (toolCallId, {workpiece, filename}) => {
+      execute: async (toolCallId, {workpiece, filename, startLine, lineCount}) => {
         try {
           let resolved =
               hooks.resolveWorkpieceRoot(resolveToolWorkpieceId(workpiece), true, chatId);
+          let window = {startLine, lineCount};
 
           // An unpinned workpiece with committed code is read live at its base -- a gadget's
           // head (fixed for the turn; see observeHead) or a worktree's accepted commit -- by
@@ -2764,8 +2857,9 @@ async function runAgentPass(
               if (file === undefined) {
                 throw new Error("File does not exist.");
               }
+              let shown = readFileWindow(file.text, window);
               markFileRead(resolved.workpieceId, filename, file.oid);
-              return toolResult(file.text, {observedOid: file.oid});
+              return toolResult(shown, {observedOid: file.oid});
             }
           }
 
@@ -2777,12 +2871,48 @@ async function runAgentPass(
           if (text === undefined) {
             throw new Error("File does not exist.");
           }
+          let shown = readFileWindow(text, window);
           markFileRead(resolved.workpieceId, filename);
-          return toolResult(text);
+          return toolResult(shown);
         } catch (error) {
           toolCallNotes.set(toolCallId, {
             error: toolErrorText(error)
           });
+          throw error;
+        }
+      }
+    }),
+
+    grep: defineTool({
+      name: "grep",
+      label: "Search files",
+      description: GREP_TOOL_DESCRIPTION,
+      parameters: Type.Object({
+        workpiece: workpieceParam,
+        pattern: Type.String({description: "Regular expression matched against each line."}),
+        path: Type.Optional(Type.String({
+          description: "File or directory to search, relative to the workpiece root. Omit to " +
+              "search every file.",
+        })),
+      }),
+      execute: async (toolCallId, {workpiece, pattern, path}) => {
+        try {
+          let {workpieceId} =
+              hooks.resolveWorkpieceRoot(resolveToolWorkpieceId(workpiece), true, chatId);
+          let re = new RegExp(pattern);
+          // The same base readFile reads from: the pin base while pinned (buffered or stored),
+          // else a gadget's head fixed for the turn or a worktree's accepted commit. Session
+          // content overlays it either way; a gadget with no committed code has only that.
+          let base = pinnedGadgets.has(workpieceId)
+              ? worktreeBase(workpieceId)
+              : observeHead(workpieceId) ?? hooks.getWorktreePinBase(workpieceId);
+          let scan = await hooks.grepWorkpiece(worktreeTurnAccess, workpieceId, base, path);
+          // Recorded as shown: replay reads this text back, and a broad match over several
+          // large files could otherwise exceed a storage record.
+          let output = formatGrep(scan, re, MAX_TOOL_RESULT_CHARS);
+          return toolResult(output, {output} as Partial<AiToolCall>);
+        } catch (error) {
+          toolCallNotes.set(toolCallId, {error: toolErrorText(error)});
           throw error;
         }
       }
@@ -2958,6 +3088,17 @@ async function runAgentPass(
       execute: async (toolCallId, {url, raw}) => {
         try {
           let result = await webFetchImpl(hooks.getWebFetchEnv(), {url, raw});
+          // Cut the body, not the formatted result, so the frontmatter's `truncated` stays true
+          // to the text and the recorded output is what the model saw. The header counts against
+          // the cap too, so the formatted whole fits. Don't end on half of a surrogate pair: a
+          // lone surrogate is not valid Unicode for the provider.
+          let overflow = formatWebFetchResult(result).length - MAX_TOOL_RESULT_CHARS;
+          if (overflow > 0) {
+            let end = result.body.length - overflow;
+            let last = result.body.charCodeAt(end - 1);
+            if (last >= 0xd800 && last <= 0xdbff) --end;
+            result = {...result, body: result.body.slice(0, end), truncated: true};
+          }
 
           let host = new URL(result.finalUrl).host;
           await hooks.recordAgentObservation(

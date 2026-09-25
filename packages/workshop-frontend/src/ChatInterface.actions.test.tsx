@@ -47,6 +47,7 @@ vi.mock('./AuthContext', () => {
 import { entry, makeOverseer, makeTestRoot } from './action-test-harness'
 import ChatInterface from './ChatInterface'
 import { INCOMPLETE_DESCRIPTION_COPY } from './components/IncompleteDescriptionNotice'
+import { RESTRICTED_APPROVAL_COPY } from './components/RestrictedApprovalNotice'
 import { linkActionLog } from './useActions'
 
 const testRoot = makeTestRoot()
@@ -81,11 +82,15 @@ function withChatApi(
   }
 }
 
-function renderChat(overseer: RpcStub<Overseer>, props: { selectedChatId?: number } = {}) {
+function renderChat(
+  overseer: RpcStub<Overseer>,
+  props: { restricted?: boolean, selectedChatId?: number } = {},
+) {
   return testRoot.render(
     <ChatInterface
       workspaceId="workspace"
       overseer={overseer}
+      restricted={props.restricted}
       selectedChatId={props.selectedChatId ?? null}
       onNavigateToChat={() => {}}
       pendingConsoleLogCount={0}
@@ -147,24 +152,106 @@ describe('ChatInterface action refresh', () => {
   })
 })
 
+// A pending action whose description runs to several paragraphs: what the approver has to read
+// in full when the workspace is restricted.
+const longDescription = [
+  'Send the following email to alice@example.com:',
+  'Hi Alice, attached are the quarterly numbers you asked for.',
+  'Regards, the workspace.',
+].join('\n\n')
+
 function pendingLog(over: Partial<Record<string, unknown>> = {}) {
   return entry(1, {
-    description: { title: 'Send email', description: 'Send an email.', implementsRevert: false, ...over },
+    description: { title: 'Send email', description: longDescription, implementsRevert: false, ...over },
   })
 }
 
 // Renders chat 1 selected, so its messages -- and the action card for `log` -- are actually on
 // screen.
-async function renderPendingCard(log: ActionLogEntry) {
+async function renderPendingCard(log: ActionLogEntry, props: { restricted?: boolean } = {}) {
   const server = makeOverseer()
   const chat = withChatApi(server, undefined, [
     { id: 1, title: 'Chat', started: new Date(), lastActive: new Date() },
   ])
-  await renderChat(server.overseer, { selectedChatId: 1 })
+  await renderChat(server.overseer, { ...props, selectedChatId: 1 })
   await server.resolveSubscription()
   await server.resolvePendingQuery({ entries: [log] })
   chat.emitMessage({ ...actionMessage, actionLog: log } as AiChatMessage)
 }
+
+const clampedDescription = () => document.querySelector('[class*="max-h-[200px]"]')
+
+// The text a screen reader announces as the Approve button's description.
+function approveDescribedBy(): string | null {
+  const approve = [...document.querySelectorAll('button')].find(b => b.textContent === 'Approve')
+  if (!approve) throw new Error('No Approve button rendered')
+  const ids = approve.getAttribute('aria-describedby')
+  if (ids === null) return null
+  return ids.split(' ').map(id => {
+    const el = document.getElementById(id)
+    if (!el) throw new Error(`aria-describedby names a missing element: ${id}`)
+    return el.textContent ?? ''
+  }).join('\n')
+}
+
+describe('restricted approval', () => {
+  it('shows the notice and the full request on a pending card while restricted', async () => {
+    await renderPendingCard(pendingLog(), { restricted: true })
+
+    expect(document.body.textContent).toContain(RESTRICTED_APPROVAL_COPY)
+    expect(document.body.textContent).toContain('Regards, the workspace.')
+    expect(clampedDescription()).toBeNull()
+    // The controls precede the review text in DOM order, so the buttons name it explicitly.
+    const described = approveDescribedBy()
+    expect(described).toContain(RESTRICTED_APPROVAL_COPY)
+    expect(described).toContain('Regards, the workspace.')
+    expect(described).toContain(INCOMPLETE_DESCRIPTION_COPY)
+  })
+
+  it('names only the restricted notice and request for a complete description', async () => {
+    await renderPendingCard(pendingLog({ descriptionIsComplete: true }), { restricted: true })
+
+    const described = approveDescribedBy()
+    expect(described).toContain(RESTRICTED_APPROVAL_COPY)
+    expect(described).not.toContain(INCOMPLETE_DESCRIPTION_COPY)
+  })
+
+  it('shows the notice and the full request on a blocking card while restricted', async () => {
+    await renderPendingCard(pendingLog({ awaitDecision: true }), { restricted: true })
+
+    expect(document.body.textContent).toContain(RESTRICTED_APPROVAL_COPY)
+    expect(clampedDescription()).toBeNull()
+    const described = approveDescribedBy()
+    expect(described).toContain(RESTRICTED_APPROVAL_COPY)
+    expect(described).toContain('Regards, the workspace.')
+  })
+
+  it('names the fields as part of the request while restricted', async () => {
+    const fields = [{ label: 'To', kind: 'list', items: ['a@example.com'] }]
+    await renderPendingCard(pendingLog({ descriptionIsComplete: true, fields }), { restricted: true })
+
+    expect(approveDescribedBy()).toContain('a@example.com')
+  })
+
+  for (const [name, over] of [['pending', {}], ['blocking', { awaitDecision: true }]] as const) {
+    it(`shows a ${name} card's long fields without a scroll cap while restricted`, async () => {
+      const fields = [{ label: 'Body', kind: 'text', value: 'Full body text' }]
+      await renderPendingCard(pendingLog({ ...over, fields }), { restricted: true })
+
+      const body = [...document.querySelectorAll('pre')].find(pre => pre.textContent === 'Full body text')
+      expect(body?.className).not.toContain('max-h-56')
+      expect(document.querySelector('[class*="max-h-[360px]"]')).toBeNull()
+    })
+  }
+
+  it('keeps the scrolling description and no notice when not restricted', async () => {
+    await renderPendingCard(pendingLog())
+
+    expect(document.body.textContent).not.toContain(RESTRICTED_APPROVAL_COPY)
+    expect(clampedDescription()).not.toBeNull()
+    expect(approveDescribedBy()).toBeNull()
+  })
+})
 
 describe('incomplete description notice', () => {
   it('flags a pending action whose description is not marked complete', async () => {
@@ -182,7 +269,7 @@ describe('incomplete description notice', () => {
   it('shows no notice when the description is complete', async () => {
     await renderPendingCard(pendingLog({ descriptionIsComplete: true }))
 
-    expect(document.body.textContent).toContain('Send an email.')
+    expect(document.body.textContent).toContain('Regards, the workspace.')
     expect(document.body.textContent).not.toContain(INCOMPLETE_DESCRIPTION_COPY)
   })
 })
@@ -198,7 +285,7 @@ describe('action fields', () => {
       const pre = [...document.body.querySelectorAll('pre')].find(el => el.textContent === body)
       expect(pre).toBeDefined()
       expect(document.body.querySelector('script')).toBeNull()
-      expect(document.body.textContent).toContain('Send an email.')
+      expect(document.body.textContent).toContain('Send the following email to alice@example.com:')
     })
   }
 })

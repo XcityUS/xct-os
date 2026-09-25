@@ -44,6 +44,7 @@ import {
   writeCommit,
   writeTree,
   log,
+  type CommitObject,
   type PromiseFsClient,
   type TreeEntry,
 } from "isomorphic-git";
@@ -287,8 +288,16 @@ export class GitStore {
 
   /** The tree oid of a commit. */
   async commitTree(oid: string): Promise<string> {
+    return (await this.readCommitObject(oid)).tree;
+  }
+
+  /**
+   * Reads a commit object's parsed headers and message. Unlike `readCommitLog()`, carries the
+   * committer and timezone offsets, and never touches any other object.
+   */
+  async readCommitObject(oid: string): Promise<CommitObject> {
     let { commit } = await readCommit({ fs: this.#fs, gitdir: GITDIR, oid, cache: this.#cache });
-    return commit.tree;
+    return commit;
   }
 
   /**
@@ -323,7 +332,13 @@ export class GitStore {
    */
   async writeChangedTree(
       treeBase: string, changes: ReadonlyMap<string, string | null>): Promise<string> {
-    return await this.#rebuildTree(await this.commitTree(treeBase), buildChangeNode(changes), "")
+    let baseTree = await this.commitTree(treeBase);
+    // No changes: the base's tree, by oid. Rebuilding reads each tree it descends into, and this
+    // store holds only what has been pulled -- a worktree committed untouched may never have
+    // needed its base's root tree locally (a commit object can arrive alone, e.g. via
+    // env.GIT.readCommit()).
+    if (changes.size === 0) return baseTree;
+    return await this.#rebuildTree(baseTree, buildChangeNode(changes), "")
         ?? await writeTree({ fs: this.#fs, gitdir: GITDIR, tree: [] });
   }
 
@@ -650,13 +665,14 @@ function mergeText(base: string, ours: string, theirs: string, labels: MergeLabe
 
 /**
  * Derives a git commit identity from a chat author: the display name becomes the commit name,
- * and the profile ID the email. Profile IDs are typically email addresses; in username/password
- * mode they may be bare usernames, which become `<username>@localhost`. (A placeholder
- * convention until users can customize their commit identity.)
+ * and the email is the author's preferred `commitEmail` if set, else the profile ID. Profile IDs
+ * are typically email addresses; in username/password mode they may be bare usernames, which
+ * become `<username>@localhost`.
  */
 export function commitIdentityForAuthor(author: AiChatAuthorInfo): CommitIdentity {
   return {
     name: author.name,
-    email: author.id.includes("@") ? author.id : `${author.id}@localhost`,
+    email: author.commitEmail ??
+        (author.id.includes("@") ? author.id : `${author.id}@localhost`),
   };
 }

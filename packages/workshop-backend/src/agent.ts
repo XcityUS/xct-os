@@ -102,6 +102,8 @@ export interface AgentStepChange {
  * head advancements. runAgent implements this interface over its turn state and passes it to
  * executeCodeMode, which registers it for exactly the duration of the execution (see
  * OverseerImpl.executeCodeMode) -- so a stored worktree stub cannot operate outside its turn.
+ * (The env.GIT binding's in-memory worktrees implement it too, with no turn behind them; see
+ * InMemoryWorktree in git-binding.ts.)
  */
 export interface WorktreeTurnAccess {
   /**
@@ -338,6 +340,12 @@ export type AgentGadgetInfo = {
   output?: BlueprintOutput;
 };
 
+/**
+ * The name of the `Git` binding (see git-binding.ts) present in every env -- each gadget's and the
+ * agent's executeCode env -- beneath any binding of the same name, which shadows it.
+ */
+export const GIT_BINDING_NAME = "GIT";
+
 // Resolves a `describeBinding` tool argument (a name in the chat's env) to its human-readable
 // description. Shared by the live tool and the replay path so the two can't drift. (Replay of
 // logs from before named chat bindings may pass a number -- a capsule index in the old numeric
@@ -346,8 +354,9 @@ export type AgentGadgetInfo = {
 async function resolveBindingDescription(
     name: string | number,
     chatBindings: Map<string, ChatBindingEntry>,
-    hooks: Pick<AgentHooks, "describeBinding">): Promise<string> {
+    hooks: Pick<AgentHooks, "describeBinding" | "describeGitBinding">): Promise<string> {
   let entry = chatBindings.get(`${name}`);
+  if (!entry && name === GIT_BINDING_NAME) return hooks.describeGitBinding(`env.${name}`);
   if (!entry) throw new Error(`There is no binding named "${name}" in your env.`);
   switch (entry.type) {
     case "workpiece":
@@ -514,16 +523,15 @@ export interface AgentHooks {
       : {id: WorkpieceId, title: string};
 
   /**
-   * Create a new worktree workpiece rooted at the given commit reference (a full oid or an
-   * unambiguous prefix, resolved against the workspace's local git knowledge -- never a remote
-   * lookup), provisional to and permanently private to the given chat. Performs the initial pull
-   * when the commit is known only from a gatekeeper. Like createGadget, the creation becomes
-   * durable via the step's "changes" message (`createdWorktrees`); a step that dies before its
-   * barrier leaves an unstamped record that reconciliation reaps. The new worktree is unpinned:
-   * it reads as its base commit until the first modification pins it. Returns the resolved base
-   * commit alongside the id (the input may be a prefix).
+   * Create a new worktree workpiece rooted at the given commit id (a full oid, resolved against
+   * the workspace's local git knowledge -- never a remote lookup), provisional to and permanently
+   * private to the given chat. Performs the initial pull when the commit is known only from a
+   * gatekeeper. Like createGadget, the creation becomes durable via the step's "changes" message
+   * (`createdWorktrees`); a step that dies before its barrier leaves an unstamped record that
+   * reconciliation reaps. The new worktree is unpinned: it reads as its base commit until the
+   * first modification pins it. Returns the base commit alongside the id.
    */
-  createWorktree(title: string, chatId: number, commitRef: string)
+  createWorktree(title: string, chatId: number, commitId: string)
       : Promise<{id: WorkpieceId, title: string, baseCommit: string}>;
 
   /**
@@ -585,6 +593,9 @@ export interface AgentHooks {
    * incorporated into the returned description.)
    */
   describeBinding(envName: string, id: WorkpieceId): Promise<string>;
+
+  /** Describe the env.GIT binding (see GIT_BINDING_NAME), for the describeBinding tool. */
+  describeGitBinding(envName: string): string;
 
   /**
    * Add a binding to the given gadget, pointing at the given workpiece. The binding is provisional
@@ -777,6 +788,8 @@ Make Gadget UIs responsive and usable on both desktop and phones by default.
 
 Both the client and server run inside a strictly isolated sandbox. They cannot make requests to the Internet, e.g. by calling \`fetch()\`. Instead, a Gadget communicates with the outside world strictly through its "bindings", that is, the Cloudflare Workers \`env\` API, which code in the Durable Object class can access as \`this.env\`.
 
+Every Gadget's \`env\`, as well as your own \`executeCode\` env, always contains \`env.GIT\`, which provides programmatic access to git commits known to the workspace: read a commit's metadata and files, edit them in memory, and write new commits. Use \`describeBinding\` to learn its API if you need it.
+
 Note that the iframe sandbox on the client side prohibits modal popup boxes like alert() and confirm(), so do not use those.
 
 ## Server -> Client callbacks and subscriptions
@@ -952,7 +965,23 @@ Gadgets execute on a restricted and heavily-sandboxed variant of Cloudflare Work
 You were started programmatically by the Gadget to perform a task, described below.
 
 Typically (but not always), you will need to use the \`executeCode\` tool to complete the task, invoking the available bindings (members of the env object) and other APIs available to you.
+
+Your \`env\` always contains \`env.GIT\`, which provides programmatic access to git commits known to the workspace (read a commit's metadata and files, edit them, and write new commits). Use \`describeBinding\` to learn its API if you need it.
 `.trim();
+
+// The tools offered to a spawned agent (see runAgentPass). Anything that modifies a gadget or
+// requests a connection is left out, since no user is present to review it.
+let SPAWNED_AGENT_TOOLS = [
+  "readFile",
+  "grep",
+  "writeFile",
+  "editFile",
+  "createWorktree",
+  "webFetch",
+  "observeUserChanges",
+  "describeBinding",
+  "executeCode",
+] as const;
 
 // How the task reaches an agent spawned with spawn(): as the chat's first message.
 let SPAWNED_TASK_PROMPT = `
@@ -973,7 +1002,7 @@ ${types.trim()}
 }
 
 let READ_FILE_TOOL_DESCRIPTION = `
-Read the content of a file owned by one of the workspace's gadgets. If a file changes after you read it, you will either be informed of the change or the outdated result will be replaced with a note telling you to re-read the file; otherwise there is no need to read a file again after you have already read it once. This cannot read chat attachments; attachments are provided directly in the conversation.
+Read the content of a file owned by a workpiece (a gadget or worktree) in your \`env\`. If a file changes after you read it, you will either be informed of the change or the outdated result will be replaced with a note telling you to re-read the file; otherwise there is no need to read a file again after you have already read it once. This cannot read chat attachments; attachments are provided directly in the conversation.
 
 For a large file, pass \`startLine\` and \`lineCount\` to read a window of it; the result then ends with a line giving the range shown and the \`startLine\` to continue from. Use \`grep\` to find the lines you need first.
 `.trim();
@@ -989,7 +1018,7 @@ By default the new gadget is empty. Pass \`blueprintId\` (discovered with the \`
 let CREATE_WORKTREE_TOOL_DESCRIPTION = `
 Create a worktree: a file tree rooted at a git commit, which you can then read and edit with the regular file tools (\`readFile\`, \`writeFile\`, \`editFile\`, \`grep\`) by passing the \`bindingName\` you choose as their \`workpiece\` parameter. Unlike a gadget, a worktree has no runnable code of its own and is private to this conversation.
 
-\`commitId\` is a git commit id (a full 40-hex SHA-1, or an unambiguous prefix) already known to this workspace — typically one returned by a connection's API (e.g. a repository's branch or commit listing). Look the commit up through the connection first if you only know a branch or tag name.
+\`commitId\` is a full git commit id (40 hex digits; abbreviated ids are not accepted) already known to this workspace — typically one returned by a connection's API (e.g. a repository's branch or commit listing). Look the commit up through the connection first if you only know a branch or tag name.
 
 In \`executeCode\`, the worktree's env binding additionally offers a programmatic API — \`listFiles\`, \`grep\`, \`commit\` (write a git commit of the worktree's content), \`diff\`, and more; use \`describeBinding\` to see it.
 `.trim();
@@ -1057,8 +1086,16 @@ The addition is part of your proposed changes: like code edits, it takes permane
 NOTE: You do NOT need this tool to use a resource yourself with \`executeCode\` — your own bindings are already available there. ONLY use it when a Gadget's code needs the resource.
 `.trim();
 
-let EXECUTE_CODE_TOOL_DESCRIPTION = `
+let EXECUTE_CODE_INTRO = `
 Executes one-off JavaScript code, returning the output it logs to the console. The code runs in a sandbox where it cannot talk to the internet, except through the bindings in its 'env' object; fetch() will not work. Otherwise, the code can call any built-in APIs available in Cloudflare Workers.
+`.trim();
+
+let EXECUTE_CODE_SELF_PARAM = `
+The function also receives a \`self\` parameter which is a magic object that points back to this chat thread. Calling any method on \`self\`, like \`self.foo(123)\`, records a callback to this chat, which is delivered to you as a message on a later turn and activates you to respond. The call resolves as soon as the callback is recorded and returns nothing; it never waits for you (so awaiting it within the same executeCode run is fine, but it cannot yield a result). The arguments must be storable: any RPC stubs among them must be persistent stubs. \`self\` can be passed over RPC (e.g. to a subscription method) and stored in a Durable Object's KV storage for long-term callbacks. When a callback is received, its arguments appear in your env as an array, under a name like \`foo_ARGS\` given in the callback message.
+`.trim();
+
+let EXECUTE_CODE_TOOL_DESCRIPTION = `
+${EXECUTE_CODE_INTRO}
 
 The 'env' object contains this chat's named bindings:
 * An entry for each Gadget in the workspace, under the name given in the system prompt's gadget list (or the name you passed to \`createGadget\`): an RPC stub pointing at the Gadget's server-side Durable Object. If the user asks you to interact with a Gadget directly, or asks if you can "see" it, use this stub (read the Gadget's server code to learn what RPC methods it exposes).
@@ -1068,7 +1105,20 @@ Note that this differs from the \`env\` a Gadget's own code sees: a Gadget's ser
 
 When the user asks you to just do a task that can be done with these bindings, you should use executeCode to perform the task, instead of adding code to a gadget to do it.
 
-The function also receives a \`self\` parameter which is a magic object that points back to this chat thread. Calling any method on \`self\`, like \`self.foo(123)\`, records a callback to this chat, which is delivered to you as a message on a later turn and activates you to respond. The call resolves as soon as the callback is recorded and returns nothing; it never waits for you (so awaiting it within the same executeCode run is fine, but it cannot yield a result). The arguments must be storable: any RPC stubs among them must be persistent stubs. \`self\` can be passed over RPC (e.g. to a subscription method) and stored in a Durable Object's KV storage for long-term callbacks. When a callback is received, its arguments appear in your env as an array, under a name like \`foo_ARGS\` given in the callback message.
+${EXECUTE_CODE_SELF_PARAM}
+`.trim();
+
+// executeCode as described to a spawned agent, which lacks the gadget-editing and connection tools
+// the regular description refers to.
+let SPAWNED_EXECUTE_CODE_TOOL_DESCRIPTION = `
+${EXECUTE_CODE_INTRO}
+
+The 'env' object contains this chat's named bindings:
+* Each binding listed in the system prompt. A Gadget's binding is an RPC stub pointing at the Gadget's server-side Durable Object; read the Gadget's server code to learn what RPC methods it exposes.
+* Each resource a user grants in a message, shown as \`[Resource Title](env.SOME_NAME)\`.
+* Each worktree you create with \`createWorktree\`, under the name you chose.
+
+${EXECUTE_CODE_SELF_PARAM}
 `.trim();
 
 let LIST_CONNECTABLE_RESOURCES_TOOL_DESCRIPTION = `
@@ -1437,7 +1487,11 @@ async function runAgentPass(
   // to anything yet. A denied request releases its name (log-derived, so replay agrees).
   let claimedNames = new Set<string>();
 
-  let isNameInScope = (name: string) => chatBindings.has(name) || claimedNames.has(name);
+  // Whether a name is unavailable for a new chat binding. GIT_BINDING_NAME counts as in scope
+  // because the automatic env.GIT occupies it; only new bindings are refused -- a chat binding
+  // that already took the name (from before env.GIT existed) keeps resolving as it did.
+  let isNameInScope = (name: string) =>
+      name === GIT_BINDING_NAME || chatBindings.has(name) || claimedNames.has(name);
 
   // Reverse lookup: the chat env name for a workpiece, if the agent holds one.
   let chatNameFor = (id: WorkpieceId): string | undefined => {
@@ -1572,10 +1626,10 @@ async function runAgentPass(
     if (!entry) {
       throw new Error(
           `There is no binding named "${workpiece}" in your env. Pass the env name of a ` +
-          `gadget, as listed in the system prompt or chosen in createGadget.`);
+          `gadget or worktree, as listed in the system prompt or chosen when creating it.`);
     }
     if (entry.type !== "workpiece") {
-      throw new Error(`env.${workpiece} does not refer to a gadget.`);
+      throw new Error(`env.${workpiece} does not refer to a gadget or worktree.`);
     }
     return entry.id;
   };
@@ -1767,6 +1821,14 @@ async function runAgentPass(
   }
   // Read after prepareChatBindings, which seeds (and persists) the context on first use.
   let agentContext = hooks.getChatAgentContext(chatId);
+
+  // Refuses a file-tool write the chat may not make: a spawned agent runs with no user present to
+  // review changes, so it may modify only worktrees, never a gadget's code.
+  let assertMayModifyWorkpiece = (workpieceId: WorkpieceId) => {
+    if (agentContext.spawnerConfig && !hooks.isWorktree(workpieceId)) {
+      throw new Error("You do not have permission to edit this gadget's code.");
+    }
+  };
 
   // Always-available resources (e.g. the Context Library) describe the agent's environment, so
   // they're announced in the system prompt (slot 1, below) alongside the bindings list rather
@@ -2580,7 +2642,7 @@ async function runAgentPass(
     let systemPromptBindings: string;
     if (namedSeeds.length == 0) {
       systemPromptBindings =
-          "Aside from any resources described below, the `env` object is empty.";
+          "Aside from `env.GIT` and any resources described below, the `env` object is empty.";
     } else {
       let lines = namedSeeds.map(seed =>
           `* env.${seed.name} — ` +
@@ -2815,8 +2877,8 @@ async function runAgentPass(
   // not describe it as optional here.
   let workpieceParam = Type.String({
     description:
-        "Env binding name of the workpiece (e.g. gadget) that owns the file, as listed in the " +
-        "system prompt or chosen in createGadget.",
+        "Env binding name of the workpiece (gadget or worktree) that owns the file, as listed " +
+        "in the system prompt or chosen when creating it.",
   });
 
   let tools: Record<string, AgentTool> = {
@@ -2931,6 +2993,7 @@ async function runAgentPass(
         try {
           let resolved =
               hooks.resolveWorkpieceRoot(resolveToolWorkpieceId(workpiece), true, chatId);
+          assertMayModifyWorkpiece(resolved.workpieceId);
 
           // Writing over a worktree's symlink or submodule entry is rejected with the same
           // descriptive error reading one gets, and a base *directory* path too -- such a
@@ -3000,6 +3063,7 @@ async function runAgentPass(
         try {
           let resolved =
               hooks.resolveWorkpieceRoot(resolveToolWorkpieceId(workpiece), true, chatId);
+          assertMayModifyWorkpiece(resolved.workpieceId);
           let readFiles = filesRead.get(resolved.workpieceId);
           if (readFiles === undefined || !readFiles.has(filename)) {
             throw new Error("You must read a file before you can edit it.");
@@ -3181,6 +3245,10 @@ async function runAgentPass(
             throw new Error(`There is no gadget named "${gadget}" in your env.`);
           }
           let sourceEntry = chatBindings.get(source);
+          if (!sourceEntry && source === GIT_BINDING_NAME) {
+            throw new Error(`env.${source} is already present in every gadget's env; there is ` +
+                `no need to bind it.`);
+          }
           if (!sourceEntry) {
             throw new Error(`There is no binding named "${source}" in your env.`);
           }
@@ -3328,8 +3396,8 @@ async function runAgentPass(
         }),
         commitId: Type.String({
           description:
-              "The git commit to root the worktree at: a full 40-hex SHA-1, or an unambiguous " +
-              "prefix of at least 4 hex digits.",
+              "The git commit to root the worktree at: its full 40-hex SHA-1, exactly as " +
+              "returned by the API that provided it. Abbreviated ids are not accepted.",
         }),
       }),
       execute: async (toolCallId, {title, bindingName, commitId}) => {
@@ -3341,7 +3409,7 @@ async function runAgentPass(
           }
 
           // Like createGadget: the registry record (chat-private) is created immediately -- this
-          // is also where the commit reference resolves and, for gatekeeper-known commits, the
+          // is also where the commit id resolves and, for gatekeeper-known commits, the
           // initial pull happens -- but the creation is *recorded* (and the record made
           // permanent) by the step's "changes" message at the barrier. A step that dies first
           // leaves an unstamped orphan for reconciliation. The new worktree is unpinned:
@@ -3386,7 +3454,8 @@ async function runAgentPass(
     executeCode: defineTool({
       name: "executeCode",
       label: "Execute code",
-      description: EXECUTE_CODE_TOOL_DESCRIPTION,
+      description: agentContext.spawnerConfig
+          ? SPAWNED_EXECUTE_CODE_TOOL_DESCRIPTION : EXECUTE_CODE_TOOL_DESCRIPTION,
       parameters: Type.Object({
         code: Type.String({
           description:
@@ -3519,12 +3588,11 @@ async function runAgentPass(
   };
 
   if (agentContext.spawnerConfig) {
-    // Restrict sub-agents to a narrower set of tools: they can inspect and call bindings in code
-    // (which is how they read reference knowledge), but not the full editing/connection surface.
-    tools = {
-      describeBinding: tools.describeBinding,
-      executeCode: tools.executeCode,
-    };
+    // Restrict sub-agents to a narrower set of tools. No user is present to approve changes, so
+    // they get nothing that modifies gadgets or requests connections; they can inspect and call
+    // bindings, fetch the web, and work on worktrees (writes to gadgets are refused by
+    // assertMayModifyWorkpiece).
+    tools = Object.fromEntries(SPAWNED_AGENT_TOOLS.map(name => [name, tools[name]]));
   }
 
   let toolList = Object.values(tools);

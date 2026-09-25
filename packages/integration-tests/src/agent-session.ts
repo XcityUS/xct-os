@@ -66,6 +66,8 @@ export type ProvisionalGadget = { client: RpcStub<GadgetClient>; chatId: number 
  */
 export interface WorkshopAgentSession extends AsyncDisposable {
   readonly username: string;
+  /** How many times the connection to the Workshop has dropped since the session opened. */
+  readonly connectionDrops: number;
   runTurn(prompt: string, options?: AgentTurnOptions): Promise<AgentTurnResult>;
   approveActionsAndWait(
       ids: readonly [number, ...number[]], options?: AgentTurnOptions): Promise<AgentTurnResult>;
@@ -380,6 +382,7 @@ class WorkshopAgentSessionImpl implements WorkshopAgentSession {
   #reconnection: Promise<void> | undefined;
   #broken = false;
   #reconnectedDuringTurn = false;
+  #connectionDrops = 0;
   #terminal = false;
   #closed = false;
   #lastHistory: AiChatMessage[] = [];
@@ -411,6 +414,10 @@ class WorkshopAgentSessionImpl implements WorkshopAgentSession {
     this.#watchSession();
   }
 
+  get connectionDrops(): number {
+    return this.#connectionDrops;
+  }
+
   async initialize(): Promise<void> {
     await this.#subscribeToChat();
   }
@@ -430,6 +437,7 @@ class WorkshopAgentSessionImpl implements WorkshopAgentSession {
     const publicApi = this.#publicApi;
     publicApi.onRpcBroken(error => {
       if (this.#publicApi !== publicApi || this.#closed || this.#reconnection !== undefined) return;
+      this.#connectionDrops++;
       this.#reconnection = this.#reconnect(error).finally(() => {
         this.#reconnection = undefined;
       });
@@ -873,9 +881,17 @@ class WorkshopAgentSessionImpl implements WorkshopAgentSession {
         stopError = error instanceof Error ? error : new Error(String(error));
       }
       try {
+        // Deleting the workspace schedules an abort of its DO (scheduleAccessRestart), and that
+        // abort drops this session. Dispose only after the drop: an abort that finds no client left
+        // can crash local workerd, and with it every other session on the same Workshop.
+        const dropped = Promise.withResolvers<void>();
+        this.#publicApi.onRpcBroken(() => dropped.resolve());
         await this.#beforeCancellationDeadline(
             () => this.#workspace.deleteSelf(), Date.now() + CANCELLATION_TIMEOUT_MS,
             "Workspace deletion timed out");
+        await this.#beforeCancellationDeadline(
+            () => dropped.promise, Date.now() + CANCELLATION_TIMEOUT_MS,
+            "The Workshop kept the session open after deleting its workspace");
       } catch (error) {
         deleteError = error instanceof Error ? error : new Error(String(error));
       }

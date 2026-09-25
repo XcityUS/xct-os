@@ -1101,6 +1101,9 @@ importers:
       '@types/node':
         specifier: 26.1.0
         version: 26.1.0
+      chess.js:
+        specifier: 1.4.0
+        version: 1.4.0
       typescript:
         specifier: 'catalog:'
         version: 7.0.2
@@ -1277,6 +1280,9 @@ importers:
       vite:
         specifier: 7.3.6
         version: 7.3.6(@types/node@26.1.0)(jiti@2.7.0)(lightningcss@1.33.0)(terser@5.49.2)(yaml@2.9.0)
+      zod:
+        specifier: ^4.5.4
+        version: 4.5.4
     devDependencies:
       '@oxlint/plugins':
         specifier: 1.73.0
@@ -3742,6 +3748,9 @@ packages:
 
   character-reference-invalid@2.0.1:
     resolution: {integrity: sha512-iBZ4F4wRbyORVsu0jPV7gXkOsGYjGHPmAyv+HiHG8gi5PtC9KI2j1+v8/tlibRvjoWX027ypmG/n0HtO5t7unw==}
+
+  chess.js@1.4.0:
+    resolution: {integrity: sha512-BBJgrrtKQOzFLonR0l+k64A98NLemPwNsCskwb+29bRwobUa4iTm51E1kwGPbWXAcfdDa18nad6vpPPKPWarqw==}
 
   chokidar@5.0.0:
     resolution: {integrity: sha512-TQMmc3w+5AxjpL8iIiwebF73dRDF4fBIieAqGn9RGCWaEVwQ6Fb2cGe31Yns0RRIzii5goJ1Y7xbMwo1TxMplw==}
@@ -7903,6 +7912,8 @@ snapshots:
   character-entities@2.0.2: {}
 
   character-reference-invalid@2.0.1: {}
+
+  chess.js@1.4.0: {}
 
   chokidar@5.0.0:
     dependencies:

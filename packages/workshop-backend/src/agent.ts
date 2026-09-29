@@ -18,6 +18,7 @@ import { formatAlwaysAvailableResourcesPrompt } from "./agent-catalog";
 import { formatInstanceInstructions } from "./admin-config";
 import type { AiGatewayLogRoute } from "./ai-gateway";
 import type { SpawnCallableOptions } from "./agent-spawner-binding";
+import { traceRejectedToolCall, traceTool } from "./agent-tracing";
 import { AgentTurnError, completeText, httpStatusFromError, zeroUsage } from "./ai-invoke";
 import type { ModelHandle } from "./ai-models";
 import { blobOid } from "./git-store";
@@ -3632,7 +3633,9 @@ async function runAgentPass(
     tools = Object.fromEntries(SPAWNED_AGENT_TOOLS.map(name => [name, tools[name]]));
   }
 
-  let toolList = Object.values(tools);
+  // Calls that reached a tool's execute(), so tool_execution_end can tell the ones pi rejected.
+  let executedToolCalls = new Set<string>();
+  let toolList = Object.values(tools).map(tool => traceTool(tool, executedToolCalls));
 
   // Records a turn that ended with a provider error, so it can be rethrown for the overseer's
   // error triage after the loop settles. (pi never throws for provider failures; the loop
@@ -3710,6 +3713,10 @@ async function runAgentPass(
         }
         if (event.toolName === "executeCode") {
           emitStreamEvent({type: "toolCallFinished", toolCallId: event.toolCallId});
+        }
+        if (!executedToolCalls.delete(event.toolCallId)) {
+          traceRejectedToolCall(Object.hasOwn(tools, event.toolName) ? event.toolName : undefined,
+              event.toolCallId, abortSignal.aborted);
         }
         break;
 
@@ -3918,7 +3925,7 @@ async function runAgentPass(
     // Other failures become an AgentTurnError carrying the failing request's HTTP status (when
     // it can be determined) for the overseer's triage.
     throw new AgentTurnError(
-        turnFailure.message, httpStatusFromError(turnFailure.message, handle));
+        turnFailure.message, httpStatusFromError(turnFailure.message, handle.lastResponse));
   }
 
   return {type: reloadForCompaction ? "reloadForCompaction" : "finished"};

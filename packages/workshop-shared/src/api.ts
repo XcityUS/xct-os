@@ -1191,9 +1191,12 @@ export type XcityProviderDiagnostics = {
   /** True when a wallet-minted tokenhub key for this user and wallet is available. */
   keyPresent: boolean;
 
-  /** Outcome of the wallet key mint, present only when this call attempted one. */
+  /**
+   * Outcome of the latest wallet key call (a mint, or a `resync` of the cached key), present
+   * only when this call made one.
+   */
   keyMint?: {
-    /** Always true — the mint hop ran (a cached key means this field is absent entirely). */
+    /** Always true — the wallet hop ran (a cached key served as-is means this field is absent). */
     attempted: boolean;
 
     /** HTTP status of the wallet mint response, when one was received. */
@@ -1201,6 +1204,13 @@ export type XcityProviderDiagnostics = {
 
     /** Short classified failure: "network-error", "timeout", or "malformed-response". */
     error?: string;
+
+    /**
+     * True when the call re-requested an already-cached key during a catalog refresh, so the
+     * wallet could re-sync it with the user's plan. Its failure is harmless: the cached key is
+     * used as-is and `keyPresent` stays true.
+     */
+    resync?: boolean;
   };
 
   /** Outcome of the tokenhub catalog hop, present once the catalog was fetched or served. */

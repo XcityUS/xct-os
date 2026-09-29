@@ -644,6 +644,10 @@ export class XcityModelPlane {
    * persists it on success. Returns undefined on failure without touching the cached catalog,
    * except that a key re-mint invalidates the catalog tied to the old key.
    *
+   * Every refresh first asks the wallet for the key (see #resyncKey), so plan changes reach a
+   * cached key at most one catalog TTL after they land. A cache hit never gets here, so this
+   * costs one wallet call per refresh and none per load.
+   *
    * Two conditions trigger a re-mint-and-retry, each at most once per refresh: a 401, and a
    * catalog holding nothing but LiteLLM grant sentinels. In both cases the retry's outcome is
    * the one reported and persisted.
@@ -653,10 +657,19 @@ export class XcityModelPlane {
    */
   async #refreshModels(diagnostics: XcityProviderDiagnostics):
       Promise<XcityModelCatalogRecord["models"] | undefined> {
-    let key = await this.#ensureKey(false, diagnostics);
+    // Without a cached key, #ensureKey's mint is the very same wallet call, so it doubles as the
+    // resync; with one, the resync replaces the no-network cache read. Either way the wallet is
+    // asked exactly once before the first catalog fetch.
+    let cached = this.#cachedKey();
+    let key = cached
+        ? await this.#resyncKey(cached, diagnostics)
+        : await this.#ensureKey(false, diagnostics);
     if (!key) return undefined;
 
     let fetched = await this.#fetchCatalog(key.key, diagnostics);
+    // A 401 straight after a resync still re-mints once: the resync only shows the wallet still
+    // has the key on record, not that tokenhub accepts it. Kept straight-line rather than
+    // special-cased, so the bound stays at one re-mint per condition per refresh.
     if (fetched.status === "unauthorized") {
       key = await this.#ensureKey(true, diagnostics);
       if (!key) return undefined;
@@ -760,14 +773,19 @@ export class XcityModelPlane {
     inflightCatalogRefreshes.set(refreshKey, refresh);
   }
 
+  /** The cached key, when it was minted for this user by the currently configured wallet. */
+  #cachedKey(): XcityVirtualKeyRecord | undefined {
+    let key = this.#storage.get().key;
+    return key && key.walletUrl === this.#config.walletUrl && key.userId === this.#xcityUserId
+        ? key : undefined;
+  }
+
   async #ensureKey(forceMint: boolean, diagnostics: XcityProviderDiagnostics):
       Promise<XcityVirtualKeyRecord | undefined> {
-    let cache = this.#storage.get();
-    if (!forceMint && cache.key &&
-        cache.key.walletUrl === this.#config.walletUrl &&
-        cache.key.userId === this.#xcityUserId) {
+    let cached = this.#cachedKey();
+    if (!forceMint && cached) {
       diagnostics.keyPresent = true;
-      return cache.key;
+      return cached;
     }
 
     let minted = await this.#mintKey(diagnostics);
@@ -777,11 +795,50 @@ export class XcityModelPlane {
     }
     diagnostics.keyPresent = true;
 
-    cache = this.#storage.get();
+    let cache = this.#storage.get();
     cache.key = minted;
     cache.catalog = undefined;
     this.#storage.put(cache);
     return minted;
+  }
+
+  /**
+   * Re-requests an already-cached key from the wallet. The wallet re-syncs a key with the user's
+   * plan (model list, rpm limit, budget) only inside POST /v1/keys/for-user, so a key that is
+   * never asked for again keeps the plan it was minted under — e.g. the free tier's rpm limit
+   * after an upgrade.
+   *
+   * Best effort: if the wallet call fails, the cached key is returned untouched and the refresh
+   * carries on exactly as it would have without the resync.
+   *
+   * The wallet normally answers with the same key token. That is not a re-mint, so the cached
+   * record keeps its `mintedAt` and the catalog tied to it stays valid; only a different token is
+   * stored as a new mint, invalidating that catalog just as #ensureKey does.
+   */
+  async #resyncKey(cached: XcityVirtualKeyRecord, diagnostics: XcityProviderDiagnostics):
+      Promise<XcityVirtualKeyRecord> {
+    let returned = await this.#mintKey(diagnostics);
+    // #mintKey always records its outcome; mark it as a resync so a failure reads as harmless.
+    diagnostics.keyMint = { attempted: true, ...diagnostics.keyMint, resync: true };
+    if (!returned) {
+      logger.warn("xcity wallet key resync failed; continuing with the cached key", {
+        event: "xcity.wallet.key.resync.failed",
+      });
+      return cached;
+    }
+
+    let cache = this.#storage.get();
+    if (returned.key === cached.key) {
+      cache.key = { ...returned, mintedAt: cached.mintedAt };
+    } else {
+      logger.info("xcity wallet returned a different key on resync", {
+        event: "xcity.wallet.key.resync.rotated",
+      });
+      cache.key = returned;
+      cache.catalog = undefined;
+    }
+    this.#storage.put(cache);
+    return cache.key;
   }
 
   async #mintKey(diagnostics: XcityProviderDiagnostics):

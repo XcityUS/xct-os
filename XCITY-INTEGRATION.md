@@ -47,6 +47,12 @@ xct-studio）。部署在 https://os.xcity.ai。
 调用），并重取一次目录 —— 每次 load 至多重试一次，仍是 sentinel 就落回 `grantNotExpanded` 状态。
 代价是 key 一直坏着时，每次目录 load 都会多一次 wallet 调用和一次目录请求。
 
+同理，套餐变更（模型列表、`rpm_limit`、`budget_duration`）也只有在 `for-user` 里才会同步到已有
+key 上，所以每次目录**刷新**（缓存命中不算，至多每 `CATALOG_CACHE_MS` 一次）都会先对已缓存的 key
+调一次 `for-user`（`#resyncKey`），再用 wallet 返回的 key 取目录：同一个 token 保留原 `mintedAt`，
+换了 token 才按新铸处理。该调用是 best-effort —— wallet 失败时照旧用缓存 key 刷新，只在
+`diagnostics.keyMint`（`resync: true`）里留痕。
+
 Xcity 的模型元数据以 `XcityAiModelConfig = AiModelConfig & { xcity?: … }`
 的形式挂在共享类型上（`xcity/model-plane.ts`）。好处是元数据随配置天然流到每个消费点，
 无需到处传第二个参数；代价是给一个跨 RPC 边界的共享类型做了结构化扩展。

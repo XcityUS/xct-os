@@ -2584,6 +2584,19 @@ export type AiChatMetadata = {
   totalCost?: number;
 
   /**
+   * Prompt tokens this conversation has sent to the model so far, including the ones the
+   * provider read from or wrote to its prompt cache, if known. A running total, like
+   * `totalCost`: compaction does not reset it.
+   */
+  promptTokens?: number;
+
+  /** How many of `promptTokens` the provider read from its prompt cache. */
+  cacheReadTokens?: number;
+
+  /** How many of `promptTokens` the provider wrote to its prompt cache. */
+  cacheWriteTokens?: number;
+
+  /**
    * First sequence this chat still replays. Everything before it is covered by a compaction
    * checkpoint; those messages remain in canonical history but no longer drive current-state reads.
    */

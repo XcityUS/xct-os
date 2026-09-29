@@ -42,6 +42,7 @@ import type { ProductAnalyticsConnectionType, ProductAnalyticsGadgetInput } from
 import { checkUsageAndBalance } from "./ai-gateway-billing/limits/usage-checker";
 import { getXcityUsageConfig } from "./xcity/config";
 import { checkXcityUsage } from "./xcity/usage-checker";
+import { translateXcityModelError } from "./xcity/tokenhub-errors";
 import { completeAgentCatalogSnapshot, normalizeAgentCatalog } from "./agent-catalog";
 import { refreshCachedBalance } from "./ai-gateway-billing/cloudflare/connection-service";
 import { SharingManager, SharingCaller, CollaboratorRecord, ShareKeyRecord } from "./sharing";
@@ -5919,7 +5920,9 @@ class OverseerImpl implements AgentHooks {
         event: "agent.run.finished", outcome,
         durationMs: Date.now() - startedAt,
       });
-    } catch (err: unknown) {
+    } catch (caught: unknown) {
+      // Xcity: a TokenHub rate-limit failure becomes an actionable message (identity otherwise).
+      let err = translateXcityModelError(this.env, aiModel.config, caught);
       // A failed model request surfaces as AgentTurnError (pi reports provider failures as data;
       // runAgent converts them back to a throw), carrying the failing request's HTTP status when
       // one was observed.

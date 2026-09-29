@@ -11018,6 +11018,9 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         event_name: "gadget_deleted",
         user_id: this.#clientUser.id.toString(),
       });
+      // The restart severs every session still holding this workspace so its client reopens. The
+      // deleter has nothing to reopen, so close it first. Best-effort: throwing here resets the DO.
+      await this.notifyClosed().catch(() => {});
       this.impl.scheduleAccessRestart("Gadget restarted because the workspace was deleted.");
       this.impl.ownerId = undefined;
     });

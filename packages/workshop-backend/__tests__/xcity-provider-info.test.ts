@@ -340,6 +340,9 @@ describe("getXcityProviderInfoForUser diagnostics", () => {
     // sentinel-only catalog must not be served for the rest of its TTL after the fix landed.
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
+      if (url === "https://wallet.xcity.ai/v1/keys/for-user") {
+        return jsonResponse({ key: "sk-cached", minted: false });
+      }
       if (url === "https://tokenhub.xcity.ai/v1/models") {
         return jsonResponse({ data: [{ id: "deepseek-v3.2" }] });
       }
@@ -366,6 +369,7 @@ describe("getXcityProviderInfoForUser diagnostics", () => {
     expect(info?.diagnostics).toEqual({
       identity: true,
       keyPresent: true,
+      keyMint: { attempted: true, status: 200, resync: true },
       catalog: { status: 200, modelCount: 1 },
     });
     expect(info?.modelIds).toEqual(["deepseek-v3.2"]);
@@ -374,6 +378,9 @@ describe("getXcityProviderInfoForUser diagnostics", () => {
   it("keeps reporting grantNotExpanded when revalidating the cached empty catalog fails", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
+      if (url === "https://wallet.xcity.ai/v1/keys/for-user") {
+        return jsonResponse({ key: "sk-cached", minted: false });
+      }
       if (url === "https://tokenhub.xcity.ai/v1/models") {
         return new Response("nope", { status: 503 });
       }
@@ -400,6 +407,7 @@ describe("getXcityProviderInfoForUser diagnostics", () => {
     expect(info?.diagnostics).toEqual({
       identity: true,
       keyPresent: true,
+      keyMint: { attempted: true, status: 200, resync: true },
       catalog: { status: 503, modelCount: 0, grantNotExpanded: true },
     });
     expect(info?.modelIds).toEqual([XCITY_DEFAULT_MODEL_ID]);
@@ -424,9 +432,12 @@ describe("getXcityProviderInfoForUser diagnostics", () => {
     });
   });
 
-  it("says a cached key needed no mint on the all-good path", async () => {
+  it("says a cached key was resynced, not re-minted, on the all-good path", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
+      if (url === "https://wallet.xcity.ai/v1/keys/for-user") {
+        return jsonResponse({ key: "sk-cached", minted: false });
+      }
       if (url === "https://tokenhub.xcity.ai/v1/models") {
         return jsonResponse({ data: [{ id: "gpt-5.5-xhigh" }] });
       }
@@ -446,14 +457,19 @@ describe("getXcityProviderInfoForUser diagnostics", () => {
     expect(info?.diagnostics).toEqual({
       identity: true,
       keyPresent: true,
+      keyMint: { attempted: true, status: 200, resync: true },
       catalog: { status: 200, modelCount: 1 },
     });
     expect(info?.modelIds).toEqual(["gpt-5.5-xhigh"]);
+    expect(storage.get().key?.mintedAt).toBe(111);
   });
 
   it("marks a served-stale catalog and keeps the inline refresh failure", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
+      if (url === "https://wallet.xcity.ai/v1/keys/for-user") {
+        return jsonResponse({ key: "sk-cached", minted: false });
+      }
       if (url === "https://tokenhub.xcity.ai/v1/models") {
         return new Response("down", { status: 503 });
       }
@@ -484,6 +500,7 @@ describe("getXcityProviderInfoForUser diagnostics", () => {
     expect(info?.diagnostics).toEqual({
       identity: true,
       keyPresent: true,
+      keyMint: { attempted: true, status: 200, resync: true },
       catalog: { status: 503, modelCount: 1, servedStale: true },
     });
     expect(info?.modelIds).toEqual(["stale-model"]);

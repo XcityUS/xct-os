@@ -161,6 +161,9 @@ describe("Xcity model catalog resilience", () => {
   it("serves a stale catalog immediately and revalidates in the background", async () => {
     const storage = seededStorage("user-swr", 11 * MINUTE_MS);
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "https://wallet.xcity.ai/v1/keys/for-user") {
+        return jsonResponse({ key: "sk-old", minted: false });
+      }
       if (String(input) === "https://tokenhub.xcity.ai/v1/models") {
         return jsonResponse({ data: [{ id: "fresh-model" }] });
       }
@@ -176,7 +179,8 @@ describe("Xcity model catalog resilience", () => {
     expect(storage.get().catalog?.models.map(model => model.profile.id))
         .toEqual(["fresh-model"]);
     expect(plane.getModelList().map(profile => profile.id)).toEqual(["fresh-model"]);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // Key resync + catalog.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("keeps the stale catalog when the background refresh fails", async () => {
@@ -188,8 +192,9 @@ describe("Xcity model catalog resilience", () => {
     expect(plane.getModelList().map(profile => profile.id)).toEqual(["cached-model"]);
 
     await flushXcityCatalogRefreshesForTests();
-    // The failed refresh (initial attempt + one retry) never discards the cached catalog.
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // The failed refresh (resync + catalog, each an attempt plus one retry) never discards the
+    // cached catalog.
+    expect(fetchMock).toHaveBeenCalledTimes(4);
     expect(storage.get().catalog?.models.map(model => model.profile.id))
         .toEqual(["cached-model"]);
     expect(plane.getModelList().map(profile => profile.id)).toEqual(["cached-model"]);
@@ -201,9 +206,10 @@ describe("Xcity model catalog resilience", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const plane = await XcityModelPlane.forUser(ENV, CONFIG, storage, "user-ancient");
-    // Past the stale ceiling the refresh is inline (key was cached, catalog + retry = 2 calls),
-    // but its failure still surfaces the old catalog rather than an empty list.
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // Past the stale ceiling the refresh is inline (a failed key resync falls back to the cached
+    // key, then catalog: each an attempt plus one retry = 4 calls), but its failure still
+    // surfaces the old catalog rather than an empty list.
+    expect(fetchMock).toHaveBeenCalledTimes(4);
     expect(plane.getModelList().map(profile => profile.id)).toEqual(["cached-model"]);
   });
 
@@ -405,6 +411,9 @@ describe("Xcity default model fallback", () => {
   it("replaces the synthesized default with the real catalog entry", async () => {
     const storage = seededStorage("user-default-swr", 11 * MINUTE_MS, []);
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "https://wallet.xcity.ai/v1/keys/for-user") {
+        return jsonResponse({ key: "sk-old", minted: false });
+      }
       if (String(input) === "https://tokenhub.xcity.ai/v1/models") {
         return jsonResponse({
           data: [{ id: XCITY_DEFAULT_MODEL_ID, input_cost_per_token: 0.01 }],
@@ -518,8 +527,7 @@ describe("Xcity grant self-heal", () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url === "https://wallet.xcity.ai/v1/keys/for-user") {
-        mintCalls++;
-        return jsonResponse({ key: "sk-repaired" });
+        return jsonResponse({ key: ++mintCalls === 1 ? "sk-broken" : "sk-repaired" });
       }
       if (url === "https://tokenhub.xcity.ai/v1/models") {
         return ++modelCalls === 1
@@ -531,8 +539,9 @@ describe("Xcity grant self-heal", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const plane = await XcityModelPlane.forUser(ENV, CONFIG, storage, "user-cached-sentinel");
-    // The cached key served the first fetch (no mint), the sentinel result forced the second.
-    expect(mintCalls).toBe(1);
+    // The refresh's resync handed back the same cached key, which served the first fetch; the
+    // sentinel result still forced the repair mint and the second fetch.
+    expect(mintCalls).toBe(2);
     expect(modelCalls).toBe(2);
     expect(storage.get().key?.key).toBe("sk-repaired");
     expect(plane.getModelList().map(profile => profile.id)).toEqual(["real-model"]);
@@ -592,5 +601,131 @@ describe("Xcity grant self-heal", () => {
     // Nothing was persisted, and the default still stands in for the empty list.
     expect(storage.get().catalog).toBeUndefined();
     expect(plane.getModelList().map(profile => profile.id)).toEqual([XCITY_DEFAULT_MODEL_ID]);
+  });
+});
+
+// The wallet re-syncs a key with the user's plan (models, rpm limit, budget) only inside
+// POST /v1/keys/for-user, so every catalog refresh re-asks for the cached key first — otherwise
+// a plan change never reaches a user who already has one.
+
+// Stubs fetch with `respond`, recording every request's URL and bearer token in order.
+function recordingFetch(respond: (url: string) => Response | Promise<Response>) {
+  const calls: Array<{ url: string; bearer?: string }> = [];
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    const auth = new Headers(init?.headers).get("Authorization") ?? undefined;
+    calls.push({ url, bearer: auth?.replace(/^Bearer /, "") });
+    return respond(url);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return { calls, fetchMock };
+}
+
+describe("Xcity key resync on catalog refresh", () => {
+  const WALLET_KEYS_URL = "https://wallet.xcity.ai/v1/keys/for-user";
+  const MODELS_URL = "https://tokenhub.xcity.ai/v1/models";
+
+  it("re-requests the key before the catalog and keeps mintedAt for the same token", async () => {
+    const storage = seededStorage("user-resync-same", 11 * MINUTE_MS);
+    const { calls } = recordingFetch(url => {
+      if (url === WALLET_KEYS_URL) {
+        return jsonResponse({ key: "sk-old", minted: false, plan: { rpm_limit: 60 } });
+      }
+      if (url === MODELS_URL) return jsonResponse({ data: [{ id: "plan-model" }] });
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const plane = await XcityModelPlane.forUser(ENV, CONFIG, storage, "user-resync-same");
+    await flushXcityCatalogRefreshesForTests();
+
+    expect(calls.map(call => call.url)).toEqual([WALLET_KEYS_URL, MODELS_URL]);
+    expect(calls[1].bearer).toBe("sk-old");
+    // Same token: not a re-mint. The record keeps its mintedAt (so the catalog tied to it stays
+    // valid) but picks up what the wallet reported alongside it.
+    expect(storage.get().key).toMatchObject({
+      key: "sk-old", mintedAt: 111, minted: false, plan: { rpm_limit: 60 },
+    });
+    expect(storage.get().catalog).toMatchObject({ keyMintedAt: 111 });
+    expect(plane.getModelList().map(profile => profile.id)).toEqual(["plan-model"]);
+  });
+
+  it("stores a different token from the wallet as a new mint", async () => {
+    const storage = seededStorage("user-resync-rotated", 25 * HOUR_MS);
+    const { calls } = recordingFetch(url => {
+      if (url === WALLET_KEYS_URL) return jsonResponse({ key: "sk-new", minted: true });
+      if (url === MODELS_URL) return jsonResponse({ data: [{ id: "plan-model" }] });
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const plane = await XcityModelPlane.forUser(ENV, CONFIG, storage, "user-resync-rotated");
+
+    expect(calls.map(call => call.url)).toEqual([WALLET_KEYS_URL, MODELS_URL]);
+    expect(calls[1].bearer).toBe("sk-new");
+    const key = storage.get().key!;
+    expect(key.key).toBe("sk-new");
+    expect(key.mintedAt).not.toBe(111);
+    expect(storage.get().catalog?.keyMintedAt).toBe(key.mintedAt);
+    expect(plane.resolveModel("plan-model")?.config.apiToken).toBe("sk-new");
+  });
+
+  it("refreshes with the cached key when the wallet resync fails", async () => {
+    const storage = seededStorage("user-resync-down", 25 * HOUR_MS);
+    const { calls } = recordingFetch(url => {
+      if (url === WALLET_KEYS_URL) return new Response("down", { status: 503 });
+      if (url === MODELS_URL) return jsonResponse({ data: [{ id: "fresh-model" }] });
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const plane = await XcityModelPlane.forUser(ENV, CONFIG, storage, "user-resync-down");
+
+    // Resync attempt + its one transient retry, then the catalog with the untouched cached key.
+    expect(calls.map(call => call.url)).toEqual([WALLET_KEYS_URL, WALLET_KEYS_URL, MODELS_URL]);
+    expect(calls[2].bearer).toBe("sk-old");
+    expect(storage.get().key).toMatchObject({ key: "sk-old", mintedAt: 111 });
+    expect(plane.getModelList().map(profile => profile.id)).toEqual(["fresh-model"]);
+    expect(plane.getDiagnostics()).toEqual({
+      identity: true,
+      keyPresent: true,
+      keyMint: { attempted: true, status: 503, resync: true },
+      catalog: { status: 200, modelCount: 1 },
+    });
+  });
+
+  it("still re-mints once when the catalog rejects the resynced key", async () => {
+    const storage = seededStorage("user-resync-401", 25 * HOUR_MS);
+    let walletCalls = 0;
+    const { calls } = recordingFetch(url => {
+      if (url === WALLET_KEYS_URL) {
+        return jsonResponse({ key: ++walletCalls === 1 ? "sk-old" : "sk-reminted" });
+      }
+      if (url === MODELS_URL) {
+        return calls.at(-1)?.bearer === "sk-old"
+            ? new Response("no", { status: 401 })
+            : jsonResponse({ data: [{ id: "fresh-model" }] });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const plane = await XcityModelPlane.forUser(ENV, CONFIG, storage, "user-resync-401");
+
+    expect(calls.map(call => call.url))
+        .toEqual([WALLET_KEYS_URL, MODELS_URL, WALLET_KEYS_URL, MODELS_URL]);
+    expect(storage.get().key?.key).toBe("sk-reminted");
+    // The latest wallet call was a real re-mint, not a resync.
+    expect(plane.getDiagnostics().keyMint).toEqual({ attempted: true, status: 200 });
+    expect(plane.resolveModel("fresh-model")?.config.apiToken).toBe("sk-reminted");
+  });
+
+  it("makes no wallet call when the cached catalog is fresh", async () => {
+    const storage = seededStorage("user-resync-fresh", 1 * MINUTE_MS);
+    const fetchMock = vi.fn(async () => { throw new Error("unexpected fetch"); });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const plane = await XcityModelPlane.forUser(ENV, CONFIG, storage, "user-resync-fresh");
+    await flushXcityCatalogRefreshesForTests();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(plane.getModelList().map(profile => profile.id)).toEqual(["cached-model"]);
+    expect(plane.getDiagnostics().keyMint).toBeUndefined();
   });
 });

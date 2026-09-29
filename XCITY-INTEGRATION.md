@@ -18,7 +18,7 @@ xct-studio）。部署在 https://os.xcity.ai。
 
 新增文件不会与上游冲突，rebase 时零成本。
 
-## 允许修改的上游文件：八个接缝点
+## 允许修改的上游文件：九个接缝点
 
 **除下列位置外，不修改任何上游文件。** 每处改动限一个分支判断，且必须由环境变量门控 ——
 不设 `XCITY_*` 变量时，行为必须与上游完全一致。这条同时保证了随时可回滚。
@@ -34,6 +34,7 @@ xct-studio）。部署在 https://os.xcity.ai。
 | 6 | 登录后置 | `packages/workshop-backend/src/auth/login-flow.ts` / `server.ts` | Xcity 登录成功后把 GoTrue `sub` 存进 UserDurableObject（`setXcityIdentity`），并仿照 Cloudflare 登录计费路径请求 full scope、调用 `linkConnectedAccountFromLogin` 持久化 gatekeeper 连接，供余额门禁反复获取新鲜 GoTrue access token。接缝 1 说"不改代码"，但铸 per-user litellm key和余额门禁都必须有用户身份/连接，且这里是自然落点。改动限于 `vendorId === XCITY_VENDOR_ID` 分支，与既有的 Cloudflare 分支并列 |
 | 7 | 附件能力 | `chat-attachment-validation.ts` / `chat-attachment-pdf.ts` / `overseer.ts` 的调用点 | 把完整 `AiModelConfig` 而非仅 `provider` 传下去，让 tokenhub 的 per-model `vision` / `pdf_input` 能力生效。无 Xcity 元数据时逐字回落原有的 `ATTACHMENT_SUPPORT_BY_PROVIDER` 表 |
 | 8 | Agent Marketplace Persona | `packages/workshop-shared/src/api.ts` / `workshop-backend/src/{deployment-config.ts,server.ts,user.ts,overseer.ts,agent.ts}` / `workshop-frontend/src/{ChatInterface.tsx,routes/index.tsx,components/chat/XcityAgentPicker.tsx}` | 按 `XCITY_HOME_URL` + model-plane 配置门控，新增 authenticated catalog/persona-status RPC 与 `ServerConfig.xcityAgentMarketplaceEnabled`；catalog/persona 获取实现只放在 `workshop-backend/src/xcity/`。用户当前选择存在 User DO，chat 创建时把已校验 slug 的 persona snapshot 写入 `chatContext.xcityAgent` 和 metadata，普通 coding agent 在 system prompt slot 0 注入 persona；spawned agent 不继承。前端入口贴近 composer model picker，支持搜索/category 过滤和 `/?agent=<slug>` 深链校验 |
+| 9 | 限流提示 | `packages/workshop-backend/src/overseer.ts` — agent turn 的 `catch` | 一行调用 `xcity/tokenhub-errors.ts` 的 `translateXcityModelError`：仅当 model-plane 已配置且模型带 Xcity 元数据时，把 LiteLLM 429 / `throttling_error` 改写成可读的一行提示（套餐限额、重置倒计时、`XCITY_HOME_URL` 升级指引），不含 key；详情以 `xcity.tokenhub.throttled` 记日志。其余情况原样返回同一个 error 对象 |
 
 **已知的结构性取舍**：目录为空或不可用时，模型面会就地合成一条 `XCITY_DEFAULT_MODEL_ID` 记录
 （`synthesizeXcityDefaultModelRecord`，标记 `xcity.synthesizedFallback`），让用户至少有一个可聊的模型。

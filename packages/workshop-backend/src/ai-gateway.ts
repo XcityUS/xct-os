@@ -82,13 +82,15 @@ export class AiGatewayConfig {
   }
 
   /**
-   * Get the list of models available through AI Gateway, as AiChatAuthorInfo entries.
+   * Get the list of models offered through AI Gateway, as AiChatAuthorInfo entries. Hidden models
+   * are left out but still resolve (see resolveModel), so stored references to them keep working.
    */
   getModelList(): AiChatAuthorInfo[] {
     let result: AiChatAuthorInfo[] = [];
     for (let [provider, models] of Object.entries(SUGGESTED_MODELS)) {
       if (this.providers.has(provider)) {
         for (let [id, model] of Object.entries(models)) {
+          if (model.hidden) continue;
           result.push({ type: "agent", id, name: model.name });
         }
       }

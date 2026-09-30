@@ -103,6 +103,7 @@ function buildOptions(gatewayMode: boolean, enabledProviders: Set<string> | null
     // In gateway mode, suggested models are already built-in, so don't list them.
     if (!gatewayMode) {
       for (const [modelId, model] of Object.entries(SUGGESTED_MODELS[provider])) {
+        if (model.hidden) continue
         options.push({
           value: encodeSelection(provider, modelId),
           label: model.name,

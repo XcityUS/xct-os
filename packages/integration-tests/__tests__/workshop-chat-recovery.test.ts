@@ -1,14 +1,16 @@
 import { afterAll, beforeAll, expect, it } from "vitest";
 import type { AiChatMessage, AiChatSubscriber } from "@gadgets/workshop-shared/api";
-import { loadAllChatHistory } from "../src/agent-session.js";
-import { settleRestart, startTestGatekeeperHarness, type Harness } from "../src/harness.js";
+import { loadAllChatHistory, openAgentSession } from "../src/agent-session.js";
+import {
+  settleRestart, startTestGatekeeperHarness, TEST_VENDOR_ID, testActionState, type Harness,
+} from "../src/harness.js";
 import {
   SCRIPTED_MODEL_ID, scriptedModelRouter, type RoutedScriptedModel,
 } from "../src/mock-model.js";
 import { NetworkInterceptor } from "../src/network-interceptor.js";
 import {
-  connect, logIn, nextUsernames, restartWorkspace, RpcTarget, signUp, stubFor, waitFor,
-  waitForIdleChat, WorkpieceRecorder,
+  accountLabel, connect, logIn, nextUsernames, restartWorkspace, RpcTarget, signUp, stubFor,
+  waitFor, waitForIdleChat, withOwnerWorkspace, WorkpieceRecorder,
 } from "../src/rpc-client.js";
 
 let harness: Harness;
@@ -298,4 +300,107 @@ it.concurrent("a chat over its context budget compacts, and history pages across
   expect(tail.messages.every(message => message.sequence >= boundary)).toBe(true);
   expect(messageTexts(await loadAllChatHistory(before => ws.getChatHistory(chatId, before))))
     .toEqual(["First question", "First reply.", secondPrompt, "Second reply."]);
+});
+
+it.concurrent("switching models keeps history, refuses a deleted model, and recovers with another",
+    async () => {
+  const modelA = models.script([
+    { text: "A's first reply." },
+    { error: { status: 500, message: "scripted provider outage" } },
+  ]);
+  const modelB = models.script([{ text: "B saw model A's history." }, { text: "B retried the chat." }]);
+  // Every script shares SCRIPTED_MODEL_ID; B keeps its routed accountId under its own model id.
+  const MODEL_B_ID = "scripted-model-b";
+  const [owner] = nextUsernames("modellifecycleowner");
+  using publicApi = connect(harness.url);
+  using api = await signUp(publicApi, owner!);
+  await api.addModel(modelA.userModel.profile, modelA.userModel.config);
+  await api.addModel(
+      { ...modelB.userModel.profile, id: MODEL_B_ID, name: "Scripted model B" },
+      { ...modelB.userModel.config, model: MODEL_B_ID });
+  using ws = await api.newGadget();
+  await api.setQuickModel(SCRIPTED_MODEL_ID);
+  expect(await api.getQuickModel()).toBe(SCRIPTED_MODEL_ID);
+  await api.setPreferredModel(SCRIPTED_MODEL_ID);
+  expect(await api.getPreferredModel()).toBe(SCRIPTED_MODEL_ID);
+
+  const chatId = await ws.newChat("Ask model A.", SCRIPTED_MODEL_ID);
+  const history = () => loadAllChatHistory(before => ws.getChatHistory(chatId, before));
+  const settled = async (model: RoutedScriptedModel, requests: number) => {
+    await waitFor(`request ${requests}`, async () => model.requests.length === requests || null);
+    await waitForIdleChat(ws, chatId);
+  };
+  await settled(modelA, 1);
+  await ws.sendChatMessage(chatId, "Ask model B.", MODEL_B_ID);
+  await settled(modelB, 1);
+  const switched = JSON.stringify(modelB.requests[0]);
+  for (const text of ["Ask model A.", "A's first reply.", "Ask model B."]) {
+    expect(switched).toContain(text);
+  }
+  // The user switches back to A, whose provider fails, and deletes it.
+  await ws.sendChatMessage(chatId, "Ask model A again.", SCRIPTED_MODEL_ID);
+  await settled(modelA, 2);
+
+  await api.deleteModel(SCRIPTED_MODEL_ID);
+  expect(await api.getQuickModel()).toBeNull();
+
+  const beforeRefused = await history();
+  await expect(ws.sendChatMessage(chatId, "This must not be saved.", SCRIPTED_MODEL_ID))
+    .rejects.toThrow(`No such model: ${SCRIPTED_MODEL_ID}`);
+  expect(await history()).toEqual(beforeRefused);
+  expect(modelA.requests).toHaveLength(2);
+
+  // Retry answers the failed turn's message; after a completed reply it would have nothing to do.
+  await ws.retryAgent(chatId, MODEL_B_ID);
+  await settled(modelB, 2);
+  expect(messageTexts(await history())).toEqual([
+    "Ask model A.", "A's first reply.", "Ask model B.", "B saw model A's history.",
+    "Ask model A again.", "B retried the chat.",
+  ]);
+});
+
+it.concurrent("approving after the waiting chat's model was deleted applies once without resuming",
+    async () => {
+  const model = models.script([
+    { toolCall: {
+      id: "write-test-value",
+      name: "executeCode",
+      arguments: {
+        code: "export default async function(self, env) { console.log(await env.TEST_AMBIENT.writeValue(13)); }",
+      },
+    } },
+    { text: "This must not run." },
+  ]);
+  await using session = await openAgentSession(harness.url, {
+    modelId: SCRIPTED_MODEL_ID,
+    userModel: model.userModel,
+    ambientVendorIds: [TEST_VENDOR_ID],
+    usernamePrefix: "deletedapprovalmodel",
+  });
+  const label = accountLabel(session.connectedAccount(TEST_VENDOR_ID));
+
+  expect((await session.runTurn("Set the test value to 13.")).outcome)
+    .toEqual({ status: "completed" });
+  const [action] = await waitFor("the test write to await approval", async () => {
+    const { entries } = await session.listActions({ filter: "pending" });
+    return entries.length === 1 ? entries : null;
+  });
+  expect(action).toMatchObject({ description: { title: "Set the test value to 13" } });
+  {
+    using publicApi = connect(harness.url);
+    using api = await logIn(publicApi, session.username);
+    await api.deleteModel(SCRIPTED_MODEL_ID);
+  }
+
+  await withOwnerWorkspace(harness.url, session.username, async ws => {
+    // What the approval call should then report is undecided, so only its effects are asserted.
+    await Promise.allSettled([ws.approveAction(action!.id)]);
+    const [chat] = await ws.listChats();
+    await waitForIdleChat(ws, chat!.id);
+  });
+  expect((await session.listActions({ filter: "action" })).entries)
+    .toContainEqual(expect.objectContaining({ id: action!.id, state: "approved" }));
+  expect(await testActionState(harness, label)).toEqual({ pending: [], value: 13, applyCount: 1 });
+  expect(model.requests).toHaveLength(1);
+  expect(model.remainingSteps()).toBe(1);
 });

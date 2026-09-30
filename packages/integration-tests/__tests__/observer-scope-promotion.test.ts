@@ -1,13 +1,14 @@
 // A "use" collaborator is verified only against the connections their scope reaches. Merging an
-// agent-proposed binding, or enabling a hook on an unbound connection, widens that scope, so the
-// workspace restarts and the viewer's next open re-verifies against the widened scope.
+// agent-proposed binding, binding on mainline, or enabling a hook on an unbound connection widens
+// that scope, so the workspace restarts and the viewer's next open re-verifies against it. The
+// user's own binding edits (bind, rename, unbind) also reload the running gadget's environment.
 
 import { afterAll, beforeAll, expect, it } from "vitest";
 import type { RpcStub } from "capnweb";
 import type { AiChatMessage, AuthenticatedApi, Overseer } from "@gadgets/workshop-shared/api";
 import { openAgentSession } from "../src/agent-session.js";
 import {
-  settleRestart, startTestGatekeeperHarness, TEST_GATEKEEPER_WORKER, TEST_VENDOR_ID, type Harness,
+  settleRestart, startTestGatekeeperHarness, TEST_VENDOR_ID, testControl, type Harness,
 } from "../src/harness.js";
 import { SCRIPTED_MODEL_ID, scriptedModelRouter, type RoutedScriptedModel } from "../src/mock-model.js";
 import { NetworkInterceptor } from "../src/network-interceptor.js";
@@ -43,6 +44,22 @@ async function provisionAccount(api: RpcStub<AuthenticatedApi>): Promise<Connect
   });
 }
 
+// A fresh owner with a provisioned test account and a new workspace.
+async function newWorkspace(usernamePrefix: string) {
+  const [username] = nextUsernames(usernamePrefix);
+  using stack = new DisposableStack();
+  const api = stack.use(await signUp(stack.use(connect(harness.url)), username));
+  const account = await provisionAccount(api);
+  const ws = stack.use(await api.newGadget());
+  return Object.assign(stack.move(), { account, ws });
+}
+
+async function newConnection(ws: RpcStub<Overseer>, accountId: number, resourceUrl: string) {
+  using connection = await ws.newGatekeeper(accountId, resourceUrl);
+  if (!connection) throw new Error(`Failed to create the connection to ${resourceUrl}`);
+  return await connection.getId();
+}
+
 const openSession = (model: RoutedScriptedModel, usernamePrefix: string) =>
   openAgentSession(harness.url, {
     modelId: SCRIPTED_MODEL_ID,
@@ -55,16 +72,6 @@ function connectionCard(history: AiChatMessage[]) {
   const card = history.find(message => message.type === "connectionRequest");
   if (!card) throw new Error("The agent did not create a connection request");
   return card;
-}
-
-async function control(route: string, body: object): Promise<unknown> {
-  const response = await harness.fetchWorker(
-      TEST_GATEKEEPER_WORKER, `http://gatekeeper-test.test/control/${route}`,
-      { method: "POST", body: JSON.stringify(body) });
-  if (response.status !== 200) {
-    throw new Error(`/control/${route} failed with ${response.status}: ${await response.text()}`);
-  }
-  return await response.json();
 }
 
 // A viewer's session on its own connection. The default recorder has no queued responses, so an
@@ -140,10 +147,8 @@ it("merging an agent-proposed binding re-verifies a live use viewer against it",
 
   const { sourceId, workspaceId, viewer } =
       await withOwnerWorkspace(harness.url, session.username, async ws => {
-    using source = await ws.newGatekeeper(session.connectedAccount(TEST_VENDOR_ID).id, SOURCE_URL);
-    if (!source) throw new Error("Failed to create the source connection");
     return {
-      sourceId: await source.getId(),
+      sourceId: await newConnection(ws, session.connectedAccount(TEST_VENDOR_ID).id, SOURCE_URL),
       workspaceId: (await ws.getMetadata()).id,
       viewer: await addViewer(ws),
     };
@@ -240,9 +245,8 @@ export default async function(self, env) {
   await session.acceptChanges();
 
   const { sourceId, workspaceId } = await withOwnerWorkspace(harness.url, session.username, async ws => {
-    using source = await ws.newGatekeeper(session.connectedAccount(TEST_VENDOR_ID).id, SOURCE_URL);
-    if (!source) throw new Error("Failed to create the source connection");
-    return { sourceId: await source.getId(), workspaceId: (await ws.getMetadata()).id };
+    const sourceId = await newConnection(ws, session.connectedAccount(TEST_VENDOR_ID).id, SOURCE_URL);
+    return { sourceId, workspaceId: (await ws.getMetadata()).id };
   });
 
   const watchTurn = await session.runTurn("Watch the source.");
@@ -270,11 +274,120 @@ export default async function(self, env) {
   using reopened = await reopenVerified(workspaceId, viewer);
   expect(reopened.recorder.callCount).toBe(1);
   expect(reopened.recorder.calls[0].map(n => n.gatekeeperId)).toEqual([sourceId]);
-  expect(await control("observer-events", { resourceUrl: SOURCE_URL }))
+  expect(await testControl(harness, "observer-events", { resourceUrl: SOURCE_URL }))
       .toEqual({ events: [expect.objectContaining({ type: "add" })] });
 
   using gadget = await reopened.overseer.getGadget(hook.gadgetId);
   using facet = await gadget.connectToGadget() as RpcStub<StateGadget>;
-  expect(await control("fire-hook", { key: hookKey, value: 7 })).toEqual({ fired: true });
+  expect(await testControl(harness, "fire-hook", { key: hookKey, value: 7 })).toEqual({ fired: true });
   expect(await facet.deliveredValue()).toBe(7);
+});
+
+interface EnvironmentGadget extends RpcTarget {
+  envKeys(): Promise<string[]>;
+}
+
+const ENVIRONMENT_SERVER = `import { DurableObject } from "cloudflare:workers";
+export class Gadget extends DurableObject {
+  async envKeys() { return Object.keys(this.env).sort(); }
+}`;
+
+it("mainline binding edits reload the running gadget's environment", async () => {
+  const model = models.script([
+    {
+      toolCalls: [
+        { id: "create", name: "createGadget", arguments: { title: "Environment", bindingName: "ENVIRONMENT" } },
+        {
+          id: "write",
+          name: "writeFile",
+          arguments: { workpiece: "ENVIRONMENT", filename: "server.js", content: ENVIRONMENT_SERVER },
+        },
+      ],
+    },
+    { text: "Built." },
+  ]);
+  await using session = await openSession(model, "bindingenv");
+  const built = await session.runTurn("Build the environment gadget.");
+  expect(built.outcome).toEqual({ status: "completed" });
+  await session.acceptChanges();
+  const gadgetId = built.workpieces.find(w => w.title === "Environment")?.id;
+  if (gadgetId === undefined) throw new Error("The agent did not create the gadget");
+
+  await withOwnerWorkspace(harness.url, session.username, async ws => {
+    const accountId = session.connectedAccount(TEST_VENDOR_ID).id;
+    const firstId = await newConnection(ws, accountId, "https://gadgets-test.example/things/env-first");
+    const suggestedId =
+        await newConnection(ws, accountId, "https://gadgets-test.example/things/env-suggested");
+    using app = await ws.getGadget(gadgetId);
+    // A fresh facet per check, so each one runs against the environment the last edit left.
+    const envKeys = async () => {
+      using facet = await app.connectToGadget() as RpcStub<EnvironmentGadget>;
+      return await facet.envKeys();
+    };
+
+    await app.bind("DATA", firstId);
+    expect(await envKeys()).toEqual(["DATA", "GADGET", "GIT"]);
+    await expect(app.bind("DATA", suggestedId)).rejects.toThrow('There is already a binding named "DATA".');
+
+    expect(await app.bindWithSuggestedName(suggestedId)).toBe("TEST_THING");
+    expect(await envKeys()).toEqual(["DATA", "GADGET", "GIT", "TEST_THING"]);
+
+    const annotation = {
+      title: "Suggested test thing",
+      description: "Keep this annotation through a rename.",
+      suggestValue: true,
+    };
+    await app.setBlueprintAnnotation("TEST_THING", annotation);
+    await app.renameBinding("TEST_THING", "RENAMED");
+    expect(await app.getBlueprintAnnotation("RENAMED")).toEqual(annotation);
+    expect(await envKeys()).toEqual(["DATA", "GADGET", "GIT", "RENAMED"]);
+
+    await app.unbind("RENAMED");
+    expect(await envKeys()).toEqual(["DATA", "GADGET", "GIT"]);
+  });
+});
+
+it("mainline binding names steer clear of another chat's pending binding", async () => {
+  using owner = await newWorkspace("bindingconflict");
+  const { account, ws } = owner;
+  using app = await ws.createGadget("App", undefined, "APP");
+  const draftTargetId =
+      await newConnection(ws, account.id, "https://gadgets-test.example/things/draft-name");
+  const mainlineTargetId =
+      await newConnection(ws, account.id, "https://gadgets-test.example/things/mainline-name");
+
+  const chatB = await ws.newChat("Reserve TEST_THING", null);
+  await app.bind("TEST_THING", draftTargetId, chatB);
+  expect(await app.listBindings()).not.toContainEqual(expect.objectContaining({ name: "TEST_THING" }));
+  expect(await app.listBindings(chatB)).toContainEqual(
+      expect.objectContaining({ name: "TEST_THING", target: draftTargetId, chatId: chatB }));
+
+  await expect(app.bind("TEST_THING", mainlineTargetId)).rejects.toThrow(
+      'The binding name "TEST_THING" is already proposed by another chat. ' +
+      "Accept or revert that chat's changes first, or choose a different name.");
+  expect(await app.bindWithSuggestedName(mainlineTargetId)).toBe("TEST_THING_2");
+
+  await app.bind("MAIN", mainlineTargetId);
+  await expect(app.renameBinding("MAIN", "TEST_THING")).rejects.toThrow();
+});
+
+it("a mainline bind re-verifies a held use viewer against the bound connection", async () => {
+  using owner = await newWorkspace("bindingviewer");
+  const { account, ws } = owner;
+  using app = await ws.createGadget("App", undefined, "APP");
+  const sourceId =
+      await newConnection(ws, account.id, "https://gadgets-test.example/things/live-binding");
+  const workspaceId = (await ws.getMetadata()).id;
+  const viewer = await addViewer(ws);
+  // Unbound, the connection is outside the viewer's use scope, so this open needs no verification.
+  using held = await holdSession(workspaceId, viewer.name);
+
+  await app.bind("DATA", sourceId);
+  await expect(ws.getGatekeeperById(sourceId)).rejects.toThrow(/restarting/);
+
+  await waitFor("the viewer's session to be severed", () =>
+    held.overseer.getMetadata().then(() => null, () => true));
+  using reopened = await reopenVerified(workspaceId, viewer);
+  expect(reopened.recorder.callCount).toBe(1);
+  expect(reopened.recorder.calls[0].map(n => n.gatekeeperId)).toEqual([sourceId]);
 });

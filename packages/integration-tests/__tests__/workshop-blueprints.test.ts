@@ -2,10 +2,9 @@ import type { RpcStub } from "capnweb";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import type { Overseer, TreeNode, WorkpieceId } from "@gadgets/workshop-shared/api";
 import { diffFiles, type CodeContent } from "@gadgets/workshop-shared/code-change";
-import { z } from "zod";
 import type { TestSession } from "../fixtures/gatekeeper-test/src/test-gatekeeper.js";
 import {
-  startTestGatekeeperHarness, TEST_GATEKEEPER_WORKER, TEST_VENDOR_ID, type Harness,
+  startTestGatekeeperHarness, TEST_VENDOR_ID, testActionState, type Harness,
 } from "../src/harness.js";
 import { NetworkInterceptor } from "../src/network-interceptor.js";
 import {
@@ -18,7 +17,7 @@ const network = new NetworkInterceptor();
 
 beforeAll(async () => {
   network.install();
-  harness = await startTestGatekeeperHarness();
+  harness = await startTestGatekeeperHarness({ enableGadgetExecution: true });
 });
 
 afterAll(async () => {
@@ -39,23 +38,6 @@ function username(prefix: string): string {
   const value = nextUsernames(prefix).at(0);
   if (value === undefined) throw new Error("Failed to allocate a test username");
   return value;
-}
-
-const TEST_ACTION_STATE = z.object({
-  pending: z.array(z.object({ id: z.number(), value: z.number() })),
-  value: z.number().optional(),
-  applyCount: z.number(),
-});
-type TestActionState = z.infer<typeof TEST_ACTION_STATE>;
-
-async function actionState(label: string): Promise<TestActionState> {
-  const response = await requireHarness().fetchWorker(
-      TEST_GATEKEEPER_WORKER, "http://gatekeeper-test.test/control/action-state",
-      { method: "POST", body: JSON.stringify({ label }) });
-  if (response.status !== 200) {
-    throw new Error(`Reading test action state failed with ${response.status}: ${await response.text()}`);
-  }
-  return TEST_ACTION_STATE.parse(await response.json());
 }
 
 function treePaths(nodes: TreeNode[], prefix = ""): string[] {
@@ -83,6 +65,19 @@ const headOf = (workpieces: WorkpieceRecorder, gadgetId: WorkpieceId, after?: st
     return summary?.type === "gadget" && summary.commitId !== undefined &&
         summary.commitId !== after ? summary.commitId : null;
   });
+
+const CSV_EXPORT_SERVER =
+    `import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";\n` +
+    `export class Gadget extends DurableObject {}\n` +
+    `export class ExportHandler extends WorkerEntrypoint {\n` +
+    `  async getExportFormats(_gadget) {\n` +
+    `    return [{ id: "csv", label: "CSV", mode: "server", contentType: "text/csv", fileExtension: ".csv" }];\n` +
+    `  }\n` +
+    `  async export(_gadget, id) {\n` +
+    `    if (id !== "csv") throw new Error(\`Unsupported export format: \${id}\`);\n` +
+    `    return new Response("a,b\\n1,2\\n").body;\n` +
+    `  }\n` +
+    `}\n`;
 
 /** Merge a one-file edit into mainline through a human-only chat; returns the new head. */
 async function commitText(ws: RpcStub<Overseer>, workpieces: WorkpieceRecorder,
@@ -242,7 +237,7 @@ it.concurrent("republishing a blueprint changes future installs, not existing on
   await source.deleteSelf();
 });
 
-it.concurrent("an installed blueprint binds the installer's account, not the publisher's", async () => {
+it.concurrent("a blueprint archive keeps DATA's annotation, and installs bind the installer's account", async () => {
   const [publisher, installer] = nextUsernames("blueprintpublisher", "blueprintinstaller");
   if (!publisher || !installer) throw new Error("Failed to allocate test usernames");
 
@@ -278,6 +273,11 @@ it.concurrent("an installed blueprint binds the installer's account, not the pub
       publisherAccount.id, "https://gadgets-test.example/things/source");
   if (!decoy || !data) throw new Error("Failed to create the publisher's test connections");
   await sourceGadget.bind("DATA", await data.getId());
+  const annotation = {
+    title: "Source data", description: "Connect the source test thing.", suggestValue: true,
+  };
+  await sourceGadget.setBlueprintAnnotation("DATA", annotation);
+  expect(await sourceGadget.getBlueprintAnnotation("DATA")).toEqual(annotation);
   const blueprint = await sourceGadget.createBlueprint(
       "Bound", "Blueprint with a DATA binding");
 
@@ -285,6 +285,16 @@ it.concurrent("an installed blueprint binds the installer's account, not the pub
   using installerApi = await signUp(installerPublic, installer);
   const importedId = await installerApi.importBlueprint(
       await publisherPublic.downloadBlueprint(blueprint.id));
+  expect((await installerPublic.getBlueprint(importedId))?.metadata.bindings).toEqual({
+    DATA: {
+      title: "Source data",
+      description: "Connect the source test thing.",
+      type: "gatekeeper",
+      gatekeeperName: TEST_VENDOR_ID,
+      typeUrlPattern: "https://gadgets-test.example/things/*",
+      resourceUrl: "https://gadgets-test.example/things/source",
+    },
+  });
   await installerApi.provisionAmbientAccount(TEST_VENDOR_ID);
   const installerAccount = (await listConnectedAccounts(installerApi))
       .find(account => account.vendorId === TEST_VENDOR_ID);
@@ -325,9 +335,9 @@ it.concurrent("an installed blueprint binds the installer's account, not the pub
   });
   await installedWorkspace.approveAction(pending.id);
   await write;
-  expect(await actionState(accountLabel(installerAccount)))
+  expect(await testActionState(requireHarness(), accountLabel(installerAccount)))
       .toEqual({ pending: [], value: 17, applyCount: 1 });
-  expect(await actionState(accountLabel(publisherAccount)))
+  expect(await testActionState(requireHarness(), accountLabel(publisherAccount)))
       .toEqual({ pending: [], applyCount: 0 });
 
   const sourcePaths = treePaths(await sourceWorkspace.listTree(sourceSummary.commitId));
@@ -338,4 +348,27 @@ it.concurrent("an installed blueprint binds the installer's account, not the pub
 
   await installedWorkspace.deleteSelf();
   await sourceWorkspace.deleteSelf();
+});
+
+// This stream is the gadget's own export, not a `.gadget` archive; the importable round trip is
+// the blueprint archive test above.
+it.concurrent("a gadget's ExportHandler lists and streams its format", async () => {
+  using publicApi = connect(requireHarness().url);
+  using api = await signUp(publicApi, username("gadgetexport"));
+  using ws = await api.newGadget();
+  const workpieces = new WorkpieceRecorder();
+  using workpiecesStub = stubFor(workpieces);
+  using _subscription = await ws.subscribeToWorkpieces(workpiecesStub);
+  await workpieces.loaded;
+  using app = ws.createGadget("App", undefined, "APP");
+  const gadgetId = await app.getId();
+  await commitText(ws, workpieces, gadgetId, await headOf(workpieces, gadgetId),
+      "server.js", undefined, CSV_EXPORT_SERVER);
+
+  expect(await app.getExportFormats()).toEqual([
+    { id: "csv", label: "CSV", mode: "server", contentType: "text/csv", fileExtension: ".csv" },
+  ]);
+  expect(await new Response(await app.export("csv")).text()).toBe("a,b\n1,2\n");
+
+  await ws.deleteSelf();
 });

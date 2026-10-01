@@ -1,43 +1,60 @@
+// Generated from cloudflare.config.ts by scripts/generate-worker-configs.ts -- do not edit.
+// Change cloudflare.config.ts and run `pnpm configs:generate`.
 {
   "name": "gatekeeper-xcity",
   "main": ".wrangler/validate/src/xcity.ts",
-  "build": {
-    "command": "pnpm exec capnweb-validate build --out .wrangler/validate",
-    "watch_dir": "src"
-  },
-  "compatibility_date": "2026-02-02",
-  "compatibility_flags": ["allow_irrevocable_stub_storage", "nodejs_als"],
-  "rules": [
-    { "type": "Text", "globs": ["**/*.txt", "**/*.svg"], "fallthrough": false }
-  ],
-  // A plain namespace binding for the account DO. GatekeeperUserImpl is a props-derived
-  // entrypoint that the Workshop stores durably (allow_irrevocable_stub_storage); once the
-  // creating request context is gone, dispatching through the revived instance's ctx.exports
-  // hangs until the runtime cancels it ("code had hung"). `env` survives revival, so account
-  // access goes through this binding, with ctx.exports kept only as a dev fallback.
-  "durable_objects": {
-    "bindings": [
-      { "name": "USER_ACCOUNT", "class_name": "UserAccount" }
-    ]
-  },
-  "migrations": [
-    {
-      "tag": "v0",
-      "new_sqlite_classes": [ "UserAccount" ]
-    },
-    {
-      "tag": "v1",
-      "new_sqlite_classes": [ "XcityMediaGatekeeperImpl" ]
-    },
-    {
-      "tag": "v2",
-      "new_sqlite_classes": [ "XcityContextGatekeeperImpl" ]
-    }
+  "compatibility_date": "2026-09-04",
+  "compatibility_flags": [
+    "allow_irrevocable_stub_storage",
+    "nodejs_als"
   ],
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1,
-    "logs": { "invocation_logs": false }
-  }
-
+    "logs": {
+      "invocation_logs": false
+    }
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "USER_ACCOUNT",
+        "class_name": "UserAccount"
+      }
+    ]
+  },
+  "build": {
+    "command": "pnpm exec capnweb-validate build --out .wrangler/validate",
+    "watch_dir": "src"
+  },
+  "rules": [
+    {
+      "type": "Text",
+      "globs": [
+        "**/*.txt",
+        "**/*.svg"
+      ],
+      "fallthrough": false
+    }
+  ],
+  "migrations": [
+    {
+      "tag": "v0",
+      "new_sqlite_classes": [
+        "UserAccount"
+      ]
+    },
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "XcityMediaGatekeeperImpl"
+      ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "XcityContextGatekeeperImpl"
+      ]
+    }
+  ]
 }

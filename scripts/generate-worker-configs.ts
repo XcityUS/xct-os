@@ -69,6 +69,11 @@ export async function renderWorkerConfig(dir: string): Promise<string> {
   const config: WranglerConfig = convertToWranglerConfig(parsed.data);
 
   const extras: WranglerExtras = mod.wrangler ?? {};
+  if (extras.sameScriptDurableObjects?.length) {
+    config.durable_objects = {
+      bindings: [...config.durable_objects?.bindings ?? [], ...extras.sameScriptDurableObjects],
+    };
+  }
   for (const [binding, id] of Object.entries(extras.kvPreviewIds ?? {})) {
     const entry = config.kv_namespaces?.find((kv) => kv.binding === binding);
     if (!entry) {

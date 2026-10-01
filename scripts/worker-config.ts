@@ -50,6 +50,13 @@ export interface WranglerExtras {
    * it Miniflare keys local data by binding name, orphaning data already stored under these ids.
    */
   kvPreviewIds?: Record<string, string>;
+  /**
+   * Durable Object namespace bindings to classes this Worker itself exports, emitted as
+   * `durable_objects.bindings` entries with no `script_name`. @cloudflare/config's
+   * `bindings.durableObject()` always names a script, which the release manifest rejects for a
+   * same-script binding (see manifest-lib.ts).
+   */
+  sameScriptDurableObjects?: { name: string; class_name: string }[];
 }
 
 /** The `wrangler` export of a gatekeeper validated by capnweb-validate that imports .txt/.svg. */

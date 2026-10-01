@@ -1,5 +1,5 @@
 import { defineConfig } from 'vite-plus'
-import { vitestTask } from '../../scripts/vitest-task-vite-config.js'
+import { vitestTask } from '@gadgets/scripts/vitest-task'
 
 /**
  * Vite+ settings for this package. The SPA's own build config lives in `vite.app.config.ts`;
@@ -16,7 +16,7 @@ export default defineConfig({
       // survive a later disabled-reporting cache hit and could be collected as if they matched the
       // current bundle. This runs every time, before the cache lookup.
       'clean:error-reporting-artifacts': {
-        command: 'node ../../scripts/clean-error-reporting-artifacts.ts .',
+        command: 'gadgets-clean-error-reporting .',
         cache: false,
       },
       // A task rather than a package.json script so `input` can be stated explicitly: automatic
@@ -28,7 +28,7 @@ export default defineConfig({
       // the gatekeepers would invalidate each other. Only directory *contents* can be excluded, not
       // the directories, so a deleted output tree still costs one cold build.
       'build:app': {
-        command: 'node build-app.mjs',
+        command: 'node build-app.ts',
         dependsOn: ['clean:error-reporting-artifacts'],
         input: [
           { auto: true },
@@ -52,7 +52,7 @@ export default defineConfig({
       // rebuilds it moments later (`emptyOutDir`), so restoring it would be megabytes of writes on
       // the startup critical path.
       'build:app:dev': {
-        command: 'node build-app.mjs --dev',
+        command: 'node build-app.ts --dev',
         dependsOn: ['clean:error-reporting-artifacts'],
         input: [
           { auto: true },

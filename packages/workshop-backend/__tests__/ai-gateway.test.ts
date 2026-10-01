@@ -4,6 +4,7 @@ import {
   AiGatewayLogRetryableError,
   getAiGatewayLogCost,
 } from "../src/ai-gateway.js";
+import { getModel } from "../src/ai-models.js";
 
 function env(overrides: Partial<Cloudflare.Env> = {}): Cloudflare.Env {
   return {
@@ -119,6 +120,31 @@ describe("AiGatewayConfig transport selection", () => {
       CF_AI_GATEWAY_API_TOKEN: "gateway-token",
       WORKERS_AI: undefined,
     })).sameAccountGateway).toBeUndefined();
+  });
+});
+
+describe("AiGatewayConfig model offering", () => {
+  const gatewayEnv = env({
+    CF_AI_GATEWAY_ACCOUNT_ID: "account-id",
+    CF_AI_GATEWAY_API_TOKEN: "gateway-token",
+  });
+  const config = new AiGatewayConfig(gatewayEnv);
+
+  it("lists visible models on enabled providers only", () => {
+    const ids = config.getModelList().map(model => model.id);
+    expect(ids).toContain("claude-opus-5-5");
+    expect(ids).toContain("gpt-6.1-sol");
+    expect(ids).not.toContain("@cf/zai-org/glm-5.2");
+  });
+
+  // Chats, spawners, and preferences created before a model was hidden still name it.
+  it("still resolves a hidden model that it doesn't list", () => {
+    expect(config.getModelList().map(model => model.id)).not.toContain("gpt-6-sol");
+
+    const record = config.resolveModel("gpt-6-sol");
+    expect(record?.profile).toEqual({ type: "agent", id: "gpt-6-sol", name: "GPT-6 Sol" });
+    const handle = getModel(gatewayEnv, record!.config, { type: "user", id: "user-1", name: "User" });
+    expect(handle.model.id).toBe("gpt-6-sol");
   });
 });
 

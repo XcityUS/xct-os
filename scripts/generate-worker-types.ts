@@ -63,9 +63,11 @@ async function ownsGlobalProps(pkgDir: string): Promise<boolean> {
 }
 
 function rewriteMainModule(text: string): string {
+  // Every import of the validated bundle: mainModule, and the class of a same-script Durable
+  // Object binding (gatekeeper-xcity's USER_ACCOUNT).
   return text.replace(
-    /mainModule:\s*typeof import\("\.\/\.wrangler\/validate\/src\/([^"]+)"\)/g,
-    'mainModule: typeof import("./src/$1")',
+    /import\("\.\/\.wrangler\/validate\/src\/([^"]+)"\)/g,
+    'import("./src/$1")',
   );
 }
 

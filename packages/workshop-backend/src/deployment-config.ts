@@ -58,6 +58,7 @@ export async function getServerConfig(env: Cloudflare.Env): Promise<ServerConfig
     xcityHomeUrl,
     xcityAgentMarketplaceEnabled: getXcityAgentMarketplaceConfig(env) !== null,
     signupsEnabled: config.signupsEnabled,
+    userSearchEnabled: config.userSearchEnabled,
     siteName: config.siteName,
     siteLogo: siteLogoImage(config.siteLogoConfigured),
     announcement: config.announcement,

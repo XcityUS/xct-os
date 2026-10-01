@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import type { AiChatAuthorInfo, AiModelConfig } from "@gadgets/workshop-shared/api";
+import {
+  SUGGESTED_MODELS, type AiChatAuthorInfo, type AiModelConfig,
+} from "@gadgets/workshop-shared/api";
+import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
+import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { getModel, type ModelHandle } from "../src/ai-models.js";
 import { parseTokenhubModelCatalog } from "../src/xcity/model-plane.js";
 
@@ -45,6 +49,12 @@ function env(overrides: Partial<Cloudflare.Env> = {}): Cloudflare.Env {
 
 type CapturedRequest = { url: string; headers: Headers; body: string };
 
+// Anthropic's SDK adds provider-owned query flags (currently ?beta=true); routing owns the path.
+function urlWithoutQuery(url: string): string {
+  const parsed = new URL(url);
+  return parsed.origin + parsed.pathname;
+}
+
 const capturedRequests: CapturedRequest[] = [];
 
 const fetchStub = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -56,10 +66,12 @@ const fetchStub = (async (input: RequestInfo | URL, init?: RequestInit) => {
 }) as typeof fetch;
 
 // Runs one request through the handle with the fetch stub and returns what was sent.
-async function captureRequest(handle: ModelHandle): Promise<CapturedRequest> {
+async function captureRequest(
+    handle: ModelHandle,
+    options: NonNullable<Parameters<ModelHandle["stream"]>[2]> = {}): Promise<CapturedRequest> {
   const stream = await handle.stream(handle.model, {
     messages: [{ role: "user", content: "hello", timestamp: 0 }],
-  }, { fetch: fetchStub, maxRetries: 0 });
+  }, { fetch: fetchStub, maxRetries: 0, ...options });
   const message = await stream.result();
   expect(message.stopReason).toBe("error");
   expect(capturedRequests.length).toBeGreaterThan(0);
@@ -87,7 +99,7 @@ describe("getModel AI Gateway routing", () => {
     });
 
     const request = await captureRequest(handle);
-    expect(request.url).toBe(
+    expect(urlWithoutQuery(request.url)).toBe(
         "https://gateway.ai.cloudflare.com/v1/gateway-account-id/platform-gateway/anthropic/" +
         "v1/messages");
     // Gateway-owned auth: the cf-aig token authorizes the request and the SDK's own auth
@@ -196,7 +208,7 @@ describe("getModel AI Gateway routing", () => {
         "https://gateway.ai.cloudflare.com/v1/user-account-id/default/anthropic");
 
     const request = await captureRequest(handle);
-    expect(request.url).toBe(
+    expect(urlWithoutQuery(request.url)).toBe(
         "https://gateway.ai.cloudflare.com/v1/user-account-id/default/anthropic/v1/messages");
     // The user's token authorizes the gateway; the SDK's own auth headers are suppressed so the
     // gateway's unified-billing provider keys apply.
@@ -208,6 +220,9 @@ describe("getModel AI Gateway routing", () => {
   it("routes Workers AI through the platform gateway like every other provider", async () => {
     const handle = getModel(env(), WORKERS_AI_CONFIG, INITIATOR,
         { sessionAffinity: "session-a" });
+    const glm = getModel(env(),
+        {...WORKERS_AI_CONFIG, model: "@cf/zai-org/glm-5.3-flash"}, INITIATOR);
+    expect(glm.model).toMatchObject({reasoning: true, input: ["text", "image"]});
 
     expect(handle.model.api).toBe("openai-completions");
     expect(handle.model.id).toBe("@cf/meta/llama-3.3-70b-instruct-fp8-fast");
@@ -300,7 +315,7 @@ describe("getModel AI Gateway binding transport", () => {
     expect(handle.aiGatewayLogRoute).toEqual({ gateway: "platform-gateway" });
 
     const entry = await captureEntry(handle);
-    expect(entry.url).toBe(
+    expect(urlWithoutQuery(entry.url)).toBe(
         "https://workers-binding.ai/ai-gateway/gateways/platform-gateway/anthropic/v1/messages");
     expect(entry.method).toBe("POST");
     // The sentinel auth header satisfies pi's request-auth check; the gateway recognizes and
@@ -347,7 +362,7 @@ describe("getModel AI Gateway binding transport", () => {
 
     const request = await captureRequest(handle);
     expect(capturedEntries).toHaveLength(0);
-    expect(request.url).toBe(
+    expect(urlWithoutQuery(request.url)).toBe(
         "https://workers-binding.ai/ai-gateway/gateways/platform-gateway/anthropic/v1/messages");
     expect(request.headers.get("cf-aig-authorization"))
         .toBe("Bearer cloudflare-gateway-binding");
@@ -374,7 +389,7 @@ describe("getModel AI Gateway binding transport", () => {
 
     const anthropicHandle = getModel(hybridEnv, ANTHROPIC_CONFIG, INITIATOR);
     const entry = await captureEntry(anthropicHandle);
-    expect(entry.url).toBe(
+    expect(urlWithoutQuery(entry.url)).toBe(
         "https://workers-binding.ai/ai-gateway/gateways/platform-gateway/anthropic/v1/messages");
     // The binding arm carries the sentinel, never the real gateway token.
     expect(entry.headers["cf-aig-authorization"]).toBe("Bearer cloudflare-gateway-binding");
@@ -403,6 +418,87 @@ describe("getModel direct routing (no gateway)", () => {
     capturedRequests.length = 0;
   });
 
+  it.each([
+    ["anthropic", "claude-opus-5-5", "Claude Opus 5.5", 1_000_000],
+    ["anthropic", "claude-sonnet-5-5", "Claude Sonnet 5.5", 1_000_000],
+    ["anthropic", "claude-fable-5-1", "Claude Fable 5.1", 1_000_000],
+    ["openai", "gpt-6.1-sol", "GPT-6.1 Sol", 1_050_000],
+    ["openai", "gpt-6-astra", "GPT-6 Astra", 1_050_000],
+    ["openai", "gpt-6-sol", "GPT-6 Sol", 1_050_000],
+    ["openai", "gpt-6-luna", "GPT-6 Luna", 1_050_000],
+  ] as const)(
+      "offers %s model %s with configured limits and catalog metadata",
+      (provider, model, name, contextWindow) => {
+    expect(SUGGESTED_MODELS[provider][model]).toMatchObject({name, contextWindow});
+
+    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider,
+      model,
+      apiToken: "direct-api-token",
+    }, INITIATOR);
+    const upstream = provider === "anthropic" ? ANTHROPIC_MODELS[model] : OPENAI_MODELS[model];
+    expect(upstream).toBeDefined();
+    expect(handle.model).toMatchObject({
+      id: model,
+      name,
+      contextWindow,
+      maxTokens: 128_000,
+      cost: upstream.cost,
+      compat: upstream.compat,
+      thinkingLevelMap: upstream.thinkingLevelMap,
+    });
+    expect(handle.model.compat).toMatchObject(provider === "anthropic"
+      ? { forceAdaptiveThinking: true }
+      : { supportsExplicitPromptCacheMode: true });
+  });
+
+  it.each(["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"])(
+      "keeps quick requests valid for %s", async (model) => {
+    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider: "anthropic",
+      model,
+      apiToken: "direct-api-token",
+    }, INITIATOR);
+
+    const request = await captureRequest(handle, { thinking: false });
+    const body = JSON.parse(request.body) as Record<string, unknown>;
+    expect(body.model).toBe(model);
+    expect(body.max_tokens).toBe(128_000);
+    if (handle.model.compat?.supportsMidConvoEffort) {
+      // Managed-effort models require adaptive thinking even for one-shot quick calls; keep
+      // their active effort low instead of silently sending the provider's high-effort default.
+      expect(body).toMatchObject({ thinking: { type: "adaptive" } });
+      expect(body.messages).toContainEqual(expect.objectContaining({
+        role: "system", output_config: { effort: "low" },
+      }));
+    } else {
+      expect(body).not.toHaveProperty("thinking");
+    }
+  });
+
+  // pi maps these models' "off" thinking level to nothing, since they can't turn reasoning off.
+  it.each(["gpt-6-astra", "gpt-6.1-sol"])(
+      "does not try to disable reasoning for %s", async (model) => {
+    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider: "openai",
+      model,
+      apiToken: "direct-api-token",
+    }, INITIATOR);
+
+    const request = await captureRequest(handle, { thinking: false });
+    expect(JSON.parse(request.body)).not.toHaveProperty("reasoning");
+  });
+
+  it.each(["gpt-6-sol", "gpt-6-luna"])(
+      "turns off reasoning for quick %s requests", async (model) => {
+    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider: "openai", model, apiToken: "direct-api-token",
+    }, INITIATOR);
+
+    const request = await captureRequest(handle, { thinking: false });
+    expect(JSON.parse(request.body)).toMatchObject({ reasoning: { effort: "none" } });
+  });
+
   it("uses the provider defaults and the config's own credentials", async () => {
     const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
       provider: "anthropic",
@@ -415,10 +511,28 @@ describe("getModel direct routing (no gateway)", () => {
     expect(handle.aiGatewayLogRoute).toBeUndefined();
 
     const request = await captureRequest(handle);
-    expect(request.url).toBe("https://api.anthropic.com/v1/messages");
+    expect(urlWithoutQuery(request.url)).toBe("https://api.anthropic.com/v1/messages");
     expect(request.headers.get("x-api-key")).toBe("direct-api-token");
     expect(request.headers.get("cf-aig-metadata")).toBeNull();
   }, 15000);
+
+  it("sends the caller's system prompt to the provider", async () => {
+    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider: "anthropic",
+      model: "claude-sonnet-4-5",
+      apiToken: "direct-api-token",
+    }, INITIATOR);
+
+    const stream = handle.stream(handle.model, {
+      systemPrompt: "Be concise.",
+      messages: [{ role: "user", content: "Hello", timestamp: 0 }],
+    }, { fetch: fetchStub, maxRetries: 0 });
+    await stream.result();
+
+    expect(JSON.parse(capturedRequests[0].body).system).toEqual([
+      expect.objectContaining({ type: "text", text: "Be concise." }),
+    ]);
+  });
 
   it("uses the config's own account and token for direct Workers AI", async () => {
     // Outside gateway mode, Workers AI is BYOK like any other provider: credentials come from
@@ -524,6 +638,67 @@ describe("getModel direct routing (no gateway)", () => {
       model: "gpt-5.5-xhigh",
       user: "01823f64-8ac8-715e-bf17-0f92801f2af3",
     });
+  }, 15000);
+
+  it("sends the config's extra headers, overriding provider defaults", async () => {
+    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider: "openai",
+      model: "gpt-5",
+      apiToken: "direct-api-token",
+      apiUrl: "https://proxy.example.com/v1",
+      extraHeaders: { "X-Proxy-Key": "proxy-secret", Authorization: "Bearer proxy-token" },
+    }, INITIATOR);
+
+    const request = await captureRequest(handle);
+    expect(request.url).toBe("https://proxy.example.com/v1/responses");
+    expect(request.headers.get("x-proxy-key")).toBe("proxy-secret");
+    expect(request.headers.get("authorization")).toBe("Bearer proxy-token");
+  }, 15000);
+
+  it.each([
+    { provider: "anthropic", model: "claude-sonnet-4-5", keyHeader: "x-api-key" },
+    { provider: "openai", model: "gpt-5", keyHeader: "authorization" },
+  ] as const)("sends no $provider API key when the token is blank", async (
+      { provider, model, keyHeader }) => {
+    // A proxy like AI Gateway with stored keys only injects its own provider key into requests
+    // that carry none, authenticating the caller through extra headers instead. (A header pi
+    // doesn't recognize as auth, so this also covers pi's own "No API key" check.)
+    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider,
+      model,
+      apiToken: "",
+      apiUrl: "https://proxy.example.com",
+      extraHeaders: { "X-Proxy-Auth": "proxy-token" },
+    }, INITIATOR);
+
+    const request = await captureRequest(handle);
+    expect(request.headers.get(keyHeader)).toBeNull();
+    expect(request.headers.get("x-proxy-auth")).toBe("proxy-token");
+  }, 15000);
+
+  it("sends extra headers for an Ollama config without an API key", async () => {
+    // The null default that suppresses the SDK's placeholder bearer token must not also
+    // suppress an Authorization header the user configured explicitly.
+    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider: "ollama",
+      model: "qwen3:8b",
+      apiToken: "",
+      apiUrl: "http://my-ollama:11434",
+      extraHeaders: { Authorization: "Basic dXNlcjpwYXNz" },
+    }, INITIATOR);
+
+    const request = await captureRequest(handle);
+    expect(request.headers.get("authorization")).toBe("Basic dXNlcjpwYXNz");
+  }, 15000);
+
+  it("ignores extra headers when routing through AI Gateway", async () => {
+    const handle = getModel(env(), {
+      ...ANTHROPIC_CONFIG,
+      extraHeaders: { "X-Proxy-Key": "proxy-secret" },
+    }, INITIATOR);
+
+    const request = await captureRequest(handle);
+    expect(request.headers.get("x-proxy-key")).toBeNull();
   }, 15000);
 
   it("strips a legacy /api (or /v1) suffix from an Ollama base URL", () => {

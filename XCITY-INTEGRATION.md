@@ -18,7 +18,7 @@ xct-studio）。部署在 https://os.xcity.ai。
 
 新增文件不会与上游冲突，rebase 时零成本。
 
-## 允许修改的上游文件：九个接缝点
+## 允许修改的上游文件：接缝点
 
 **除下列位置外，不修改任何上游文件。** 每处改动限一个分支判断，且必须由环境变量门控 ——
 不设 `XCITY_*` 变量时，行为必须与上游完全一致。这条同时保证了随时可回滚。
@@ -26,15 +26,17 @@ xct-studio）。部署在 https://os.xcity.ai。
 | # | 接缝 | 文件 | 改法 |
 |---|---|---|---|
 | 1 | 认证 | `packages/workshop-backend/src/auth/` + 部署配置 | 不改代码。通过 `AUTH_GATEKEEPERS=xcity` 白名单启用 `gatekeeper-xcity`（上游既有机制，见 `docs/oauth-signin.md`） |
-| 2 | 模型面 | `packages/workshop-backend/src/ai-models.ts` — `getModel()` | 在 `options.userGateway` 分支**之前**插入一个 `XCITY_TOKENHUB_URL` 门控分支，复用 `getModelDirect()` 的构造方式携带 per-user key。不碰 Cloudflare AI Gateway 的任何代码路径 |
+| 2 | 模型面 | `packages/workshop-backend/src/ai-models.ts` — `getModel()` + `getModelDirect()` 的 ollama 分支 | 在 `options.userGateway` 分支**之前**插入一个 `XCITY_TOKENHUB_URL` 门控分支，复用 `getModelDirect()` 的构造方式携带 per-user key；ollama 分支只多调用 `xcity/model-plane.ts` 的 `xcityModelInput` / `xcityModelCost` / `attachXcityModelDescriptorMetadata`（无 Xcity 元数据时返回上游默认值）和 `openAiRequestUser`。不碰 Cloudflare AI Gateway 的任何代码路径。上下文窗口/输出上限**不再是接缝**：`tokenhubModelToRecord` 直接填上游自带的 `AiModelConfig.contextWindow` / `outputLimit`（2026-10 同步起），`agent-compaction.ts` 与 `modelTokenWindow()` 与上游逐字一致 |
 | 2b | quick model | `packages/workshop-backend/src/ai-gateway.ts` — `getQuickModelConfig()` | 门控下改用 tokenhub 模型替代硬编码的 Workers AI。选取顺序见 `xcity/model-plane.ts` 的 `pickQuickXcityModelConfig`：`XCITY_QUICK_MODEL` → 硬编码默认模型 `XCITY_DEFAULT_MODEL_ID`（产品要求，逐字拼写）→ 成本最低启发式 |
 | 3 | 额度门禁 | overseer 中 `checkUsageAndBalance` 的调用点 + billing UI | 按 `XCITY_WALLET_URL` 门控，二选一地调用 `packages/workshop-backend/src/xcity/usage-checker.ts`；该 checker 从持久化的 Xcity gatekeeper 连接取 GoTrue user token，查 `GET $XCITY_WALLET_URL/v1/wallet/balance`，在 `UserDurableObject` 缓存余额 5 分钟。`balance > 0` 放行且不扣费，`balance <= 0` 拦截并引导去 `XCITY_HOME_URL` 充值；拿不到 token、wallet 失败或响应异常时 fail-open（真正扣费/预算边界在 tokenhub/litellm）。例外：按次计费的 marketplace skill（tokenhub persona 响应里的可选 `pricing.kwh_per_use`）在每个用户发起、persona 生效的 turn 开始时经 `xcity/skill-billing.ts` 调 `POST $XCITY_WALLET_URL/v1/wallet/debit`（`WALLET_SERVICE_TOKEN` 鉴权，request_id 按 prompt 序号幂等）扣一次费；该扣费同样 fail-open——200 与 402 都视为终态，网络/5xx 只记日志，拦截聊天的始终是本余额门禁而非扣费本身。前端沿用 `CloudflareUsageInfo` 通道的可选 `billingMode: "xcity"` 字段显示 KWH（credits / 100）并隐藏 Cloudflare 文案 |
 | 4 | Gadget 能力 | `packages/gatekeeper-mcp-portal/` | 转发用户的 tokenhub bearer；其余能力走新增的 `gatekeeper-xcity` |
 | 5 | 本地开发 | `scripts/run-dev-server.ts` — `SHARED_GATEKEEPER_CREDS`（2026-08 同步前在 `run-dev-server.js`） | 加一行 `"gatekeeper-xcity": { id: "XCITY_CLIENT_ID", secret: "XCITY_CLIENT_SECRET" }`。仅影响本地 dev，不影响生产 |
-| 6 | 登录后置 | `packages/workshop-backend/src/auth/login-flow.ts` / `server.ts` | Xcity 登录成功后把 GoTrue `sub` 存进 UserDurableObject（`setXcityIdentity`），并仿照 Cloudflare 登录计费路径请求 full scope、调用 `linkConnectedAccountFromLogin` 持久化 gatekeeper 连接，供余额门禁反复获取新鲜 GoTrue access token。接缝 1 说"不改代码"，但铸 per-user litellm key和余额门禁都必须有用户身份/连接，且这里是自然落点。改动限于 `vendorId === XCITY_VENDOR_ID` 分支，与既有的 Cloudflare 分支并列 |
+| 6 | 登录后置 | `packages/workshop-backend/src/auth/login-flow.ts` / `server.ts` | Xcity 与 Cloudflare 共用同一个"登录即链接账户"分支（请求 full scope、`linkConnectedAccountFromLogin` + 上游的 `PendingLogin.link`，使过期通知/重连能找到用户 DO），之后调用 `xcity/login.ts` 的 `completeXcityLogin` 把 GoTrue `sub` 存进 UserDurableObject（`setXcityIdentity`）并预热模型面，供余额门禁反复获取新鲜 GoTrue access token。接缝 1 说"不改代码"，但铸 per-user litellm key和余额门禁都必须有用户身份/连接，且这里是自然落点。改动限于 `vendorId === XCITY_VENDOR_ID` 分支，与既有的 Cloudflare 分支并列 |
 | 7 | 附件能力 | `chat-attachment-validation.ts` / `chat-attachment-pdf.ts` / `overseer.ts` 的调用点 | 把完整 `AiModelConfig` 而非仅 `provider` 传下去，让 tokenhub 的 per-model `vision` / `pdf_input` 能力生效。无 Xcity 元数据时逐字回落原有的 `ATTACHMENT_SUPPORT_BY_PROVIDER` 表 |
-| 8 | Agent Marketplace Persona | `packages/workshop-shared/src/api.ts` / `workshop-backend/src/{deployment-config.ts,server.ts,user.ts,overseer.ts,agent.ts}` / `workshop-frontend/src/{ChatInterface.tsx,routes/index.tsx,components/chat/XcityAgentPicker.tsx}` | 按 `XCITY_HOME_URL` + model-plane 配置门控，新增 authenticated catalog/persona-status RPC 与 `ServerConfig.xcityAgentMarketplaceEnabled`；catalog/persona 获取实现只放在 `workshop-backend/src/xcity/`。用户当前选择存在 User DO，chat 创建时把已校验 slug 的 persona snapshot 写入 `chatContext.xcityAgent` 和 metadata，普通 coding agent 在 system prompt slot 0 注入 persona；spawned agent 不继承。前端入口贴近 composer model picker，支持搜索/category 过滤和 `/?agent=<slug>` 深链校验 |
+| 8 | Agent Marketplace Persona | `packages/workshop-shared/src/api.ts` / `workshop-backend/src/{deployment-config.ts,server.ts,user.ts,overseer.ts,agent.ts}` / `workshop-frontend/src/{ChatInterface.tsx,features/chat/composer/ChatComposer.tsx,routes/index.tsx,components/chat/XcityAgentPicker.tsx}` | 按 `XCITY_HOME_URL` + model-plane 配置门控，新增 authenticated catalog/persona-status RPC 与 `ServerConfig.xcityAgentMarketplaceEnabled`；catalog/persona 获取实现只放在 `workshop-backend/src/xcity/`。用户当前选择存在 User DO，chat 创建时把已校验 slug 的 persona snapshot 写入 `chatContext.xcityAgent` 和 metadata，普通 coding agent 在 system prompt slot 0 的末尾（上游的 communication guidance 与部署 instructions 之后）注入 persona，格式化函数在 `xcity/agent-persona.ts`；spawned agent 不继承。前端入口贴近 composer model picker，支持搜索/category 过滤和 `/?agent=<slug>` 深链校验 |
 | 9 | 限流提示 | `packages/workshop-backend/src/overseer.ts` — agent turn 的 `catch` | 一行调用 `xcity/tokenhub-errors.ts` 的 `translateXcityModelError`：仅当 model-plane 已配置且模型带 Xcity 元数据时，把 LiteLLM 429 / `throttling_error` 改写成可读的一行提示（套餐限额、重置倒计时、`XCITY_HOME_URL` 升级指引），不含 key；详情以 `xcity.tokenhub.throttled` 记日志。其余情况原样返回同一个 error 对象 |
+| 10 | 品牌文案 | 12 个 `packages/gatekeeper-<vendor>/src/<vendor>.ts`（cloudflare / confluence / email / github / google / homeassistant / linear / notion / slack / spotify / supabase / zoominfo）、`mcp-shared/src/endpoint.ts`、`workshop-shared/src/api.ts` 的 `DEFAULT_SITE_NAME`、前端 `XcityMark` 等 | 无门控的纯文案替换 "Cloudflare OS" → "Xcity OS"。上游 #464/#473 把连接完成页换成了 `@gadgets/gatekeeper-kit/connect-pages` 的 handoff 页，该页**不含品牌文案**，所以 gatekeeper-kit 不需要改；剩余品牌字符串（"链接已过期"页、`describe()` 的 description、OAuth 失败提示）仍分散在各 vendor 文件里。同步时对这 12 个文件一律取上游版本，再执行 `sed -i 's/Cloudflare OS/Xcity OS/g'`；`workshop-shared/src/gatekeeper.ts` 里两处注释保留原文 |
+| 11 | AI Providers 页 | `packages/workshop-frontend/src/routes/providers.tsx` | 仅在 `getXcityProviderInfo()` 非空时渲染 `src/XcityProviderCard.tsx`（卡片 + 逐跳诊断）与 `XcityAddModelModal`，tokenhub 行隐藏上游的 Edit/Clone/Delete 菜单。注：行内 "quick model" → "default model" 文案替换目前**未门控**（同步前即如此），属于已知偏差 |
 
 **已知的结构性取舍**：目录为空或不可用时，模型面会就地合成一条 `XCITY_DEFAULT_MODEL_ID` 记录
 （`synthesizeXcityDefaultModelRecord`，标记 `xcity.synthesizedFallback`），让用户至少有一个可聊的模型。
@@ -113,6 +115,13 @@ git rebase upstream/main        # 冲突应该只可能出现在上表接缝点
   `gatekeeper-xcity` 接入上游 Vite+ 模式（`vite.config.ts` 复用
   `scripts/gatekeeper-configurator-vite-config.ts`，依赖改用 pnpm catalog，capnweb 0.8→0.12）。
   建议同步频率保持每 1–2 周一次，避免再次积累大分叉。
+- 2026-10-01：merge `upstream/main`（ae35bb0，135 提交，含 gatekeeper-kit、connect handoff #464/#473、
+  action descriptions #541/#565、git cache、`backend-utils` → `observability` 改名、`cloudflare.config.ts`
+  生成 wrangler 配置）。27 个冲突文件：12 个 vendor gatekeeper 取上游后重放品牌文案；其余均在接缝点内。
+  借机把接缝收窄：token 上限改走上游 `AiModelConfig.contextWindow/outputLimit`、persona 格式化挪进
+  `xcity/agent-persona.ts`、Xcity 登录后置挪进 `xcity/login.ts`、Providers 卡片挪进 `XcityProviderCard.tsx`。
+  `gatekeeper-xcity` 改走上游 connect handoff：完成页渲染 `connectHandoffPageHtml`，重连先
+  `stageCredentials` 再 `reconnectComplete`，由 `commitReconnect` 生效。
 
 ## 部署
 

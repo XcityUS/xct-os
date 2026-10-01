@@ -100,8 +100,19 @@ describe("compaction trigger", () => {
 
     // Anthropic publishes an input-only window, so withholding anything would waste it.
     expect(getModelTokenLimits({
-      provider: "anthropic", model: "claude-opus-5", apiToken: "",
+      provider: "anthropic", model: "claude-opus-5-5", apiToken: "",
     })).toEqual({inputBudget: 1_000_000, maxOutputTokens: undefined});
+  });
+
+  it("uses the suggested 272K compaction budget for GPT-5.6 and GPT-6", () => {
+    for (let model of ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra"]) {
+      expect(getModelTokenLimits({provider: "openai", model, apiToken: ""}))
+          .toEqual({inputBudget: 272_000, maxOutputTokens: 128_000});
+    }
+    for (let model of ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-6-astra"]) {
+      expect(getModelTokenLimits({provider: "openai", model, apiToken: ""}))
+          .toEqual({inputBudget: 272_000, maxOutputTokens: 128_000});
+    }
   });
 
   // Workers AI rejects a request whose prompt and response cap together exceed the window, so a
@@ -130,6 +141,19 @@ describe("compaction trigger", () => {
 
     expect(getModelTokenLimits(record.config))
         .toEqual({inputBudget: 224_000, maxOutputTokens: 32_000});
+  });
+
+  it("lets the model config override the window and output limit", () => {
+    expect(getModelTokenLimits({
+      provider: "anthropic", model: "claude-unlisted", apiToken: "",
+      contextWindow: 1_000_000, outputLimit: 64_000,
+    })).toEqual({inputBudget: 936_000, maxOutputTokens: 64_000});
+
+    // An override beats the model table, too.
+    expect(getModelTokenLimits({
+      provider: "cloudflare", model: "@cf/moonshotai/kimi-k2.7-code", apiToken: "",
+      outputLimit: 16_384,
+    })).toEqual({inputBudget: 245_760, maxOutputTokens: 16_384});
   });
 
   it("recognizes /compact as the newest message, and only there", () => {
@@ -377,6 +401,23 @@ describe("compaction checkpoint state", () => {
     expect(state.proposedChange).toBeUndefined();
     // It still counts as a batch, so change IDs stay sequential across the boundary.
     expect(state.nextChangeId).toBe(1);
+  });
+
+  // A delivered call's arguments stay reachable under the name stamped on its message; a message
+  // from before calls were durable carries no name, and its arguments are gone.
+  it("binds a delivered call's arguments by the name stamped on it, and a legacy call not at all",
+      () => {
+    let state = buildState([
+      record(0, agent, {
+        type: "agentCallback", methodName: "run", argsSummary: "[0]: 1", bindingName: "run_ARGS",
+      }),
+      record(1, agent, {type: "agentCallback", methodName: "run", argsSummary: "[0]: 2"}),
+    ], 2);
+
+    expect(state.chatBindings).toEqual([
+      ["APP", {type: "workpiece", id: 1}],
+      ["run_ARGS", {type: "value", messageSequence: 0}],
+    ]);
   });
 
   it("carries a previous checkpoint's proposed state forward", () => {

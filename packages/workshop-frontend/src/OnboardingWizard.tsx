@@ -34,6 +34,7 @@ import SiteLogo from './components/SiteLogo'
 import XcityMark from './components/XcityMark'
 import { useDocumentTitle } from './useDocumentTitle'
 import { AccountsSubscriberAdapter } from './accountsSubscriber'
+import { openConnectWindow } from './connectHandoff'
 
 // ─── constants ──────────────────────────────────────────────────────────────────
 
@@ -259,8 +260,7 @@ export default function OnboardingWizard({
   const handleConnect = async (vendorId: string) => {
     setConnectingVendorId(vendorId)
     try {
-      const { url } = await authenticatedApi.connectAccount(vendorId)
-      window.open(url, '_blank', 'noopener,noreferrer')
+      openConnectWindow(await authenticatedApi.connectAccount(vendorId))
     } catch (err) {
       console.error('Failed to start connection:', err)
       toasts.add({ title: 'Failed to start connection', variant: 'error' })

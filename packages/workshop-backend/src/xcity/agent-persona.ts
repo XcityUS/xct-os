@@ -16,6 +16,11 @@ const PERSONA_CACHE_MS = 30 * 60 * 1000;
 const SKILL_INDEX_PAGE_SIZE = 200;
 // Backstop against an unbounded cursor walk if the gateway ever stops advancing.
 const SKILL_INDEX_MAX_PAGES = 25;
+// How long a failed index fetch is remembered before the next caller may try again. One
+// availability sweep resolves hundreds of slugs, and without this each would refetch the index.
+const SKILL_INDEX_FAILURE_MS = 60 * 1000;
+// A rejected key does not become valid by itself; a re-minted key is a new cache key anyway.
+const SKILL_INDEX_AUTH_FAILURE_MS = 5 * 60 * 1000;
 
 /**
  * What tokenhub knows about a marketplace persona: the system prompt text (null when the skill
@@ -38,8 +43,14 @@ type SkillIndexEntry = {
   bySlug: Map<string, string>;
 };
 
+type SkillIndexResult = { bySlug: Map<string, string> } | { retryAfterMs: number };
+
 let personaCache = new Map<string, PersonaCacheEntry>();
 let skillIndexCache = new Map<string, SkillIndexEntry>();
+// Keyed by skillIndexAttemptKey (tokenhub + caller's key), never by tokenhub alone: one user's
+// rejected key must not fail, or share a fetch with, another user's lookup.
+let skillIndexFailedUntil = new Map<string, number>();
+let skillIndexInFlight = new Map<string, Promise<Map<string, string> | null>>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -51,6 +62,18 @@ function optionalString(value: unknown): string | undefined {
 
 function cacheKey(config: XcityConfig, slug: string): string {
   return `${config.tokenhubUrl}\n${slug}`;
+}
+
+function skillIndexAttemptKey(apiKey: string, config: XcityConfig): string {
+  return `${config.tokenhubUrl}\n${apiKey}`;
+}
+
+function skillIndexFailure(status?: number): { retryAfterMs: number } {
+  return {
+    retryAfterMs: status === 401 || status === 403
+      ? SKILL_INDEX_AUTH_FAILURE_MS
+      : SKILL_INDEX_FAILURE_MS,
+  };
 }
 
 function parsePositiveNumber(value: unknown): number | undefined {
@@ -77,7 +100,7 @@ function parsePersona(body: unknown): XcityAgentPersonaDetails {
 // is the only way back from a slug to the row. The listing returns whole rows including the
 // prompt text, but we keep just the ids: a user reads one persona per chat, and holding every
 // persona in memory to serve one of them is the wrong trade.
-async function fetchSkillIndex(apiKey: string, config: XcityConfig): Promise<Map<string, string> | null> {
+async function fetchSkillIndex(apiKey: string, config: XcityConfig): Promise<SkillIndexResult> {
   let bySlug = new Map<string, string>();
   let cursor: string | undefined;
 
@@ -96,7 +119,7 @@ async function fetchSkillIndex(apiKey: string, config: XcityConfig): Promise<Map
       logger.warn("xcity skill index request failed", {
         event: "xcity.agent.persona.index.failed", error,
       });
-      return null;
+      return skillIndexFailure();
     }
     if (!response.ok) {
       response.body?.cancel();
@@ -104,7 +127,7 @@ async function fetchSkillIndex(apiKey: string, config: XcityConfig): Promise<Map
         event: "xcity.agent.persona.index.failed",
         status: response.status, statusText: response.statusText,
       });
-      return null;
+      return skillIndexFailure(response.status);
     }
 
     let body: unknown;
@@ -114,9 +137,9 @@ async function fetchSkillIndex(apiKey: string, config: XcityConfig): Promise<Map
       logger.warn("xcity skill index response could not be read", {
         event: "xcity.agent.persona.index.malformed", error,
       });
-      return null;
+      return skillIndexFailure();
     }
-    if (!isRecord(body) || !Array.isArray(body.data)) return null;
+    if (!isRecord(body) || !Array.isArray(body.data)) return skillIndexFailure();
 
     for (let row of body.data) {
       if (!isRecord(row)) continue;
@@ -129,19 +152,43 @@ async function fetchSkillIndex(apiKey: string, config: XcityConfig): Promise<Map
     }
 
     cursor = optionalString(body.next_cursor);
-    if (body.has_more !== true || !cursor) return bySlug;
+    if (body.has_more !== true || !cursor) return { bySlug };
   }
 
   logger.warn("xcity skill index pagination did not terminate", {
     event: "xcity.agent.persona.index.truncated",
   });
-  return bySlug;
+  return { bySlug };
+}
+
+// Fetch the index at most once per key at a time, and not at all while a recent failure for that
+// key is remembered: concurrent callers share the pending fetch, later ones get null for free.
+function loadSkillIndex(apiKey: string, config: XcityConfig): Promise<Map<string, string> | null> {
+  let key = skillIndexAttemptKey(apiKey, config);
+  let failedUntil = skillIndexFailedUntil.get(key);
+  if (failedUntil !== undefined && Date.now() < failedUntil) return Promise.resolve(null);
+
+  let pending = skillIndexInFlight.get(key);
+  if (pending) return pending;
+  pending = fetchSkillIndex(apiKey, config).then(result => {
+    if ("bySlug" in result) return result.bySlug;
+    let now = Date.now();
+    for (let [other, until] of skillIndexFailedUntil) {
+      if (until <= now) skillIndexFailedUntil.delete(other);
+    }
+    skillIndexFailedUntil.set(key, now + result.retryAfterMs);
+    return null;
+  }).finally(() => {
+    skillIndexInFlight.delete(key);
+  });
+  skillIndexInFlight.set(key, pending);
+  return pending;
 }
 
 async function resolveSkillId(apiKey: string, config: XcityConfig, slug: string): Promise<string | null> {
   let cached = skillIndexCache.get(config.tokenhubUrl);
   if (!cached || Date.now() - cached.fetchedAt >= PERSONA_CACHE_MS) {
-    let bySlug = await fetchSkillIndex(apiKey, config);
+    let bySlug = await loadSkillIndex(apiKey, config);
     if (!bySlug) return null;
     cached = { fetchedAt: Date.now(), bySlug };
     skillIndexCache.set(config.tokenhubUrl, cached);
@@ -279,6 +326,8 @@ export async function getXcityAgentPersona(
 export function clearXcityAgentPersonaCacheForTests(): void {
   personaCache = new Map();
   skillIndexCache = new Map();
+  skillIndexFailedUntil = new Map();
+  skillIndexInFlight = new Map();
 }
 
 function escapeXmlText(text: string): string {

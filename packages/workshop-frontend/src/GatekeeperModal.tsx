@@ -371,8 +371,9 @@ export default function GatekeeperModal({
 
     Promise.all([
       authenticatedApi.listModels(),
-      // The default model set on /providers; older backends may not implement it.
-      authenticatedApi.getQuickModel().catch(() => null),
+      // The default model set on /providers; older backends (and API stubs without the method)
+      // may not implement it, so a synchronous throw falls back like a rejection.
+      Promise.resolve().then(() => authenticatedApi.getQuickModel()).catch(() => null),
     ]).then(([models, defaultModelId]) => {
       if (cancelled) return
       setAvailableModels(models)

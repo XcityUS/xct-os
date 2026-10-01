@@ -504,11 +504,15 @@ export const ChatComposer = ({
       const { message, capsules: capsuleSpecifiers, formats: formatRefs } =
         submissionResult.submission;
 
+      // The Xcity agent slug rides along only when the picker is shown, so a non-Xcity send calls
+      // onSend with exactly upstream's arguments.
+      const xcityAgentArg: [string | null] | [] =
+        onXcityAgentChange ? [selectedXcityAgentSlug] : [];
       await onSend(message, selectedModel?.id ?? null,
           capsuleSpecifiers,
           readyAttachments.length ? readyAttachments : undefined,
           formatRefs,
-          onXcityAgentChange ? selectedXcityAgentSlug : undefined);
+          ...xcityAgentArg);
       clearSentAttachments(attachmentsSnapshot);
       if (!completeDraftSend(draftSend)) return;
       replaceComposerDocument({ text: "", capsules: [], formats: [], command: null });

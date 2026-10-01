@@ -4,7 +4,10 @@ import {
   GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, GatekeeperUserVerifier, VendorDescription,
   GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription,
   ApprovalQueue, SupportedResource, ResourceConfiguratorFrame, ResourceDescription, stripTrailingSlashes,
+  type ConnectHandoff,
 } from "@gadgets/workshop-shared/gatekeeper";
+import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
+import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import { XcityGatekeeperUser } from "@gadgets/workshop-shared/xcity-gatekeeper";
 import {
   getOAuthConfig, getAuthBaseUrl, buildAuthorizeUrl, generatePkce, exchangeCode, refreshTokens,
@@ -91,7 +94,16 @@ type StoredNonce = {
   // this lets that visit restart the authorize redirect instead of dead-ending on the "link
   // expired" page.
   initiation?: { value: string; expiresAt: number };
+  /**
+   * Set when this flow reconnects an existing account, so its tokens are staged rather than made
+   * live (see commitReconnect). The mode travels with the flow instead of living on the account:
+   * committing one reconnect while another is in flight must not change how that other flow lands.
+   */
+  reconnect?: true;
 };
+
+// The tokens an OAuth exchange produced, as written live or held in the reconnect stage.
+type XcityGrant = { refreshToken: string; accessToken: StoredAccessToken };
 
 // A cached access token plus its absolute expiry (unix ms).
 type StoredAccessToken = { token: string; expires: number };
@@ -183,12 +195,6 @@ function getXcityResources(env: Env): SupportedResource[] {
       .filter((resource): resource is SupportedResource => resource !== null);
 }
 
-const SELF_CLOSING_HTML = `<!DOCTYPE html>
-<html lang="en"><body>
-<script type="text/javascript">window.close();</script>
-<p>Authorization complete. You may close this tab and return to Xcity OS.
-</body></html>`;
-
 const INVALID_LINK_HTML = `<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><title>Authorization Link Expired</title></head>
 <body style="font-family: system-ui, sans-serif; text-align: center; padding: 3rem;">
@@ -243,10 +249,13 @@ export default {
       if (!code) return new Response("Error: no 'code' provided");
 
       const stub = ctx.exports.UserAccount.get(ctx.exports.UserAccount.idFromString(doId));
-      if (!await stub.acceptAuthCode(code, oauthNonce)) {
+      const handoff = await stub.acceptAuthCode(code, oauthNonce);
+      if (!handoff) {
         return new Response(INVALID_LINK_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
       }
-      return new Response(SELF_CLOSING_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+      // The popup lands on the Workshop's handoff page, which activates the grant (or, for a
+      // sign-in, releases the session) only when redeemed from the initiating browser.
+      return htmlResponse(connectHandoffPageHtml(handoff));
     }
     return new Response("Not Found", { status: 404 });
   },
@@ -320,12 +329,16 @@ export class UserAccount extends DurableObject<Env> {
     });
   }
 
+  /**
+   * Prepare for a reconnect flow: the next acceptAuthCode() stages the new tokens and notifies via
+   * reconnectComplete() instead of complete(); commitReconnect() makes them live.
+   */
   async prepareReconnect(initiationNonce: string) {
-    this.ctx.storage.kv.put<boolean>("reconnecting", true);
     this.ctx.storage.kv.put<StoredNonce>("nonce", {
       value: initiationNonce,
       expiresAt: Date.now() + INITIATION_NONCE_LIFETIME_MS,
       stage: "initiation",
+      reconnect: true,
     });
   }
 
@@ -352,16 +365,21 @@ export class UserAccount extends DurableObject<Env> {
       stage: "oauth",
       verifier,
       initiation,
+      reconnect: stored?.reconnect,
     });
     const scopes = this.ctx.storage.kv.get<string[]>("scopes") ?? FULL_SCOPES;
     return { oauthNonce, challenge, scopes };
   }
 
-  async acceptAuthCode(code: string, oauthNonce: string): Promise<boolean> {
+  /**
+   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on, or
+   * null when the callback's nonce doesn't match.
+   */
+  async acceptAuthCode(code: string, oauthNonce: string): Promise<ConnectHandoff | null> {
     const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
     if (!stored || stored.stage !== "oauth" || !stored.verifier ||
         Date.now() >= stored.expiresAt || !constantTimeEqual(stored.value, oauthNonce)) {
-      return false;
+      return null;
     }
     this.ctx.storage.kv.delete("nonce");
 
@@ -375,20 +393,22 @@ export class UserAccount extends DurableObject<Env> {
       throw new Error("Xcity OAuth exchange failed or returned no refresh token.");
     }
 
-    this.ctx.storage.kv.put<string>("refreshToken", tokens.refreshToken);
-    this.ctx.storage.kv.put<StoredAccessToken>("accessToken", {
-      token: tokens.accessToken,
-      expires: Date.now() + tokens.expiresIn * 1000,
-    });
-    this.ctx.storage.kv.delete("identity");
+    const grant: XcityGrant = {
+      refreshToken: tokens.refreshToken,
+      accessToken: { token: tokens.accessToken, expires: Date.now() + tokens.expiresIn * 1000 },
+    };
 
-    const reconnecting = this.ctx.storage.kv.get<boolean>("reconnecting");
-    if (reconnecting) {
-      this.ctx.storage.kv.delete("reconnecting");
-      await callback.credentialsRestored();
+    let handoff: ConnectHandoff;
+    if (stored.reconnect) {
+      // The reconnect URL is a bearer capability, so the new tokens are only staged until the
+      // Workshop has confirmed the browser that finished the flow is the owner's (see
+      // commitReconnect). Bound gadgets and the balance gate keep using the current tokens meanwhile.
+      const stageId = stageCredentials(this.ctx.storage.kv, grant, Date.now());
+      handoff = await callback.reconnectComplete(stageId);
     } else {
+      this.#writeGrant(grant);
       try {
-        await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props: { userObjectId: this.ctx.id.toString() } }));
+        handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props: { userObjectId: this.ctx.id.toString() } }));
       } catch (err) {
         this.ctx.storage.kv.delete("refreshToken");
         throw err;
@@ -400,7 +420,20 @@ export class UserAccount extends DurableObject<Env> {
         this.ctx.storage.setAlarm(Date.now() + 2 * 60 * 1000);
       }
     }
-    return true;
+    return handoff;
+  }
+
+  /** Makes the tokens staged under `stageId` live; see GatekeeperUser.commitReconnect. */
+  async commitReconnect(stageId: string): Promise<void> {
+    const grant = commitStagedCredentials<XcityGrant>(this.ctx.storage.kv, Date.now(), stageId);
+    if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    this.#writeGrant(grant);
+  }
+
+  #writeGrant(grant: XcityGrant) {
+    this.ctx.storage.kv.put<string>("refreshToken", grant.refreshToken);
+    this.ctx.storage.kv.put<StoredAccessToken>("accessToken", grant.accessToken);
+    this.ctx.storage.kv.delete("identity");
   }
 
   hasRefreshToken() {
@@ -653,6 +686,10 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     const initiationNonce = generateNonce();
     await this.#account().prepareReconnect(initiationNonce);
     return { url: `${getBaseUrl(this.env)}/${this.ctx.props.userObjectId}/${initiationNonce}` };
+  }
+
+  async commitReconnect(stageId: string): Promise<void> {
+    await this.#account().commitReconnect(stageId);
   }
 
   /**

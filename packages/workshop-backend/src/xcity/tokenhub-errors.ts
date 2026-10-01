@@ -9,7 +9,7 @@
 // it, logs the structured detail (never the key), and hands the overseer a plain-text message.
 
 import type { AiModelConfig } from "@gadgets/workshop-shared/api";
-import { createLogger } from "@gadgets/backend-utils/logger";
+import { createLogger } from "@gadgets/observability/logger";
 import { AgentTurnError } from "../ai-invoke.js";
 import { getXcityConfig, getXcityHomeUrl } from "./config.js";
 import { getXcityModelMetadata } from "./model-plane.js";

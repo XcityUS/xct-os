@@ -31,11 +31,12 @@
 //   by in-flight chats -- and are cheap. If GC is ever needed, the roots are enumerable: gadget
 //   records, blueprint gadget records, live chats' pinned commits, the pin declarations in chat
 //   logs and compaction checkpoints (closed epochs are reconstructed from them), and the
-//   `observedCommit` stamps on chats' readFile tool calls (which nothing else roots -- a future
-//   GC must either root them or the agent's elision path must tolerate a missing commit by
-//   eliding unconditionally).
+//   `observedOid` blob stamps (and legacy `observedCommit` stamps) on chats' readFile tool calls
+//   (which nothing else roots -- a future GC must either root them or the agent's replay must
+//   tolerate a missing object by eliding the read).
 
 import {
+  hashBlob,
   readBlob,
   readCommit,
   readTree,
@@ -43,6 +44,7 @@ import {
   writeCommit,
   writeTree,
   log,
+  type CommitObject,
   type PromiseFsClient,
   type TreeEntry,
 } from "isomorphic-git";
@@ -263,63 +265,6 @@ export class GitStore {
   }
 
   /**
-   * Reads a commit's tree as a `path -> blob oid` map (flattened like `readCommitFiles`, but
-   * without touching blob content). Content addressing makes this the cheap way to ask which
-   * files differ between two commits -- see `changedPaths`.
-   */
-  async commitFileOids(oid: string): Promise<Map<string, string>> {
-    let { commit } = await readCommit({ fs: this.#fs, gitdir: GITDIR, oid, cache: this.#cache });
-    let out = new Map<string, string>();
-    await this.#collectTreeOids(commit.tree, "", out);
-    return out;
-  }
-
-  /**
-   * The set of file paths whose content differs between two commits' trees (added, removed, or
-   * changed), compared by oid -- equal subtrees short-circuit without descending, and no blob
-   * content is ever read. `undefined` on either side means an empty tree, so a one-sided call
-   * lists a commit's whole tree.
-   */
-  async changedPaths(a: string | undefined, b: string | undefined): Promise<Set<string>> {
-    let changed = new Set<string>();
-    if (a === b) return changed;
-    let treeOf = async (oid: string | undefined) => oid === undefined ? undefined
-        : (await readCommit({ fs: this.#fs, gitdir: GITDIR, oid, cache: this.#cache }))
-            .commit.tree;
-    await this.#diffTrees(await treeOf(a), await treeOf(b), "", changed);
-    return changed;
-  }
-
-  // Accumulates the paths that differ between two trees (either may be absent = empty) into
-  // `out`. Entries are matched by name; a name that is a blob on one side and a tree on the
-  // other contributes every path under both sides.
-  async #diffTrees(aOid: string | undefined, bOid: string | undefined, prefix: string,
-                   out: Set<string>): Promise<void> {
-    if (aOid === bOid) return;
-    let entriesOf = async (oid: string | undefined) => {
-      if (oid === undefined) return new Map<string, TreeEntry>();
-      let { tree } = await readTree({ fs: this.#fs, gitdir: GITDIR, oid, cache: this.#cache });
-      return new Map(tree.map(entry => [entry.path, entry]));
-    };
-    let aEntries = await entriesOf(aOid);
-    let bEntries = await entriesOf(bOid);
-    for (let name of new Set([...aEntries.keys(), ...bEntries.keys()])) {
-      let a = aEntries.get(name);
-      let b = bEntries.get(name);
-      if (a?.oid === b?.oid && a?.type === b?.type) continue;
-      let path = prefix + name;
-      if (a?.type === "tree" || b?.type === "tree") {
-        // Descend the tree side(s); a blob opposite a tree is one more difference at `path`.
-        await this.#diffTrees(a?.type === "tree" ? a.oid : undefined,
-                              b?.type === "tree" ? b.oid : undefined, `${path}/`, out);
-        if (a?.type === "blob" || b?.type === "blob") out.add(path);
-      } else {
-        out.add(path);
-      }
-    }
-  }
-
-  /**
    * Walks the commit graph from `oid` (the commit itself first, then its ancestry), returning up
    * to `depth` commits' metadata. Traversal order for merge commits follows git log's default
    * (reverse chronological).
@@ -341,6 +286,125 @@ export class GitStore {
     }));
   }
 
+  /** The tree oid of a commit. */
+  async commitTree(oid: string): Promise<string> {
+    return (await this.readCommitObject(oid)).tree;
+  }
+
+  /**
+   * Reads a commit object's parsed headers and message. Unlike `readCommitLog()`, carries the
+   * committer and timezone offsets, and never touches any other object.
+   */
+  async readCommitObject(oid: string): Promise<CommitObject> {
+    let { commit } = await readCommit({ fs: this.#fs, gitdir: GITDIR, oid, cache: this.#cache });
+    return commit;
+  }
+
+  /**
+   * Writes a commit whose tree is `treeBase`'s tree with `changes` applied (`null` = delete),
+   * returning the commit oid. `treeBase` (a commit oid) and `parents` are deliberately separate:
+   * an explicit worktree commit builds its tree from the chat pin's base but parents on the last
+   * explicit head (squash semantics).
+   *
+   * The tree is rebuilt top-down along changed paths only, so committing at repo scale never
+   * materializes the full file map: every untouched entry -- of *any* mode, symlinks and
+   * gitlinks included -- is copied through with mode and oid verbatim, and equal subtrees reuse
+   * their base oids. A changed file keeps its base entry's mode (editing an executable must not
+   * clear 100755); only genuinely new files default to 100644. A change that lands on a
+   * non-regular-file entry (a directory, symlink, or gitlink) is rejected -- callers gate those
+   * paths with descriptive errors before committing. Directories emptied by deletions are
+   * pruned, as git requires.
+   */
+  async writeChangedFilesAsCommit(
+      changes: ReadonlyMap<string, string | null>,
+      options: WriteCommitOptions & { treeBase: string }): Promise<string> {
+    return await this.writeCommitForTree(
+        await this.writeChangedTree(options.treeBase, changes), options);
+  }
+
+  /**
+   * The tree half of `writeChangedFilesAsCommit` (same rebuild rules; see there): writes the
+   * tree objects for `treeBase`'s tree with `changes` applied and returns the new root tree oid
+   * (the empty tree when everything was deleted), without writing a commit. Exposed separately
+   * so the accept-time epoch reset can compare the flattened tree against the pin base's and
+   * head's trees -- deciding "clean", "reuse headCommit", or "auto-commit" -- before deciding
+   * to write any commit at all.
+   */
+  async writeChangedTree(
+      treeBase: string, changes: ReadonlyMap<string, string | null>): Promise<string> {
+    let baseTree = await this.commitTree(treeBase);
+    // No changes: the base's tree, by oid. Rebuilding reads each tree it descends into, and this
+    // store holds only what has been pulled -- a worktree committed untouched may never have
+    // needed its base's root tree locally (a commit object can arrive alone, e.g. via
+    // env.GIT.readCommit()).
+    if (changes.size === 0) return baseTree;
+    return await this.#rebuildTree(baseTree, buildChangeNode(changes), "")
+        ?? await writeTree({ fs: this.#fs, gitdir: GITDIR, tree: [] });
+  }
+
+  /** The commit half of `writeChangedFilesAsCommit`: writes a commit for an existing tree oid. */
+  async writeCommitForTree(tree: string, options: WriteCommitOptions): Promise<string> {
+    let when = { timestamp: Math.floor(options.timestamp.getTime() / 1000), timezoneOffset: 0 };
+    return await writeCommit({
+      fs: this.#fs,
+      gitdir: GITDIR,
+      commit: {
+        message: options.message,
+        tree,
+        parent: [...options.parents],
+        author: { ...options.author, ...when },
+        committer: { ...(options.committer ?? options.author), ...when },
+      },
+    });
+  }
+
+  // Rebuilds one tree level for writeChangedFilesAsCommit: base entries are copied through
+  // untouched (mode + oid verbatim) except where the change node names them. Returns the new
+  // tree oid, or undefined when the resulting tree is empty (the entry is then pruned).
+  async #rebuildTree(baseTreeOid: string | undefined, node: ChangeNode, prefix: string)
+      : Promise<string | undefined> {
+    let entries = new Map<string, TreeEntry>();
+    if (baseTreeOid !== undefined) {
+      let { tree } = await readTree(
+          { fs: this.#fs, gitdir: GITDIR, oid: baseTreeOid, cache: this.#cache });
+      for (let entry of tree) entries.set(entry.path, entry);
+    }
+    for (let [name, child] of node) {
+      let path = prefix + name;
+      let base = entries.get(name);
+      if (child instanceof Map) {
+        if (base !== undefined && base.type !== "tree") {
+          throw new Error(`conflicting file paths at: ${path}`);
+        }
+        let sub = await this.#rebuildTree(base?.oid, child, `${path}/`);
+        if (sub === undefined) {
+          entries.delete(name);
+        } else {
+          entries.set(name, { mode: "040000", path: name, oid: sub, type: "tree" });
+        }
+      } else if (child === null) {
+        if (base !== undefined && base.type === "tree") {
+          throw new Error(`cannot delete ${path}: it is a directory`);
+        }
+        entries.delete(name);  // deleting an absent file is a no-op
+      } else {
+        if (base !== undefined &&
+            (base.type !== "blob" || (base.mode !== "100644" && base.mode !== "100755"))) {
+          throw new Error(`cannot write ${path}: not a regular file`);
+        }
+        let oid = await writeBlob({
+          fs: this.#fs,
+          gitdir: GITDIR,
+          blob: new TextEncoder().encode(child),
+        });
+        // A changed file keeps its base entry's mode; only new files default to 100644.
+        entries.set(name, { mode: base?.mode ?? "100644", path: name, oid, type: "blob" });
+      }
+    }
+    if (entries.size === 0) return undefined;
+    return await writeTree({ fs: this.#fs, gitdir: GITDIR, tree: [...entries.values()] });
+  }
+
   async #writeTreeNode(node: TreeNode): Promise<string> {
     let entries: TreeEntry[] = [];
     for (let [name, child] of node) {
@@ -360,25 +424,6 @@ export class GitStore {
     return await writeTree({ fs: this.#fs, gitdir: GITDIR, tree: entries });
   }
 
-  // The oid-level analog of #collectTreeFiles: flattens a tree to `path -> blob oid` without
-  // reading any blob. Applies the same mode restriction, so the two views can never disagree
-  // about which paths exist.
-  async #collectTreeOids(
-      treeOid: string, prefix: string, out: Map<string, string>): Promise<void> {
-    let { tree } = await readTree(
-        { fs: this.#fs, gitdir: GITDIR, oid: treeOid, cache: this.#cache });
-    for (let entry of tree) {
-      let path = prefix + entry.path;
-      if (entry.type === "tree") {
-        await this.#collectTreeOids(entry.oid, `${path}/`, out);
-      } else if (entry.type === "blob" && (entry.mode === "100644" || entry.mode === "100755")) {
-        out.set(path, entry.oid);
-      } else {
-        throw new Error(`unsupported tree entry at ${path}: mode ${entry.mode}`);
-      }
-    }
-  }
-
   async #collectTreeFiles(
       treeOid: string, prefix: string, out: Map<string, string>): Promise<void> {
     let { tree } = await readTree(
@@ -396,6 +441,40 @@ export class GitStore {
       }
     }
   }
+}
+
+// A parsed-but-unwritten change set: new file contents (or null = delete) at the leaves,
+// touched subtrees within. The writeChangedFilesAsCommit analog of TreeNode.
+type ChangeNode = Map<string, ChangeNode | string | null>;
+
+// Converts a flat `path -> text | null` change map into nested nodes, with the same path-shape
+// validation as buildTreeNode.
+function buildChangeNode(changes: ReadonlyMap<string, string | null>): ChangeNode {
+  let root: ChangeNode = new Map();
+  for (let [path, content] of changes) {
+    let segments = path.split("/");
+    let node = root;
+    for (let [i, segment] of segments.entries()) {
+      if (segment === "" || segment === "." || segment === "..") {
+        throw new Error(`invalid file path: ${path}`);
+      }
+      let last = i === segments.length - 1;
+      let existing = node.get(segment);
+      if (last) {
+        if (existing !== undefined) throw new Error(`conflicting file paths at: ${path}`);
+        node.set(segment, content);
+      } else {
+        if (existing === undefined) {
+          existing = new Map();
+          node.set(segment, existing);
+        } else if (!(existing instanceof Map)) {
+          throw new Error(`conflicting file paths at: ${path}`);
+        }
+        node = existing;
+      }
+    }
+  }
+  return root;
 }
 
 // Converts a flat `path -> text` map into nested tree nodes, validating path shape as we go:
@@ -427,6 +506,16 @@ function buildTreeNode(files: ReadonlyMap<string, string>): TreeNode {
     }
   }
   return root;
+}
+
+/**
+ * The oid a blob holding `text` (UTF-8) has or would have -- git's content address, computed
+ * without writing anything. Equal text always yields an equal oid, so this is how content the
+ * agent knows from a chat's session is compared against a committed file without reading the
+ * committed blob (see the agent's read-before-edit stamps).
+ */
+export async function blobOid(text: string): Promise<string> {
+  return (await hashBlob({ object: new TextEncoder().encode(text) })).oid;
 }
 
 /** Compares two flattened file maps for identical content. */
@@ -576,13 +665,14 @@ function mergeText(base: string, ours: string, theirs: string, labels: MergeLabe
 
 /**
  * Derives a git commit identity from a chat author: the display name becomes the commit name,
- * and the profile ID the email. Profile IDs are typically email addresses; in username/password
- * mode they may be bare usernames, which become `<username>@localhost`. (A placeholder
- * convention until users can customize their commit identity.)
+ * and the email is the author's preferred `commitEmail` if set, else the profile ID. Profile IDs
+ * are typically email addresses; in username/password mode they may be bare usernames, which
+ * become `<username>@localhost`.
  */
 export function commitIdentityForAuthor(author: AiChatAuthorInfo): CommitIdentity {
   return {
     name: author.name,
-    email: author.id.includes("@") ? author.id : `${author.id}@localhost`,
+    email: author.commitEmail ??
+        (author.id.includes("@") ? author.id : `${author.id}@localhost`),
   };
 }

@@ -271,6 +271,17 @@ export function attachXcityModelDescriptorMetadata<T extends Model<Api>>(
   return model;
 }
 
+/**
+ * The pi input modalities for an Xcity model: images only when TokenHub declares vision or PDF
+ * input. Undefined for non-Xcity configs, whose callers keep their own default.
+ */
+export function xcityModelInput(config: AiModelConfig): ("text" | "image")[] | undefined {
+  let metadata = getXcityModelMetadata(config);
+  if (!metadata) return undefined;
+  return metadata.capabilities?.vision === true || metadata.capabilities?.pdfInput === true
+      ? ["text", "image"] : ["text"];
+}
+
 export function xcityModelCost(config: AiModelConfig) {
   let metadata = getXcityModelMetadata(config);
   if (!metadata) return undefined;
@@ -314,6 +325,10 @@ export function tokenhubModelToRecord(
     apiToken: context.apiKey,
     xcity: metadata,
   };
+  // Upstream's own per-config token-limit overrides, so compaction and the pi model descriptor
+  // size the window from the TokenHub catalog without any Xcity branch in those seams.
+  if (contextWindow !== undefined) config.contextWindow = contextWindow;
+  if (maxOutputTokens !== undefined) config.outputLimit = maxOutputTokens;
   return { profile, config };
 }
 

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { formatAgentPersona } from "../src/agent.js";
+import { formatAgentPersona } from "../src/xcity/agent-persona.js";
 import {
   clearXcityAgentCatalogCacheForTests,
   getXcityAgent,

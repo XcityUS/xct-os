@@ -280,3 +280,27 @@ export function clearXcityAgentPersonaCacheForTests(): void {
   personaCache = new Map();
   skillIndexCache = new Map();
 }
+
+function escapeXmlText(text: string): string {
+  return text.replace(/[<>&]/g, char => {
+    switch (char) {
+      case "<": return "&lt;";
+      case ">": return "&gt;";
+      case "&": return "&amp;";
+      default: return char;
+    }
+  });
+}
+
+/**
+ * Formats a marketplace persona for the coding agent's static system prompt slot (see agent.ts).
+ * Returns "" when there is no persona text, so the caller can skip it without a branch of its own.
+ */
+export function formatAgentPersona(name: string, persona: string | null | undefined): string {
+  let trimmed = persona?.trim();
+  if (!trimmed) return "";
+  return `<xcity-agent-persona>\n` +
+      `<name>${escapeXmlText(name)}</name>\n` +
+      `<instructions>\n${trimmed}\n</instructions>\n` +
+      `</xcity-agent-persona>`;
+}

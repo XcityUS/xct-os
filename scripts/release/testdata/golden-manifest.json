@@ -31,7 +31,7 @@
           "type": "secret_text"
         }
       ],
-      "compatibilityDate": "2026-02-02",
+      "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [
         "allow_irrevocable_stub_storage",
         "nodejs_als"
@@ -99,7 +99,7 @@
           "type": "secret_text"
         }
       ],
-      "compatibilityDate": "2026-02-02",
+      "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [
         "allow_irrevocable_stub_storage"
       ],
@@ -158,7 +158,7 @@
           "type": "kv_namespace"
         }
       ],
-      "compatibilityDate": "2026-02-02",
+      "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [
         "nodejs_compat",
         "allow_irrevocable_stub_storage"
@@ -203,7 +203,7 @@
     },
     "gatekeeper-email": {
       "bindings": [],
-      "compatibilityDate": "2026-02-02",
+      "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [
         "allow_irrevocable_stub_storage",
         "nodejs_als"
@@ -256,7 +256,7 @@
           "type": "secret_text"
         }
       ],
-      "compatibilityDate": "2026-02-02",
+      "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [
         "allow_irrevocable_stub_storage",
         "nodejs_als"
@@ -327,7 +327,7 @@
           "type": "secret_text"
         }
       ],
-      "compatibilityDate": "2026-02-02",
+      "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [
         "allow_irrevocable_stub_storage",
         "nodejs_als"
@@ -341,7 +341,8 @@
           "redirectUriTemplate": "{PUBLIC_BASE_URL}/gatekeeper/google/oauth",
           "setupSteps": [
             "In the Google Cloud Console, create a project (or pick an existing one).",
-            "Enable the APIs gadgets should reach: Gmail, Google Docs, Google Drive, Google Sheets, Google Calendar, and BigQuery (APIs & Services > Library).",
+            "Enable the APIs gadgets should reach: Gmail, Google Docs, Google Drive, Google Sheets, Google Calendar, Google Chat, People (for Chat DM names), and BigQuery (APIs & Services > Library).",
+            "For Chat, open the Google Chat API's Configuration tab, set an app name, avatar URL and description, turn off interactive features, and save. Without it Chat reads work but every send, edit and reaction fails.",
             "Configure the OAuth consent screen (External) and add yourself as a test user while the app is unverified.",
             "Create an OAuth client ID of type \"Web application\" and add the redirect URI below.",
             "Copy the client ID and client secret here."
@@ -388,6 +389,12 @@
             "GoogleDocGatekeeperImpl"
           ],
           "tag": "v4"
+        },
+        {
+          "new_sqlite_classes": [
+            "GoogleChatGatekeeperImpl"
+          ],
+          "tag": "v5"
         }
       ],
       "modules": [
@@ -420,7 +427,7 @@
     },
     "gatekeeper-homeassistant": {
       "bindings": [],
-      "compatibilityDate": "2026-02-02",
+      "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [
         "allow_irrevocable_stub_storage"
       ],
@@ -454,6 +461,7 @@
         }
       },
       "shortName": "homeassistant",
+      "singleton": true,
       "vars": {
         "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/homeassistant"
       }
@@ -471,7 +479,7 @@
           "type": "secret_text"
         }
       ],
-      "compatibilityDate": "2026-02-02",
+      "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [
         "allow_irrevocable_stub_storage",
         "nodejs_als"
@@ -523,7 +531,7 @@
     },
     "gatekeeper-mcp": {
       "bindings": [],
-      "compatibilityDate": "2026-02-02",
+      "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [
         "allow_irrevocable_stub_storage",
         "global_fetch_strictly_public"
@@ -558,6 +566,7 @@
         }
       },
       "shortName": "mcp",
+      "singleton": true,
       "vars": {
         "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/mcp",
         "MCP_ALLOW_INSECURE": "false"
@@ -565,7 +574,7 @@
     },
     "gatekeeper-mcp-portal": {
       "bindings": [],
-      "compatibilityDate": "2026-02-02",
+      "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [
         "allow_irrevocable_stub_storage",
         "global_fetch_strictly_public"
@@ -599,9 +608,10 @@
           "invocation_logs": false
         }
       },
-      "shortName": "mcp-portal",
+      "shortName": "mcpportal",
+      "singleton": true,
       "vars": {
-        "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/mcp-portal",
+        "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/mcpportal",
         "MCP_ALLOW_INSECURE": "false"
       }
     },
@@ -618,7 +628,7 @@
           "type": "secret_text"
         }
       ],
-      "compatibilityDate": "2026-02-02",
+      "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [
         "allow_irrevocable_stub_storage"
       ],
@@ -678,7 +688,7 @@
     },
     "gatekeeper-scheduler": {
       "bindings": [],
-      "compatibilityDate": "2026-02-02",
+      "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [
         "allow_irrevocable_stub_storage",
         "nodejs_als"
@@ -732,7 +742,7 @@
           "type": "secret_text"
         }
       ],
-      "compatibilityDate": "2026-02-02",
+      "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [
         "allow_irrevocable_stub_storage"
       ],
@@ -800,7 +810,7 @@
           "type": "secret_text"
         }
       ],
-      "compatibilityDate": "2026-02-02",
+      "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [
         "allow_irrevocable_stub_storage"
       ],
@@ -862,7 +872,7 @@
           "type": "secret_text"
         }
       ],
-      "compatibilityDate": "2026-02-02",
+      "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [
         "allow_irrevocable_stub_storage",
         "nodejs_als"
@@ -1011,7 +1021,7 @@
           "type": "secret_text"
         }
       ],
-      "compatibilityDate": "2026-02-02",
+      "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [
         "allow_irrevocable_stub_storage"
       ],
@@ -1104,7 +1114,7 @@
           "type": "assets"
         }
       ],
-      "compatibilityDate": "2026-02-02",
+      "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [],
       "gatekeeperBindingExpansion": {
         "propsByPackage": {}
@@ -1161,10 +1171,9 @@
           "type": "ai"
         }
       ],
-      "compatibilityDate": "2026-02-02",
+      "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [
         "allow_irrevocable_stub_storage",
-        "enhanced_error_serialization",
         "global_fetch_strictly_public",
         "nodejs_compat"
       ],
@@ -1198,6 +1207,12 @@
             "PendingLogin"
           ],
           "tag": "v2"
+        },
+        {
+          "new_sqlite_classes": [
+            "UserDirectoryDurableObject"
+          ],
+          "tag": "v3"
         }
       ],
       "modules": [

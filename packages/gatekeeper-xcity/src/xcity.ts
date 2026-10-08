@@ -6,6 +6,7 @@ import {
   ApprovalQueue, SupportedResource, ResourceConfiguratorFrame, ResourceDescription, stripTrailingSlashes,
   type ConnectHandoff,
 } from "@gadgets/workshop-shared/gatekeeper";
+import { haltIfAlarmsDisabled } from "@gadgets/gatekeeper-kit/alarm-guard";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import { XcityGatekeeperUser } from "@gadgets/workshop-shared/xcity-gatekeeper";
@@ -522,6 +523,7 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    if (await haltIfAlarmsDisabled(this.ctx, this.env, "connect-timeout")) return;
     // Drop the account if the flow never completed, or if this was a transient auth-only sign-in
     // grant (used once to read the email for login).
     if (!this.hasRefreshToken() || this.ctx.storage.kv.get<boolean>("ephemeral")) {
@@ -1152,6 +1154,7 @@ export class XcityMediaGatekeeperImpl extends DurableObject<Env, XcityMediaGatek
   async removeObserver(_id: string): Promise<void> {}
 
   async alarm(): Promise<void> {
+    if (await haltIfAlarmsDisabled(this.ctx, this.env, "xcity-media-poll")) return;
     let stillPolling = false;
     for (const [, flight] of this.ctx.storage.kv.list<StoredVideoFlight>({ prefix: "media:video:" })) {
       if (await this.#pollVideoFlight(flight)) stillPolling = true;

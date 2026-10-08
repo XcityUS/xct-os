@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { RpcStub, RpcTarget } from "cloudflare:workers";
+import { alarmsDisabled, guardedAlarm } from "@gadgets/observability/alarm-guard";
 import { reportIssue } from "@gadgets/observability/error-reporting";
 import type { ApprovalQueue, HookInitiator } from "@gadgets/workshop-shared/gatekeeper";
 import {
@@ -8,6 +9,7 @@ import {
   completeRun,
   createSchedule,
   failRun,
+  quarantineRun,
   rejectRun,
   type EnabledSchedule,
   type ScheduleRegistration,
@@ -235,6 +237,13 @@ export class ScheduleDriver extends DurableObject {
   }
 
   async alarm(): Promise<void> {
+    // Backstop only: a legitimate cadence is bounded by distinct due times, not by this cap.
+    await guardedAlarm(this.ctx, {
+      key: "scheduler", disabled: alarmsDisabled(this.env), maxPerHour: 3600, deferWhenOpen: true,
+    }, () => this.#alarm());
+  }
+
+  async #alarm(): Promise<void> {
     await obsContext.with({ accountId: this.ctx.id.toString(), operation: "alarm" }, async () => {
       const startedAt = Date.now();
       try {
@@ -381,6 +390,7 @@ export class ScheduleDriver extends DurableObject {
         return await this.#deliverPrepared(prepared);
       } catch (error) {
         this.#reportDeliveryFailure(error);
+        this.#quarantine(prepared.workspaceId, prepared.scheduleId);
         return false;
       }
     });
@@ -459,6 +469,7 @@ export class ScheduleDriver extends DurableObject {
         return await this.#deliver(key);
       } catch (error) {
         this.#reportDeliveryFailure(error);
+        this.#quarantine(workspaceId, scheduleId);
         return false;
       }
     });
@@ -473,6 +484,35 @@ export class ScheduleDriver extends DurableObject {
       handled: true,
       attributes: obsContext.get(),
     });
+  }
+
+  /**
+   * Ends a row whose delivery failed unexpectedly, so it cannot stay due (or re-lease) forever
+   * and spin the alarm; see docs/alarm-audit.md (S1, S2). Best effort: never throws.
+   */
+  #quarantine(workspaceId: string, scheduleId: string): void {
+    let orphaned: StoredCapabilities | undefined;
+    try {
+      const quarantined = this.ctx.storage.transactionSync(() => {
+        if (this.#requireMetadata().revoked) return false;
+        const key = scheduleKey(workspaceId, scheduleId);
+        const stored = this.#readSchedule(key);
+        if (!stored || isTerminal(stored.state)) return false;
+        const state = quarantineRun(stored.state, Date.now());
+        this.ctx.storage.kv.put<StoredSchedule>(key, { ...stored, state });
+        orphaned = this.#takeCapabilities(state);
+        return true;
+      });
+      if (quarantined) {
+        logger.error("schedule quarantined after unexpected failure", {
+          event: "schedule.quarantined",
+        });
+      }
+    } catch (error) {
+      logger.error("schedule quarantine failed", { event: "schedule.quarantine.failed", error });
+    } finally {
+      disposeCapabilities(orphaned);
+    }
   }
 
   #prepareRun(key: string, now: number): PreparedRun | undefined {

@@ -18,6 +18,7 @@ import {
   stripTrailingSlashes,
   type ConnectHandoff,
 } from '@gadgets/workshop-shared/gatekeeper';
+import { haltIfAlarmsDisabled } from "@gadgets/gatekeeper-kit/alarm-guard";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import {
   EmailSession,
@@ -327,6 +328,7 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
+    if (await haltIfAlarmsDisabled(this.ctx, this.env, "connect-timeout")) return;
     // Timed out without completion -- clean up.
     this.ctx.storage.deleteAll();
   }

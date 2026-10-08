@@ -857,11 +857,9 @@ describe("ScheduleDriver", () => {
     expect(healthy?.state.status === "active" ? healthy.state.nextFire : 0).toBeGreaterThan(
       activationTime,
     );
-    // The throw is admission's next-fire computation, so "broken" never reaches its callback.
-    expect((await driver.getSchedule("workspace-a", "broken"))?.state).toMatchObject({
-      status: "pending",
-      stage: "admission",
-    });
+    // The throw is admission's next-fire computation, so "broken" never reaches its callback. It is
+    // quarantined rather than left pending to be re-leased every recovery interval forever.
+    expect((await driver.getSchedule("workspace-a", "broken"))?.state.status).toBe("dead");
     const delivery = await testEnv.TEST_HOOKS.read();
     expect(delivery.events.filter((event) => event === "start")).toHaveLength(2);
     expect(delivery.callbackScheduleIds).toEqual(["healthy"]);
@@ -878,6 +876,59 @@ describe("ScheduleDriver", () => {
         }),
       }),
     );
+  });
+
+  it("quarantines a lease-expired row whose transition throws instead of spinning the alarm", async () => {
+    const driver = testEnv.SCHEDULE_DRIVER.getByName("poison-row");
+    const activationTime = Date.now();
+    for (const scheduleId of ["poison", "healthy"]) {
+      await enableSchedule(
+        driver,
+        {
+          workspaceId: "workspace-a",
+          scheduleId,
+          spec: { kind: "interval", everyMs: 60_000, anchorMs: activationTime },
+          title: scheduleId,
+          description: "Regression: a stuck due row must not re-arm the alarm in the past.",
+          gadgetId,
+        },
+        activationTime,
+      );
+    }
+    // A delivery the DO died in the middle of, under a spec the current code rejects: failRun()
+    // throws re-validating it, so before the fix the row stayed due and #planAlarm re-armed the
+    // alarm at its expired lease (1 ms after the epoch), i.e. immediately, forever.
+    await updateSchedule(driver, "workspace-a", "poison", (stored) => ({
+      ...stored,
+      state: {
+        workspaceId: "workspace-a",
+        scheduleId: "poison",
+        spec: { kind: "interval", everyMs: 0, anchorMs: activationTime },
+        status: "pending",
+        stage: "delivery",
+        runId: "stuck-run",
+        scheduledTime: activationTime,
+        attempts: 1,
+        leaseExpiresAt: 1,
+      },
+    }));
+
+    await expect(runDurableObjectAlarm(driver)).resolves.toBe(true);
+
+    expect((await driver.getSchedule("workspace-a", "poison"))?.state).toEqual(
+      expect.objectContaining({ status: "dead", runId: "stuck-run", attempts: 1 }),
+    );
+    const { alarm, capability } = await runInDurableObject(driver, async (_instance, state) => ({
+      alarm: await state.storage.getAlarm(),
+      capability: state.storage.kv.get("caps:workspace-a:poison"),
+    }));
+    expect(alarm).toBe(activationTime + 60_000);
+    expect(alarm).toBeGreaterThan(Date.now());
+    expect(capability).toBeUndefined();
+    // Nothing is due any more, so a further run is a no-op rather than another spin.
+    await expect(runDurableObjectAlarm(driver)).resolves.toBe(true);
+    expect(await runInDurableObject(driver, (_instance, state) => state.storage.getAlarm()))
+      .toBe(activationTime + 60_000);
   });
 
   it("reports a missing capability record without exposing callback errors", async () => {
@@ -917,7 +968,7 @@ describe("ScheduleDriver", () => {
     );
   });
 
-  it("reports and rethrows alarm infrastructure failures", async () => {
+  it("reports alarm infrastructure failures and backs off instead of rethrowing", async () => {
     const driver = testEnv.SCHEDULE_DRIVER.getByName("alarm-failure");
     await runInDurableObject(driver, (_instance, state) =>
       state.storage.kv.put("metadata", { schemaVersion: 999, revoked: false }),
@@ -932,7 +983,10 @@ describe("ScheduleDriver", () => {
       }
     });
 
-    expect(failure).toContain("Unsupported scheduler driver metadata");
+    // The alarm guard owns the retry: no platform retry storm, and never re-armed at now.
+    expect(failure).toBe("did not reject");
+    const alarm = await runInDurableObject(driver, (_instance, state) => state.storage.getAlarm());
+    expect(alarm).toBeGreaterThanOrEqual(Date.now() + 29_000);
     expect(reportIssue).toHaveBeenCalledWith(
       "scheduler.alarm",
       expect.any(Error),

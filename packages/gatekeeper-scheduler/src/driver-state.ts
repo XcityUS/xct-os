@@ -205,6 +205,25 @@ export function completeRun(
     : { ...common, status: "active", nextFire };
 }
 
+/**
+ * Ends a schedule whose stored transition failed unexpectedly (e.g. a spec the current code no
+ * longer accepts): left as is it would stay due forever and spin the alarm. Builds the dead state
+ * without re-validating the spec, so it cannot throw for the same reason.
+ */
+export function quarantineRun(schedule: EnabledSchedule, failedAt: number): EnabledSchedule {
+  if (schedule.status === "dead" || schedule.status === "completed" || schedule.status === "expired") {
+    return schedule;
+  }
+  return {
+    ...copyProgress(schedule),
+    status: "dead",
+    runId: schedule.status === "active" ? "" : schedule.runId,
+    attempts: schedule.status === "active" ? 0 : schedule.attempts,
+    failedAt,
+    failureCode: "callback_failed",
+  };
+}
+
 /** Returns exponential callback retry delay for an already-consumed attempt. */
 export function retryDelay(attempts: number): number {
   if (!Number.isInteger(attempts) || attempts < 1 || attempts > MAX_ATTEMPTS) {

@@ -23,7 +23,7 @@ function sourceFiles(dir: string, out: string[] = []): string[] {
     const path = join(dir, name);
     const stat = statSync(path);
     if (stat.isDirectory()) sourceFiles(path, out);
-    else if (/\.(ts|tsx)$/.test(name) && !/\.d\.ts$/.test(name) && !/\.test\.tsx?$/.test(name)) out.push(path);
+    else if (/\.(ts|tsx)$/.test(name) && !name.endsWith(".d.ts") && !/\.test\.tsx?$/.test(name)) out.push(path);
   }
   return out;
 }

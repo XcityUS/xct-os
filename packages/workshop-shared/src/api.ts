@@ -477,6 +477,9 @@ export interface AuthenticatedApi extends RpcTarget {
    * holding the secrets. The rules of `updateModel()` for keeping a secret apply to copying one.
    * Without it, `config` must contain no `null` secrets. With it, `profile.id` must also not name
    * a model provided by the deployment's AI Gateway configuration.
+   *
+   * Throws on a deployment whose users may not add their own models (see
+   * `AiGatewayInfo.userModelsEnabled`), as `updateModel()` does.
    */
   addModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig,
            copySecretsFrom?: string): Promise<void>;
@@ -1040,6 +1043,27 @@ export type AdminSettingsView = {
   resourceVendors: AdminResourceVendor[];
   /** The blueprints promoted as standard output formats, in menu order (including disabled ones). */
   formats: AdminFormat[];
+  /** The models the deployment provides through AI Gateway. Absent outside AI Gateway mode. */
+  gatewayModels?: {
+    /** The providers a model may be added under: the ones the gateway both enables and serves. */
+    providers: AiModelProvider[];
+    /** Every provider the gateway serves, on or off, in the order the models are listed in. */
+    providerSettings: AdminGatewayProvider[];
+    /** Every gateway model, in any mode, in listing order. */
+    models: AdminModelView[];
+    /**
+     * The reasoning level of each gateway model that has none of its own (see
+     * AdminApi.setDefaultReasoning), or null while the deployment sets none.
+     */
+    defaultReasoning: ReasoningLevel | null;
+    /** Whether users may add models of their own (see AdminApi.setUserModelsEnabled). */
+    userModelsEnabled: boolean;
+    /**
+     * Whether the admin UI may suggest models from models.dev while an admin adds one (see
+     * AdminApi.setModelsDevSuggestions).
+     */
+    modelsDevSuggestions: boolean;
+  };
 };
 
 /**
@@ -1088,9 +1112,10 @@ export type AdminFormat = {
 /**
  * Capability for managing deployment-wide admin settings, obtained via
  * AuthenticatedApi.getAdminApi() (which is null for non-admins). The access check happens when the
- * capability is minted, so these methods don't re-check. Covers branding, agent instructions, and
- * which gatekeeper connectors/resources are offered — NOT authentication config (that's env-var
- * driven). Each setter throws on invalid input.
+ * capability is minted, so these methods don't re-check. Covers branding, agent instructions,
+ * which gatekeeper connectors/resources are offered, and the models an AI Gateway deployment
+ * provides — NOT authentication config (that's env-var driven). Each setter throws on invalid
+ * input.
  */
 export interface AdminApi {
   /** Read all admin-managed settings for the admin UI in one call. */
@@ -1193,6 +1218,143 @@ export interface AdminApi {
 
   /** Reorder the menu. `blueprintIds` must be a permutation of the currently promoted ids. */
   setFormatOrder(blueprintIds: string[]): Promise<void>;
+
+  // --- AI Gateway models ---
+  //
+  // The models the deployment provides through AI Gateway (AdminSettingsView.gatewayModels). Each
+  // of these throws outside AI Gateway mode.
+
+  /**
+   * Set how the deployment offers one of its gateway models (see GatewayModelMode). Setting the
+   * model's default mode forgets the override, so the model follows its default from then on.
+   * Throws if `modelId` is not one of the deployment's gateway models.
+   *
+   * 'disabled' revokes nothing that is stored: the chats, spawners, preferences and gadget model
+   * bindings that name the model keep naming it, and stop resolving for as long as it is disabled.
+   */
+  setGatewayModelMode(modelId: string, mode: GatewayModelMode): Promise<void>;
+
+  /**
+   * Add a model to the ones the deployment provides, listed after its provider's suggested models
+   * and 'enabled' by default. Throws if the model is malformed (an empty or over-long ID or name,
+   * an over-long `behavesLike`, a token limit that isn't a positive integer), if the gateway does
+   * not serve and enable its provider (see AdminSettingsView.gatewayModels), if a suggested or
+   * added model already has its ID, if the model runtime does not know its `behavesLike` under
+   * its provider, or if what its context window reserves for the response (its output limit, or
+   * WORKERS_AI_OUTPUT_LIMIT for a Cloudflare model that gives none) leaves a prompt no room.
+   */
+  addGatewayModel(model: GatewayModel): Promise<void>;
+
+  /**
+   * Remove a model added with addGatewayModel(), along with its mode and settings. Throws if no
+   * added model has this ID; a suggested model can't be removed, only disabled.
+   *
+   * Removing frees the ID rather than reserving it. The chats, spawners and preferences that name
+   * the model resolve again if a model is later added under the same ID. A gadget model binding
+   * minted for it carries its own provider and model, so while users may add their own models
+   * (see setUserModelsEnabled) it runs once the model is removed, even if the model was disabled.
+   * To shut a model off, disable it instead.
+   */
+  removeGatewayModel(modelId: string): Promise<void>;
+
+  /**
+   * Set whether users may add models of their own, which run through the deployment's gateway
+   * like the models it provides. On by default.
+   *
+   * Off makes the deployment's models the only ones: a user can't add or edit a model, and the
+   * models users added are neither listed nor resolved. A gadget model binding stops at its next
+   * call unless a gateway model has its provider and model. Nothing stored is deleted, so the
+   * models users added work again once this is back on.
+   */
+  setUserModelsEnabled(enabled: boolean): Promise<void>;
+
+  /**
+   * Set whether the admin UI may suggest models from models.dev while an admin adds one. Off by
+   * default.
+   *
+   * The admin's browser reads the setting and, with it on, downloads models.dev's public model
+   * list while an admin adds a model, to fill in the add-model form. It changes nothing the server
+   * does: the server never contacts models.dev, and addGatewayModel() validates a suggested model
+   * like any other.
+   */
+  setModelsDevSuggestions(enabled: boolean): Promise<void>;
+
+  /**
+   * Replace what the deployment sets for one of its gateway models (see GatewayModelSettings):
+   * a field left out of `settings` is unset, and an empty `settings` unsets everything. Throws
+   * if `modelId` is not one of the deployment's gateway models, or if the compaction budget is
+   * not a positive whole number within the model's maximum (see
+   * AdminModelView.maxCompactionInputBudget).
+   *
+   * The reasoning level may be one the model lacks, since it is fitted to the model when a
+   * request is made (see ReasoningLevel).
+   */
+  setGatewayModelSettings(modelId: string, settings: GatewayModelSettings): Promise<void>;
+
+  /**
+   * Set the reasoning level of every gateway model that has none of its own, or null for each
+   * model's built-in behaviour. It never applies to a model a user added.
+   */
+  setDefaultReasoning(level: ReasoningLevel | null): Promise<void>;
+
+  /**
+   * Turn a provider on or off beside the ones CF_AI_GATEWAY_PROVIDERS lists. On is the same as
+   * listing it there: its suggested models appear in their default modes, models can be added
+   * under it, and so can users' own while those are allowed. Throws for a provider the gateway
+   * does not serve, and when turning off one that the variable lists: it is a floor, which an
+   * admin adds to.
+   *
+   * Off takes the provider's models out of the deployment's and deletes nothing: their modes and
+   * settings, and the models added under the provider, are kept for when it is back on. It stops
+   * neither a model a user already added under the provider nor a gadget model binding already
+   * minted for one of its models, which setUserModelsEnabled(false) does.
+   */
+  setGatewayProviderEnabled(provider: AiModelProvider, enabled: boolean): Promise<void>;
+
+  /**
+   * Send one small request to the first of a provider's SUGGESTED_MODELS through the gateway, as
+   * the admin, and report what happened within 15 seconds: the Workshop can't see which provider
+   * keys the gateway holds. It works on a provider that is off, and changes nothing. Throws for
+   * a provider the gateway does not serve; a request that fails is a result (see
+   * GatewayModelTest).
+   *
+   * A pass says that one model answered once. A 401 or 403 does not tell a provider key the
+   * gateway lacks from a CF_AI_GATEWAY_API_TOKEN that may not run models. The request is a
+   * quick one that takes none of a model's settings: testGatewayModel() sends a model the
+   * request its chats would.
+   */
+  testGatewayProvider(provider: AiModelProvider): Promise<GatewayModelTest>;
+
+  /**
+   * Send one request to a gateway model the way a chat turn would, through the gateway, as the
+   * admin, and report what happened within 30 seconds. The request asks for the reasoning level
+   * in effect for the model (its own, else the deployment's default, else what BuiltInReasoning
+   * describes), with the capabilities stated for it and the flags of the model it behaves like,
+   * under a response cap of at most 2,048 tokens. A level that a model takes as a token budget
+   * comes out of that cap, so it is cut to the room the cap leaves and is smaller than a chat's.
+   * It works on a model in any mode, hidden and disabled included, and changes nothing. Throws
+   * outside AI Gateway mode and for an ID that names no gateway model; a request that fails is a
+   * result (see GatewayModelTest).
+   *
+   * A pass says that the model answered that one request. It costs more than
+   * testGatewayProvider(), whose quick request is capped at a few tokens.
+   */
+  testGatewayModel(modelId: string): Promise<GatewayModelTest>;
+
+  /**
+   * Test a model as described, without adding it. It sends one request the way a chat turn would
+   * with no reasoning level set (so asking for what BuiltInReasoning describes, whatever the
+   * deployment's default level is), and one at each reasoning level the model would list once
+   * added (see AdminModelView.reasoningLevels). The requests are sent together, through the
+   * gateway, as the admin, each under testGatewayModel()'s response cap and time limit. The
+   * results come with the request that set no level first, then the levels from least to most.
+   * It stores nothing. Throws outside AI Gateway mode and for a model addGatewayModel() would
+   * refuse, for the same reason; a request that fails is a result (see GatewayModelLevelTest).
+   *
+   * A pass says that the model answered that one request. A model that lists every level is sent
+   * eight requests, each of which may use the whole response cap.
+   */
+  testNewGatewayModel(model: GatewayModel): Promise<GatewayModelLevelTest[]>;
 }
 
 /** A partial edit to one promoted format. Absent fields are left alone. */
@@ -1531,10 +1693,237 @@ export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" |
 /** Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`. */
 export type AiGatewayInfo = {
   enabled: true;
+  /**
+   * The providers the deployment enables: the ones CF_AI_GATEWAY_PROVIDERS lists and the ones its
+   * admin turned on (see AdminApi.setGatewayProviderEnabled). A user can add a model of their own
+   * under these only.
+   */
   enabledProviders: AiModelProvider[];
+  /**
+   * The ID of every model the deployment provides through AI Gateway, in any mode (see
+   * GatewayModelMode). A user can't edit or delete these, nor add a model under one of these IDs.
+   */
+  builtInModelIds: string[];
+  /**
+   * Whether users may add models of their own (see AdminApi.setUserModelsEnabled). When false,
+   * addModel() and updateModel() refuse, and the models the user added are neither listed nor
+   * resolved.
+   */
+  userModelsEnabled: boolean;
 } | {
   enabled: false;
 };
+
+/**
+ * How a deployment offers one of the models it provides through AI Gateway:
+ *   - 'enabled':  offered in model pickers.
+ *   - 'hidden':   left out of pickers but still resolves, so the chats, spawners, preferences and
+ *                 gadget model bindings that already name it keep working.
+ *   - 'disabled': left out of pickers and does not resolve: a chat or spawner that names it is
+ *                 refused, and a gadget model binding minted for it fails at its next call. Its ID
+ *                 stays reserved, so a user can't add a model of their own under it.
+ */
+export const GATEWAY_MODEL_MODES = ['enabled', 'hidden', 'disabled'] as const;
+
+/** One of GATEWAY_MODEL_MODES. */
+export type GatewayModelMode = typeof GATEWAY_MODEL_MODES[number];
+
+/** Whether `value` is a GatewayModelMode. */
+export function isGatewayModelMode(value: unknown): value is GatewayModelMode {
+  return GATEWAY_MODEL_MODES.includes(value as GatewayModelMode);
+}
+
+/**
+ * How much reasoning a model is asked for on an agent's turns, least to most. The values are the
+ * model runtime's own (pi's ModelThinkingLevel). Each model takes some of them. One it lacks is
+ * fitted to the next higher one it has, or else the next lower, so 'off' on a model that cannot
+ * stop reasoning asks for its lowest level. A model that does no reasoning is sent none.
+ */
+export const REASONING_LEVELS =
+    ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+
+/** One of REASONING_LEVELS. */
+export type ReasoningLevel = typeof REASONING_LEVELS[number];
+
+/** Whether `value` is a ReasoningLevel. */
+export function isReasoningLevel(value: unknown): value is ReasoningLevel {
+  return REASONING_LEVELS.includes(value as ReasoningLevel);
+}
+
+/**
+ * What a model is asked for while no reasoning level is set for it: 'adaptive' when the model
+ * itself decides whether and how much to reason, a level when the Workshop asks for that effort,
+ * and null when no level is sent.
+ */
+export type BuiltInReasoning = ReasoningLevel | 'adaptive' | null;
+
+/**
+ * The share of its compaction budget a chat's prompt may reach before the chat compacts, leaving
+ * room for the response.
+ */
+export const COMPACTION_TRIGGER_RATIO = 0.85;
+
+/**
+ * What a deployment's admin sets for one of its AI Gateway models. A field left out is unset: the
+ * model then has its built-in behaviour, or for `reasoning` the deployment's default level where
+ * one is set.
+ */
+export type GatewayModelSettings = {
+  /**
+   * The reasoning level of the agent's turns on the model, ahead of the deployment's default
+   * (see AdminApi.setDefaultReasoning). One-shot calls, such as titles, compaction summaries
+   * and gadget model bindings, ask for none either way.
+   */
+  reasoning?: ReasoningLevel;
+
+  /**
+   * The prompt budget, in tokens, that a chat on the model compacts against (see
+   * COMPACTION_TRIGGER_RATIO), in place of the model's built-in one. A positive whole number, at
+   * most the model's AdminModelView.maxCompactionInputBudget.
+   */
+  compactionInputBudget?: number;
+};
+
+/**
+ * What a deployment's admin states that a model it adds can do. Nothing checks a stated fact
+ * against the provider: requests are built from it as it stands.
+ */
+export type GatewayModelCapabilities = {
+  /** Whether the model takes images as input, beside text. Absent while not stated. */
+  imageInput?: boolean;
+
+  /**
+   * The reasoning levels the model can be sent. A list with no level above 'off' states a model
+   * that does no reasoning. Absent while not stated.
+   */
+  reasoningLevels?: ReasoningLevel[];
+};
+
+/**
+ * The description of a model a deployment provides through AI Gateway. Its admin supplies one to
+ * add a model beside the SUGGESTED_MODELS of the providers the gateway enables.
+ */
+export type GatewayModel = {
+  /** Which AI provider hosts the model. */
+  provider: AiModelProvider;
+
+  /**
+   * Name of the model as specified to the provider's API, which is also the ID chats and
+   * preferences refer to it by.
+   */
+  id: string;
+
+  /** Display name. */
+  name: string;
+
+  /** The maximum tokens one request may total. */
+  contextWindow: number;
+
+  /** When present, both the requested response cap and the space reserved for it. */
+  outputLimit?: number;
+
+  /**
+   * The ID of a model of the same provider that the model runtime knows. While the runtime has
+   * no entry for this model's own ID, the model borrows that one's runtime flags: its request
+   * formats and, for what `capabilities` leaves unstated, its reasoning levels and the kinds of
+   * input it takes. Its name, limits and cost stay its own.
+   */
+  behavesLike?: string;
+
+  /**
+   * What the model is stated to do. Used only while the runtime has no entry for this model's
+   * own ID, where each stated fact comes ahead of what `behavesLike` lends.
+   */
+  capabilities?: GatewayModelCapabilities;
+};
+
+/** A model a deployment provides through AI Gateway, as its admin sees it. */
+export type AdminModel = GatewayModel & {
+  /** How the deployment offers the model. */
+  mode: GatewayModelMode;
+
+  /**
+   * The mode the model has while the admin leaves it alone: SUGGESTED_MODELS decides it for a
+   * suggested model, and an added model's is 'enabled'.
+   */
+  defaultMode: GatewayModelMode;
+
+  /** Whether the admin added the model, rather than SUGGESTED_MODELS listing it. */
+  added: boolean;
+
+  /** What the admin set for the model. Absent while nothing is set. */
+  settings?: GatewayModelSettings;
+};
+
+/** An AdminModel with what the admin UI needs in order to offer its settings. */
+export type AdminModelView = AdminModel & {
+  /** The reasoning levels the model can be sent, least to most. Empty when it takes none. */
+  reasoningLevels: ReasoningLevel[];
+
+  /**
+   * What the model is asked for while neither its settings nor the deployment's default give it
+   * a reasoning level.
+   */
+  builtInReasoning: BuiltInReasoning;
+
+  /** The compaction budget the model has while GatewayModelSettings sets none. */
+  builtInCompactionInputBudget: number;
+
+  /**
+   * The largest compaction budget the model may be given: the room its context window leaves for
+   * a prompt.
+   */
+  maxCompactionInputBudget: number;
+
+  /**
+   * Whether the model runtime has an entry for the model's own ID. When it has, the runtime's
+   * entry is used, and neither `behavesLike` nor `capabilities` is.
+   */
+  runtimeKnown: boolean;
+
+  /**
+   * For a model with a `behavesLike`, whether the model runtime knows the model it names. When
+   * it does not, there is nothing to borrow, and the model runs as one the runtime does not know
+   * for as long as it has no entry for the model's own ID either.
+   */
+  behavesLikeKnown?: boolean;
+};
+
+/** One of the providers AI Gateway serves, as a deployment's admin sees it. */
+export type AdminGatewayProvider = {
+  /** The provider. */
+  provider: AiModelProvider;
+
+  /**
+   * Who enabled the provider: the CF_AI_GATEWAY_PROVIDERS environment variable, or an admin (see
+   * AdminApi.setGatewayProviderEnabled). Absent while the provider is off.
+   */
+  enabledBy?: 'environment' | 'admin';
+
+  /**
+   * Whether the provider's requests need CF_AI_GATEWAY_API_TOKEN on a deployment that has none,
+   * so that they fail until it is set. It says nothing of the provider keys the gateway holds,
+   * which the Workshop can't see (see AdminApi.testGatewayProvider).
+   */
+  needsApiToken: boolean;
+};
+
+/**
+ * What one request of AdminApi.testGatewayProvider(), AdminApi.testGatewayModel() or
+ * AdminApi.testNewGatewayModel() found: the model asked, and whether it answered. A failure
+ * carries a message on one line, cut short: what the provider or the gateway answered, or why no
+ * answer came. It carries the HTTP status of the response only when the model runtime reports
+ * one, which it does not for every provider (a failed Google request has none): the message then
+ * says what there is.
+ */
+export type GatewayModelTest = { model: string } &
+    ({ ok: true } | { ok: false; status?: number; message: string });
+
+/**
+ * One request of AdminApi.testNewGatewayModel(): its result, and the reasoning level it asked
+ * for. Null is the request sent with no level set.
+ */
+export type GatewayModelLevelTest = GatewayModelTest & { reasoning: ReasoningLevel | null };
 
 /** Configuration specifying how to connect to an AI model provider. */
 export type AiModelConfig = {
@@ -1584,6 +1973,30 @@ export type AiModelConfig = {
    * table, it is both the requested response cap and the space reserved for it in the window.
    */
   outputLimit?: number;
+
+  /**
+   * The reasoning level of an agent's turns on the model. Absent gives the model's built-in
+   * behaviour. Set only on a deployment's AI Gateway models (see GatewayModelSettings).
+   */
+  reasoning?: ReasoningLevel;
+
+  /**
+   * Overrides the model's built-in compaction budget, up to the room its window leaves for a
+   * prompt. Set only on a deployment's AI Gateway models (see GatewayModelSettings).
+   */
+  compactionInputBudget?: number;
+
+  /**
+   * The model whose runtime flags this one borrows (see GatewayModel.behavesLike). Set only on
+   * the models a deployment's admin added to its AI Gateway.
+   */
+  behavesLike?: string;
+
+  /**
+   * What the model is stated to do (see GatewayModel.capabilities). Set only on the models a
+   * deployment's admin added to its AI Gateway.
+   */
+  capabilities?: GatewayModelCapabilities;
 };
 
 /**
@@ -1591,9 +2004,11 @@ export type AiModelConfig = {
  * and edited without the client ever receiving its secrets. As returned by
  * `AuthenticatedApi.getModelConfig()`, a `null` secret is a non-empty value that was withheld. As
  * passed to `AuthenticatedApi.updateModel()` or `addModel()`, a `null` secret keeps (or copies)
- * the stored value.
+ * the stored value. It has none of the fields that only a deployment sets on its own models.
  */
-export type RedactedAiModelConfig = Omit<AiModelConfig, "apiToken" | "extraHeaders"> & {
+export type RedactedAiModelConfig = Omit<AiModelConfig,
+    "apiToken" | "extraHeaders" | "reasoning" | "compactionInputBudget" | "behavesLike" |
+    "capabilities"> & {
   /** `AiModelConfig.apiToken`, or null if withheld. */
   apiToken: string | null;
 
@@ -1625,8 +2040,10 @@ type SuggestedModel = {
   compactionInputBudget?: number;
 
   /**
-   * Still resolvable for stored references, not offered in pickers. Set on models superseded by
-   * a newer one, which chats, spawners, and preferences created earlier may still name.
+   * Makes the model's default mode 'hidden' rather than 'enabled' (see GatewayModelMode): still
+   * resolvable for stored references, not offered in pickers. Set on models superseded by a newer
+   * one, which chats, spawners, and preferences created earlier may still name. A deployment's
+   * admin can override the default for its AI Gateway.
    */
   hidden?: true;
 };
@@ -1701,7 +2118,10 @@ const SUGGESTED_MODEL_CATALOG = {
   },
 } satisfies Record<AiModelProvider, Record<string, SuggestedModel>>;
 
-/** Models built into the Workshop, by provider and model id; pickers skip the hidden ones. */
+/**
+ * Models built into the Workshop, by provider and model id. Pickers skip the hidden ones, unless
+ * the admin of an AI Gateway deployment enabled them there.
+ */
 export const SUGGESTED_MODELS: Record<AiModelProvider, Record<string, SuggestedModel>> =
     SUGGESTED_MODEL_CATALOG;
 
@@ -2258,6 +2678,23 @@ export interface Overseer extends RpcTarget {
       : Promise<[path: string, FileAtCommit][]>;
 
   /**
+   * List the paths whose entry differs between two commits' trees: added, removed, or changed
+   * in content or mode, sorted by code unit (as `Array.prototype.sort()` sorts). Only files are
+   * listed, never a directory: a symlink or submodule is listed as a file is, and a name that is
+   * a file in one tree and a directory in the other lists the file and the paths within the
+   * directory. The two commits may come in either order; the list is the same.
+   *
+   * Like listTree(), only tree objects are read, never blobs, and a subtree with the same id
+   * in both is not read at all, so the cost is proportional to what differs. The result is
+   * immutable and cacheable by the pair of commit IDs.
+   *
+   * This is how a client finds the files a merge changed: where a chat's pin has a `baseCommit`
+   * other than its `mergedCommit` (see ChatGadgetPinState), the files that differ between the
+   * two are changed in the chat even where none of the chat's code changes touch them.
+   */
+  listChangedPaths(fromCommit: string, toCommit: string): Promise<string[]>;
+
+  /**
    * Walk the commit graph from `fromCommit` (that commit first, then its ancestry), returning up
    * to `depth` commits' metadata -- all reachable commits when `depth` is omitted. Traversal
    * order for merge commits follows git log's default (reverse chronological). Like
@@ -2279,7 +2716,7 @@ export interface Overseer extends RpcTarget {
    *
    * `submission.pins` must carry one declaration per *permanent* gadget the change touches that is
    * not yet pinned in the chat, each naming the head commit the client's content derives from.
-   * The server checks that each declared base is the gadget's current head, or a parent of it
+   * The server checks that each declared base is the gadget's current head, or its first parent
    * (tolerating a race with one concurrent merge), and establishes the pin atomically with the
    * change. A declaration identical to the existing pin is accepted idempotently; one naming a
    * different `baseCommit` (a race between two first editors) throws. Exception: a gadget still
@@ -2565,10 +3002,17 @@ export interface Overseer extends RpcTarget {
    * `changes` message are swept in first, and there is no way to accept only a subset.
    *
    * Accepting is only ever a fast-forward: every gadget touched by the merged changes must have
-   * its chat pin equal to the gadget's current head commit (see
-   * ChatGadgetPinState.mergedCommit). If mainline has advanced past any pin, nothing at all is
-   * merged and the call returns a "stale" outcome (an expected result, not an exception; see
-   * MergeChangesResult): call updateChatFromMainline(), resolve any conflicts, and retry.
+   * its chat pin's ChatGadgetPinState.mergedCommit equal to the gadget's current head commit.
+   * If mainline has advanced past any pin, nothing at all is merged and the call returns a
+   * "stale" outcome (an expected result, not an exception; see MergeChangesResult): call
+   * updateChatFromMainline(), resolve any conflicts, and retry. Where the pin's `baseCommit` is
+   * a merge commit not yet accepted, whose first parent is `mergedCommit`, the head moves
+   * through it: to the merge commit itself if the chat changed nothing since, else to a new
+   * commit on top of it.
+   *
+   * A chat has something to accept when it holds a pin, a gadget or binding edge pending in it,
+   * or a blueprint proposal that is neither merged nor reverted. Otherwise this is a no-op and
+   * records nothing.
    *
    * A successful merge closes the chat's current **epoch**: all merged content now lives in
    * commits, so the chat's code base resets to empty (every pin is dropped, the change stream
@@ -2577,6 +3021,11 @@ export interface Overseer extends RpcTarget {
    * is content-preserving: ChatCodeBase.prior describes the closed stream, and in-flight
    * submissions rooted in it are transformed onto the new generation rather than discarded (see
    * submitCodeChange()), so a client typing through someone's accept loses nothing.
+   *
+   * A blueprint release the chat proposes to merge into a gadget (see
+   * AiChatMessageBody.blueprintMerges) is accepted with the rest: the gadget's new head gains
+   * the release as a parent, unless its history already holds it, and the gadget follows that
+   * blueprint from then on.
    */
   mergeChanges(chatId: number): Promise<MergeChangesResult>;
 
@@ -2587,22 +3036,28 @@ export interface Overseer extends RpcTarget {
    * chat, so it tracks mainline head live and there is nothing to merge into. For each pinned
    * gadget whose ChatGadgetPinState.mergedCommit is behind the gadget's current head, the server
    * computes a 3-way text merge (base = the last merged commit, ours = the head, theirs = the
-   * chat's current files) and applies the result to the chat as an ordinary change -- broadcast via
-   * AiChatSubscriber.changeApplied(), so concurrent editors transform against it like any other
-   * remote change -- recorded in a `changes` message carrying `mainlineMerge`, advancing the pin to
-   * head. Conflicting hunks are left inline as 3-way conflict markers
-   * (`<<<<<<<`/`|||||||`/`=======`/`>>>>>>>`) for the user or their agent to clean up; the
-   * affected paths, each qualified by its gadget's binding name (`GADGET_NAME/path`), are
-   * returned in sorted order and also recorded on the message. An empty `conflictPaths` means
-   * every file merged cleanly (or there was nothing to merge).
+   * chat's current files) and writes it as commits: the chat's files before the update, and the
+   * merge commit, whose parents are the head and that (see MainlineMergeGadget). The chat's pin
+   * for the gadget then re-roots at the merge commit (see ChatGadgetPinRecord), with the head as
+   * its `mergedCommit`. A gadget whose files in the chat are already in the head's history had
+   * nothing of its own to merge, and re-roots at the head itself. Conflicting hunks are left
+   * inline as 3-way conflict markers (`<<<<<<<`/`|||||||`/`=======`/`>>>>>>>`) for the user or
+   * their agent to clean up; the affected paths, each qualified by its gadget's binding name
+   * (`GADGET_NAME/path`), are returned in sorted order and also recorded on the message. An
+   * empty `conflictPaths` means every file merged cleanly (or there was nothing to merge).
+   *
+   * The update is recorded as a `changes` message carrying `mainlineMerge` and declaring the
+   * re-roots, with no `change`. It then ends the chat's change stream with a destructive bump
+   * of ChatCodeBase.generation, delivered after the message: clients rebuild their content from
+   * the log, re-rooted. Changes a client has submitted and not yet had acknowledged are lost.
+   *
+   * Throws, changing nothing, if both sides changed a file and a version of it, or the merged
+   * text, is too large for a file to hold; the error names the file. Making it smaller on
+   * either side, or undoing the chat's own changes to it, lets the update through.
    *
    * Once the chat is up to date (and mainline hasn't moved again), mergeChanges() succeeds as a
-   * plain fast-forward.
-   *
-   * Whenever any pin advances, a `changes` message carrying `mainlineMerge` is recorded -- even
-   * when the chat's content already matched mainline and there is no change to deliver -- so the
-   * chat log always accounts for the advancement (see the revert restriction on
-   * AiChatMessageBody.mainlineMerge).
+   * plain fast-forward through the merge commit. The update can be reverted like any other
+   * proposed change, which puts the pins back as they were before it (see revertChanges()).
    */
   updateChatFromMainline(chatId: number): Promise<{conflictPaths: string[]}>;
 
@@ -2610,14 +3065,17 @@ export interface Overseer extends RpcTarget {
    * Indicates that the user has requested that proposed changes starting from the given sequence
    * number in the chat thread be reverted.
    *
-   * Throws if the range covers a still-proposed mainline merge (see
+   * Throws if the range covers a still-proposed mainline merge that records no `gadgets` (see
    * AiChatMessageBody.mainlineMerge for why such a message cannot be erased), or if the range
    * erases the chat's conversion boundary while keeping an earlier still-proposed batch (see
    * AiChatMessageBody.conversionBoundary; a revert covering everything, `revertFrom` 0, always
    * satisfies this).
    *
-   * Pins declared by reverted messages are removed from ChatCodeBase (a pin survives a revert
-   * iff its declaring message survives), and changes not yet materialized into a message are erased
+   * Each pin is settled from the log as it stands after the revert: its `baseCommit` is that of
+   * its last surviving declaration, and a pin with none is removed from ChatCodeBase. Its
+   * `mergedCommit` is put back to what the earliest update from mainline the revert covers
+   * records it was before (MainlineMergeGadget.baseCommit), and is otherwise left alone.
+   * Changes not yet materialized into a message are erased
    * along with the reverted range. Erasing already-applied changes invalidates every client's local
    * state -- content they may have transformed against is gone -- so ChatCodeBase.generation is
    * bumped destructively: in-flight submitCodeChange() calls fail and clients rebuild instead of
@@ -2688,8 +3146,9 @@ export interface Overseer extends RpcTarget {
    * atomically in a single call with one propagation pass.
    *
    * - `title` / `description`: if provided, update the respective field.
-   * - `updateCode`: if true, snapshot the source gadget's current committed code into the
-   *   blueprint and increment the blueprint version.
+   * - `updateCode`: if true, release the source gadget's current committed code as the
+   *   blueprint's next version. If that code is what the blueprint's latest version already
+   *   holds, the version stays as it is.
    * - `updateBindings`: if true, refresh the blueprint's connection annotations from
    *   the source gadget's current bindings without changing the code snapshot.
    *
@@ -2901,7 +3360,9 @@ export type AiChatMetadata = {
  * (Overseer.listTree(baseCommit), with each file's text read by path via readFilesAtCommit()
  * only when something needs it -- an `edit` to apply, or a file the user opens; a whole
  * repository tree is never fetched); apply the current epoch's non-reverted `changes` messages'
- * changes in log order; then apply the changes not yet materialized into a message, delivered
+ * changes in log order, from the pin's last declaration on (see ChatGadgetPinRecord, and
+ * `composeEpochChanges` in `@gadgets/workshop-shared/code-change`); then apply the changes not
+ * yet materialized into a message, delivered
  * in revision order via AiChatSubscriber.changeApplied(). Accepting changes ends the epoch: the
  * pin set resets to empty and the change stream restarts.
  */
@@ -2918,9 +3379,10 @@ export type ChatCodeBase = {
    * two classes. **Content-preserving** (a merge's epoch reset): the stream identity changes
    * but the content carries over -- `prior` describes the closed stream, and in-flight
    * submissions are transformed onto the new generation (see submitCodeChange()). **Destructive**
-   * (a revert, draft discard, or agent turn abort erased already-applied changes): content other
-   * clients may have transformed against is gone, so they must discard local state and rebuild.
-   * Pin additions and updateChatFromMainline() do *not* bump -- they only append changes.
+   * (a revert, draft discard, or agent turn abort erased already-applied changes, or
+   * updateChatFromMainline() re-rooted pins): content other clients may have transformed against
+   * is gone, so they must discard local state and rebuild. Pin additions do *not* bump -- they
+   * only append changes.
    */
   generation: number;
 
@@ -2975,39 +3437,59 @@ export type ChatCodeBase = {
  * worktree, also its first commit()), which pins at the then-current head (a worktree's
  * accepted commit) -- and lasts until the epoch ends or the declaring message is reverted.
  *
- * This same shape is both the declaration a client submits with a first modification
- * (CodeChangeSubmission.pins) and the permanent record of it in the chat log (the `pins` field of
- * a "changes" message) and in compaction checkpoints. The log record is what a closed epoch's
- * content is reconstructed from: start from `baseCommit`'s tree, then apply the epoch's changes
- * in order. Nothing here ever changes once recorded; a pin's mutable state lives in
- * ChatGadgetPinState.
+ * This shape is the declaration a client submits with a first modification
+ * (CodeChangeSubmission.pins). Its permanent record in the chat log and in compaction
+ * checkpoints is a ChatGadgetPinRecord, which only the server writes.
  */
 export type ChatGadgetPin = {
   /** The pinned gadget. */
   gadgetId: WorkpieceId;
 
   /**
-   * The commit whose tree the chat's uncommitted changes for this gadget apply on top of.
-   * Immutable for the life of the pin: every change recorded for this gadget since is expressed
-   * against content rooted here, so the base moving would invalidate them all. (Mainline movement
-   * is merged into the chat as ordinary changes, advancing ChatGadgetPinState.mergedCommit --
-   * never this.)
+   * The commit whose tree the chat's uncommitted changes for this gadget apply on top of. Fixed
+   * until a later declaration re-roots the gadget (see ChatGadgetPinRecord): every change
+   * recorded for this gadget since is expressed against content rooted here, so nothing else
+   * moves it.
    */
   baseCommit: string;
 };
 
 /**
- * A pin's current state within a chat (see ChatCodeBase.pins): the immutable ChatGadgetPin the
- * epoch recorded, plus how far mainline has been merged into the chat since. That addition is
- * live state rather than history, which is why it is absent from the declaration a client submits
- * and from the record the chat log keeps.
+ * A pin declaration as the chat log records it: the `pins` of a "changes" message, and of a
+ * compaction checkpoint. A declaration **re-roots** its gadget: the gadget's chat content
+ * becomes `baseCommit`'s tree, and any changes that earlier messages of the epoch recorded for
+ * the gadget no longer count. Every fold of the log applies that one rule, so a closed epoch's
+ * content is reconstructed by starting each gadget from its last surviving declaration's tree
+ * and applying the changes recorded from that message on. A reverted message declares nothing,
+ * so reverting a re-root brings back the declaration before it and the changes recorded since.
+ */
+export type ChatGadgetPinRecord = ChatGadgetPin & {
+  /**
+   * ChatGadgetPinState.mergedCommit as of the declaration, for whoever describes it. Absent
+   * when it equals `baseCommit`. A record of the past only: the pin's live `mergedCommit` is
+   * never set from it.
+   */
+  mergedCommit?: string;
+};
+
+/**
+ * A pin's current state within a chat (see ChatCodeBase.pins): its current declaration, plus how
+ * far mainline has been merged into the chat since. That addition is live state rather than
+ * history, which is why it is absent from the declaration a client submits.
  */
 export type ChatGadgetPinState = ChatGadgetPin & {
   /**
-   * The most recent mainline commit whose content has been merged into the chat for this gadget.
-   * Starts equal to baseCommit and advances on updateChatFromMainline(). Accepting the chat's
-   * changes requires this to equal the gadget's current head (WorkpieceSummary.commitId); a
-   * difference means the chat is stale and the UI should offer updating from mainline.
+   * The most recent mainline commit whose content the chat's content for this gadget includes.
+   * Accepting the chat's changes requires this to equal the gadget's current head
+   * (WorkpieceSummary.commitId); a difference means the chat is stale and the UI should offer
+   * updating from mainline.
+   *
+   * It starts equal to `baseCommit`. An update from mainline recorded before re-roots existed
+   * advanced it to a descendant of `baseCommit`. A re-root that merges mainline into the chat
+   * declares a merge commit as `baseCommit` and sets this to the merge's first parent, the head
+   * that was merged; accepting then fast-forwards the head from here through the merge commit
+   * (see Overseer.mergeChanges()). A revert puts back what the earliest update it covers
+   * records the pin had before (see AiChatMessageBody.mainlineMerge).
    */
   mergedCommit: string;
 };
@@ -3253,12 +3735,12 @@ export type AiChatMessageBody = {
   observedCodeVersion?: number;
 
   /**
-   * Pins this batch establishes: for each gadget listed, this message's `change` contains the
-   * epoch's first modification of that gadget's code, applied on top of the pinned commit's
-   * tree. Content reconstruction establishes each listed pin's base before applying the change (see
-   * ChatGadgetPin).
+   * Pins this batch declares. For each gadget listed, the chat's content restarts at the pinned
+   * commit's tree, dropping whatever earlier messages of the epoch changed in it (see
+   * ChatGadgetPinRecord), and this message's `change` applies on top. Usually the declaration
+   * accompanies the epoch's first modification of the gadget's code.
    */
-  pins?: ChatGadgetPin[];
+  pins?: ChatGadgetPinRecord[];
 
   /**
    * The span of the change stream this batch materialized: this message's `change` is the
@@ -3273,20 +3755,26 @@ export type AiChatMessageBody = {
   watermark?: {changesGeneration: number, throughRevision: number};
 
   /**
-   * Present when this batch was produced by Overseer.updateChatFromMainline(): `change` merges
-   * mainline commits into the chat. `conflictPaths` lists the files whose 3-way merge was not
-   * clean, in sorted order, each qualified by its gadget's binding name
-   * (`GADGET_NAME/path/to/file`); their merged contents carry inline conflict markers (or, for
-   * delete-vs-modify, the surviving side's content) for the user or their agent to resolve.
-   * `change` is absent when the chat's content already matched the merged mainline commits;
-   * the batch then records only that the pins advanced.
+   * Present when this batch was produced by Overseer.updateChatFromMainline(). `conflictPaths`
+   * lists the files whose 3-way merge was not clean, in sorted order, each qualified by its
+   * gadget's binding name (`GADGET_NAME/path/to/file`); their merged contents carry inline
+   * conflict markers (or, for delete-vs-modify, the surviving side's content) for the user or
+   * their agent to resolve.
    *
-   * A batch carrying this cannot be reverted while still proposed (Overseer.revertChanges()
-   * refuses): the merge advanced the chat's pins, and erasing its content while keeping the
-   * advanced pins would let a later accept silently overwrite the mainline changes it
-   * delivered.
+   * `gadgets` records each gadget's part of the merge, whose result is a commit: the batch has
+   * no `change`, and its `pins` re-root each gadget merged at that commit, with the head merged
+   * as the declaration's `mergedCommit` (see ChatGadgetPinRecord). Each entry also records what
+   * the pin's `mergedCommit` was before the update, which a revert covering this message puts
+   * back (see Overseer.revertChanges()).
+   *
+   * A batch without `gadgets` was recorded before merges were commits. Its `change` merged
+   * mainline commits into the chat, or is absent when the chat's content already matched them,
+   * and it advanced the chat's pins with no record of their earlier values, so it cannot be
+   * reverted while still proposed (Overseer.revertChanges() refuses). Erasing its content while
+   * keeping the advanced pins would let a later accept silently overwrite the mainline changes
+   * it delivered.
    */
-  mainlineMerge?: {conflictPaths: string[]};
+  mainlineMerge?: {conflictPaths: string[], gadgets?: MainlineMergeGadget[]};
 
   /**
    * Present on the synthetic message that converted this chat from the pre-git-storage
@@ -3354,6 +3842,29 @@ export type AiChatMessageBody = {
    * within the gadget identified by `gadgetId`; `target` is the bound workpiece.
    */
   addedBindings?: {gadgetId: WorkpieceId, name: string, target: WorkpieceId}[];
+
+  /**
+   * Blueprint releases this batch proposes to merge into gadgets: recorded by
+   * GadgetClient.applyBlueprint(), and by the agent's `createGadget` tool when it builds the new
+   * gadget from a blueprint.
+   *
+   * A proposal that GadgetClient.applyBlueprint() records is one message with no `change`. Its
+   * merge was written as a commit, whose parents are the gadget's head and the release, and
+   * which marks the release as merged. The batch's `pins` re-root the gadget at that commit,
+   * with the head as the declaration's `mergedCommit` (see ChatGadgetPinRecord). The agent's
+   * `createGadget` instead delivers the release's files as the batch's `change`, since a gadget
+   * still pending in the chat has no head to commit on.
+   *
+   * Like the rest of the batch this is provisional. A merge through this message makes each
+   * gadget follow the blueprint named (see GadgetUpstream) and records the release in the
+   * gadget's history; a revert covering it withdraws the proposal, and until one or the other
+   * the gadget is as it was.
+   *
+   * A proposal whose release is already in the gadget's history writes no commit and pins
+   * nothing, so it does not put its gadget in AiChatMetadata.proposedChangeWorkpieces: this
+   * record is then the only sign that the chat has something to accept.
+   */
+  blueprintMerges?: BlueprintMerge[];
 } | {
   /**
    * Indicates that at this point in the chat, the user chose to merge all (non-reverted) changes
@@ -4018,12 +4529,21 @@ export type SlashCommandChoice = {
  *
  * At most one provisional stream is active per chat at a time. The client should not persist
  * these events. Instead, it should display them temporarily and discard them as soon as the
- * corresponding durable `message()` and/or `changes` message arrives, or when the agent stops
- * running (`activeAgent` becomes unset in the chat metadata).
+ * corresponding durable `message()` and/or `changes` message arrives, when the agent stops
+ * running (`activeAgent` becomes unset in the chat metadata), or when a `streamReset` event
+ * arrives.
  */
 export type AiChatStreamEvent = {
   /** The turn is summarizing older context before it can continue, or before `/compact` ends. */
   type: "compacting";
+} | {
+  /**
+   * The in-progress model request failed transiently and will be retried. Nothing it streamed
+   * will become durable, so the client should discard the step's provisional state -- streamed
+   * text and reasoning, tool-call cards, the active-file marker and all edit previews -- as it
+   * would for an error message. The retry then streams afresh.
+   */
+  type: "streamReset";
 } | {
   /**
    * The compaction attempt ended, whether it compacted, failed, was cancelled, or found nothing to
@@ -4180,8 +4700,7 @@ export interface AiChatSubscriber {
   /**
    * Delivers one accepted change of a chat's change stream: a human submitCodeChange(), an agent
    * tool edit (broadcast when the tool call completes, superseding the provisional editPreview*
-   * stream of its in-progress content -- see AiChatStreamEvent), or an updateChatFromMainline()
-   * merge. Changes must be applied in
+   * stream of its in-progress content -- see AiChatStreamEvent). Changes must be applied in
    * revision order within a generation; a gap means events were lost and the client should
    * rebuild from fresh metadata and history. On a generation switch, first finish the old
    * generation's remaining changes -- complete once seen through
@@ -4196,7 +4715,7 @@ export interface AiChatSubscriber {
    * CodeChangeSubmission's clientId and seq), so the submitting client recognizes its own change
    * -- in the live feed and in subscribe-replay alike, without depending on ack/broadcast
    * ordering -- and drops its in-flight buffer instead of re-applying. The echo is informational
-   * only; server-authored changes (agent edits, mainline merges) omit it.
+   * only; server-authored changes (agent edits) omit it.
    */
   changeApplied(chatId: number, generation: number, revision: number, author: AiChatAuthorInfo,
                 change: CodeChange, submission?: {clientId: string, seq: number}): void;
@@ -4267,6 +4786,14 @@ export type GadgetSummary = {
   commitId?: string;
 
   /**
+   * Where this gadget's code came from: the blueprint it follows, or that it was built from
+   * scratch (see GadgetUpstream). Absent if that is not known, as for a gadget made before it
+   * was recorded. Delivered only to subscribers with the "build" role: a blueprint id is a share
+   * link to the blueprint's code, which a "use" collaborator cannot otherwise read.
+   */
+  upstream?: GadgetUpstream;
+
+  /**
    * If present, this workpiece exists only in the context of the given chat. The UI should display
    * it only while the given chat is open.
    *
@@ -4275,6 +4802,159 @@ export type GadgetSummary = {
    * reverted (or the chat is deleted).
    */
   chatId?: number;
+};
+
+/**
+ * The blueprint a gadget follows: the one it takes updates from, and how much of it the gadget
+ * already has. An update is available when the blueprint names a current release
+ * (`BlueprintMetadata.commitId`, from `PublicApi.getBlueprint()`) other than a known `commitId`.
+ *
+ * A gadget built from scratch in its workspace follows no blueprint, and its upstream says so
+ * by naming none. That differs from a gadget with no upstream at all, whose origin is unknown.
+ */
+export type GadgetUpstream = {
+  /**
+   * The blueprint's id. Absent if the gadget was built from scratch: there is then no blueprint
+   * to offer it updates from, and no `commitId` either. GadgetClient.applyBlueprint() treats
+   * such a gadget like one of unknown origin, and gives it a blueprint to follow if its
+   * proposal is accepted.
+   */
+  blueprintId?: string;
+
+  /**
+   * The release of that blueprint the gadget most recently merged: a release commit, and an
+   * ancestor of the gadget's head. For a blueprint stored before releases were commits, it is
+   * the commit that everyone who reads that content derives from its files.
+   *
+   * Absent if the gadget was created from the blueprint before gadgets recorded the release
+   * they took. Which release that was is then unknown: whether an update is available cannot
+   * be told, and applying the blueprint merges over a guessed base (see
+   * BlueprintMerge.unverifiedBase), as for a gadget that follows no blueprint. Accepting that
+   * proposal records the release.
+   */
+  commitId?: string;
+};
+
+/**
+ * A proposal to merge a release of a blueprint into a gadget (see
+ * AiChatMessageBody.blueprintMerges). It records everything about the proposal as it was made,
+ * so describing it needs no second look at a blueprint that may have been republished since.
+ */
+export type BlueprintMerge = {
+  /** The gadget the release is merged into. */
+  gadgetId: WorkpieceId;
+
+  /** The blueprint, which the gadget follows once the proposal is accepted. */
+  blueprintId: string;
+
+  /** The blueprint's title at this release. */
+  title: string;
+
+  /** The blueprint's version counter at this release (`BlueprintMetadata.version`). */
+  version: number;
+
+  /** The release: the commit that the gadget's history gains as a parent, if it lacks it. */
+  commitId: string;
+
+  /**
+   * What the proposal does to the gadget's files, as the result of the merge decides it:
+   * - "follow": nothing. Either the release is already in the gadget's history, or the gadget
+   *   already has every change the release made since the base.
+   * - "fastForward": they become the release's exactly. The gadget had no changes of its own
+   *   since the base, or was created from the release.
+   * - "merge": the gadget and the blueprint both changed files since the base, and the two
+   *   sets of changes were merged, three ways. A merge that conflicted is one even if no file
+   *   changes: a file the gadget changed and the release deleted is kept, but whether it
+   *   should stay is still to be decided.
+   */
+  kind: "follow" | "fastForward" | "merge";
+
+  /**
+   * The commit the merge took as the version the gadget and the release have in common. Absent
+   * if there was nothing to merge: the release was already in the gadget's history, or the
+   * gadget was created from it.
+   */
+  baseCommit?: string;
+
+  /**
+   * The files whose merge was not clean, as paths within the gadget, in sorted order. Each
+   * holds inline conflict markers, or for a file one side deleted and the other changed, the
+   * changed content with no markers (as for `mainlineMerge`). Empty unless `kind` is "merge".
+   */
+  conflictPaths: string[];
+
+  /**
+   * Present if the gadget and the release share no history, so that `baseCommit` is a guess at
+   * what the gadget was built from. A change the gadget's owner made that the guess happens to
+   * include looks like something the blueprint removed, and is undone with no conflict
+   * reported.
+   */
+  unverifiedBase?: true;
+
+  /**
+   * The bindings the release declares that the gadget had none named for, by binding name.
+   * Absent if there were none. A binding that exists only to feed an agent spawner
+   * (`spawnerOnly`) is never listed, having no name in the gadget to look for.
+   */
+  missingBindings?: Record<string, BlueprintBinding>;
+};
+
+/**
+ * One gadget's part of an update from mainline (see AiChatMessageBody.mainlineMerge): the three
+ * sides of its merge, as commits, and what did not merge cleanly. The other two sides are on
+ * the message's pin declaration for the gadget: its `mergedCommit` is the head that was
+ * merged, and its `baseCommit` the merge commit, whose parents are that head and
+ * `chatCommit`. Where the chat had nothing of its own to merge, no merge commit was written,
+ * and the declaration's `baseCommit` is the head itself.
+ */
+export type MainlineMergeGadget = {
+  /** The pinned gadget that was brought up to date. */
+  gadgetId: WorkpieceId;
+
+  /**
+   * The base of the merge: the mainline commit the chat had last merged for this gadget, which
+   * is the pin's ChatGadgetPinState.mergedCommit as it was before the update. A revert of the
+   * update puts the pin's `mergedCommit` back to this.
+   */
+  baseCommit: string;
+
+  /**
+   * A commit of the chat's files for the gadget as they were before the update. Its parent is
+   * the pin's `baseCommit` as it was then, the commit the chat's changes were made on; where the
+   * files were that commit's own, it is that commit.
+   */
+  chatCommit: string;
+
+  /**
+   * The files whose merge was not clean, as paths within the gadget, in sorted order (see
+   * BlueprintMerge.conflictPaths).
+   */
+  conflictPaths: string[];
+};
+
+/** Result of GadgetClient.applyBlueprint(). */
+export type ApplyBlueprintResult = {
+  /** A new chat holds the proposal, to preview and then accept or discard. */
+  outcome: "proposed";
+
+  /** The new chat. */
+  chatId: number;
+} | {
+  /** The gadget already follows this blueprint at its current release. Nothing was proposed. */
+  outcome: "upToDate";
+} | {
+  /**
+   * The gadget and the blueprint share no history, and the caller did not allow for that.
+   * Nothing was proposed. Calling again with `allowUnrelated` proposes a merge over a guessed
+   * base (see BlueprintMerge.unverifiedBase), which the user should be warned of first.
+   */
+  outcome: "unrelated";
+} | {
+  /**
+   * The gadget and the blueprint share a version, but its files are not available to merge
+   * against. Nothing was proposed.
+   */
+  outcome: "baseUnavailable";
 };
 
 /**
@@ -4540,6 +5220,15 @@ export type BlueprintMetadata = {
   lastUpdated: Date;
 
   /**
+   * The git commit this version of the blueprint is: its *release commit*, whose tree holds the
+   * blueprint's files. The blueprint's content is a packfile of that commit.
+   *
+   * Absent on a blueprint stored before releases were commits, whose content is a snapshot of
+   * its files alone.
+   */
+  commitId?: string;
+
+  /**
    * If present, a screenshot is stored separately from the metadata. The server uses this
    * to decide when to include a derived screenshotUrl.
    */
@@ -4573,6 +5262,14 @@ export type BlueprintGadgetSummary = {
   codeVersionDate: Date;  // timestamp of the exported code version
   screenshotUrl?: string;
   dirty?: boolean;        // true if last publish failed and needs retry
+
+  /**
+   * Present if the gadget the blueprint is published from has committed files other than the
+   * ones the blueprint last published: Overseer.updateBlueprint() with `updateCode` would
+   * publish them. It goes by the files alone, so a gadget whose history has moved on but whose
+   * files are back as they were published has none.
+   */
+  unpublishedChanges?: true;
 };
 
 /**
@@ -4784,6 +5481,32 @@ export interface GadgetClient extends WorkpieceClient {
    * Overseer.updateBlueprint() etc.).
    */
   createBlueprint(title?: string, description?: string, screenshot?: BlueprintScreenshotUpload): Promise<BlueprintGadgetSummary>;
+
+  /**
+   * Propose merging the current release of a blueprint into this gadget: to take an update from
+   * the blueprint the gadget follows, or to switch it to another. The proposal is recorded in a
+   * new chat (see AiChatMessageBody.blueprintMerges), where it is previewed and then accepted
+   * or discarded like any other proposed change. Nothing about the gadget changes until it is
+   * accepted, including which blueprint it follows.
+   *
+   * The merge is three-way, against the newest version the gadget and the release have in
+   * common. If they share no history that version has to be guessed, which is only done if
+   * `allowUnrelated` is set (see ApplyBlueprintResult). Unless the release is already in the
+   * gadget's history, the merge is written as a commit, which the new chat is pinned at.
+   *
+   * A proposal of kind "merge" starts an agent turn in the new chat, to resolve what conflicted
+   * and to check that the two sets of changes work together. `modelId` is the model that runs
+   * it: as for Overseer.newChat(), one of the IDs in the result of `listModels()`, or null for
+   * no agent. No other proposal starts a turn.
+   *
+   * Throws if the blueprint does not exist, or if the gadget is still pending in a chat and so
+   * has no committed code to merge into. Throws too, creating no chat, if the gadget and the
+   * blueprint both changed a file and a version of it, or the merged text, is too large for a
+   * file to hold; the error names the file. Making it smaller, or undoing the gadget's own
+   * changes to it, lets the blueprint be applied.
+   */
+  applyBlueprint(blueprintId: string, options: {modelId: string | null, allowUnrelated?: boolean})
+      : Promise<ApplyBlueprintResult>;
 }
 
 /**

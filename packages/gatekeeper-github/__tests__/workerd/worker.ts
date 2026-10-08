@@ -8,10 +8,12 @@
 // stubs the test passes (the fake approval queue and git cache) ride through to the facet, and
 // results ride back as plain data.
 
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import type { RpcStub } from "cloudflare:workers";
-import type { ActionDescription, GitCache } from "@gadgets/workshop-shared/gatekeeper";
-import type { GitHubGatekeeperImpl } from "../../src/github.js";
+import type {
+  AccountDescription, ActionDescription, ConnectHandoff, GatekeeperUser, GitCache,
+} from "@gadgets/workshop-shared/gatekeeper";
+import type { GitHubGatekeeperImpl, GitHubVerifierApi } from "../../src/github.js";
 import type {
   GitHubBranchSummary,
   GitHubCommitDetails,
@@ -26,6 +28,39 @@ import type {
 
 export { default } from "../../src/github.js";
 export * from "../../src/github.js";
+// Named as well, since the pool builds `ctx.exports` entrypoints only from exports it can see
+// statically, and the account and TestHooks mint these.
+export { GatekeeperUserImpl, GitHubVerifier } from "../../src/github.js";
+
+/** What each `TestConnectCallback` was told, by its `props.name`. */
+export const connectCallbackEvents = new Map<string, string[]>();
+
+/** Stands in for the Workshop's connect callback, recording each call it receives. */
+export class TestConnectCallback extends WorkerEntrypoint<Cloudflare.Env, { name: string }> {
+  #record(event: string): void {
+    const events = connectCallbackEvents.get(this.ctx.props.name) ?? [];
+    events.push(event);
+    connectCallbackEvents.set(this.ctx.props.name, events);
+  }
+
+  async complete(): Promise<ConnectHandoff> {
+    this.#record("complete");
+    return { targetOrigin: "https://workshop.example", ticket: "ticket" };
+  }
+
+  async reconnectComplete(stageId: string): Promise<ConnectHandoff> {
+    this.#record(`reconnectComplete:${stageId}`);
+    return { targetOrigin: "https://workshop.example", ticket: "ticket" };
+  }
+
+  async credentialsExpired(): Promise<void> {
+    this.#record("credentialsExpired");
+  }
+
+  async credentialsRestored(): Promise<void> {
+    this.#record("credentialsRestored");
+  }
+}
 
 /** Mirrors github.ts's (unexported) `GitHubGatekeeperImplProps`. */
 export type GatekeeperProps = {
@@ -60,9 +95,15 @@ export type CreatePullRequestActionData = {
   options: GitHubCreatePullRequestOptions;
 };
 
+/** github.ts's (unexported) `PostReviewAction` record, read off the real submit signature. */
+export type PostReviewActionData = Extract<
+  Parameters<GitHubGatekeeperImpl["submitActionForApproval"]>[1], { type: "postReview" }>;
+
 type TestExports = {
   GitHubGatekeeperImpl(options: { props: GatekeeperProps }):
     DurableObjectClass<GitHubGatekeeperImpl>;
+  GatekeeperUserImpl(options: { props: { userObjectId: string } }): Fetcher<GatekeeperUser>;
+  GitHubVerifier(options: { props: { userObjectId: string } }): Fetcher<GitHubVerifierApi>;
 };
 
 // The facet methods TestHooks forwards to, spelled structurally: workers-types' `Fetcher<T>`
@@ -74,7 +115,7 @@ type GatekeeperFacet = {
   prepareCreatePullRequest(options: GitHubCreatePullRequestOptions)
     : Promise<CreatePullRequestActionData>;
   submitActionForApproval(
-    queue: unknown, action: PushActionData | CreatePullRequestActionData,
+    queue: unknown, action: PushActionData | CreatePullRequestActionData | PostReviewActionData,
     description: ActionDescription): Promise<void>;
   applyAction(actionId: number, cache: RpcStub<GitCache>): Promise<void>;
   rejectAction(actionId: number): Promise<undefined | { restart?: boolean }>;
@@ -134,6 +175,20 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
     })) as unknown as GatekeeperFacet;
   }
 
+  /** `GatekeeperUser.describe()` for the account with id `userObjectId`. */
+  async describeAccount(userObjectId: string): Promise<Outcome<AccountDescription>> {
+    const user = (this.ctx.exports as unknown as TestExports)
+      .GatekeeperUserImpl({ props: { userObjectId } });
+    return await outcome(() => user.describe());
+  }
+
+  /** `GitHubVerifier.hasRepoAccess()` as the account with id `userObjectId`. */
+  async hasRepoAccess(userObjectId: string, owner: string, repo: string): Promise<Outcome<boolean>> {
+    const verifier = (this.ctx.exports as unknown as TestExports)
+      .GitHubVerifier({ props: { userObjectId } });
+    return await outcome(() => verifier.hasRepoAccess(owner, repo));
+  }
+
   async preparePush(
     facetName: string, props: GatekeeperProps,
     branch: string, commitId: string, force: boolean, cache: RpcStub<GitCache>,
@@ -160,6 +215,14 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
   async submitCreatePullRequest(
     facetName: string, props: GatekeeperProps,
     queue: unknown, action: CreatePullRequestActionData, description: ActionDescription,
+  ): Promise<Outcome<void>> {
+    return await outcome(() =>
+      this.#gatekeeper(facetName, props).submitActionForApproval(queue, action, description));
+  }
+
+  async submitReview(
+    facetName: string, props: GatekeeperProps,
+    queue: unknown, action: PostReviewActionData, description: ActionDescription,
   ): Promise<Outcome<void>> {
     return await outcome(() =>
       this.#gatekeeper(facetName, props).submitActionForApproval(queue, action, description));

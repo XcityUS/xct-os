@@ -9,9 +9,9 @@ import type {
   AiChatAuthorInfo, AiChatMessage, AiChatMetadata, AiModelConfig,
 } from "@gadgets/workshop-shared/api";
 import type { ActionDescription } from "@gadgets/workshop-shared/gatekeeper";
-import type {
-  ActionRecord, AutoApproveTagRecord, OverseerDurableObject,
-} from "../src/overseer.js";
+import type { OverseerDurableObject } from "../src/overseer.js";
+import type { ActionRecord, AutoApproveTagRecord }
+  from "../src/storage-schema/overseer-storage.js";
 
 // The OverseerImpl members these tests drive; the class itself is private to overseer.ts.
 interface OverseerInternals {
@@ -42,7 +42,7 @@ interface OverseerInternals {
   submitAction(gatekeeperId: number, action: number, description: ActionDescription,
                caller: { from: "agent", chatId: number } | { from: "user" }): Promise<unknown>;
   drainAutoApprovals(gatekeeperId: number): Promise<void>;
-  getGatekeeperFacet(): { applyAction(): Promise<void> };
+  getGatekeeperFacet(): Promise<{ applyAction(): Promise<void> }>;
   applyPendingAction(record: ActionRecord, author: AiChatAuthorInfo, autoApproved: boolean)
       : Promise<void>;
 }
@@ -380,7 +380,7 @@ describe("agent tracing", () => {
         },
       });
       impl.storage.autoApproveTags.put({ gatekeeperId: 7, actionKind: poke, enabledBy: OWNER });
-      impl.getGatekeeperFacet = () => ({ applyAction: async () => {} });
+      impl.getGatekeeperFacet = async () => ({ applyAction: async () => {} });
 
       // A rule approves this action without a request. (Submitted first: a pending manual gate
       // holds back every later action of its connection.)

@@ -32,6 +32,18 @@ export type XcityAgentPersonaDetails = {
   kwhPerUse?: number;
 };
 
+/**
+ * Xcity marketplace persona selected when a chat was created, stored on its `AiChatAgentContext`.
+ * `persona === null` records that the catalog selection was valid but tokenhub did not have the
+ * persona prompt at creation time, so the chat intentionally behaves like an ordinary coding-agent
+ * chat.
+ */
+export type XcityChatAgentSnapshot = {
+  slug: string;
+  displayName: string;
+  persona: string | null;
+};
+
 type PersonaCacheEntry = {
   fetchedAt: number;
   details: XcityAgentPersonaDetails;

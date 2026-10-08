@@ -771,6 +771,13 @@ export interface GatekeeperUserVerifier extends WorkerEntrypoint {}
  *
  * The Gatekeeper executes as a Durable Object Facet, where it is a child of the Overseer. This
  * interface is exposed to the Overseer, not directly to the Gadget.
+ *
+ * A Gatekeeper may mint persistent stubs to itself with `this.ctx.restore(params)` and a
+ * `[restore](params)` method (see `ApprovalQueue.bindHook()`), e.g. for its worker's push handler
+ * to deliver events through. They keep restoring until the connection is removed from the
+ * workspace, and reach whatever `[restore]()` returns: return a target narrowed to the stub's
+ * purpose, never the Gatekeeper itself (which answers Overseer-only calls such as `applyAction()`),
+ * and keep the stubs within the gatekeeper's own worker.
  */
 export interface Gatekeeper<Session> extends DurableObject {
   /**
@@ -1635,9 +1642,14 @@ export interface GitCache extends RpcTarget {
   buildPack(): Promise<ReadableStream<Uint8Array>>;
 
   /**
-   * Consumes a standard git packfile and inserts all the objects within into the git cache. This
-   * is exactly equivalent to if the Gatekeeper decoded the packfile itself and `put()` each object
-   * into the cache.
+   * Consumes a standard git packfile, storing each object in it as `put()` would, and returns
+   * the oids of those now in the cache. An object too large to store is measured and left out of
+   * the result rather than thrown on, which is how a `gitPull()` notices it.
+   *
+   * The pack is decoded in one pass, so a delta must follow its base, as in every pack
+   * `git upload-pack` sends. Objects are stored as the pack streams in, and its commits last,
+   * once the rest has verified and been stored: a pack that fails can leave some of its objects
+   * stored, but not a commit without the trees that came with it.
    */
   consumePack(pack: ReadableStream<Uint8Array>): Promise<GitOid[]>;
 

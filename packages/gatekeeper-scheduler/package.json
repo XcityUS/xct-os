@@ -20,7 +20,7 @@
     "temporal-polyfill": "1.0.2"
   },
   "devDependencies": {
-    "@cloudflare/kumo": "^2.13.2",
+    "@cloudflare/kumo": "^2.14.0",
     "@cloudflare/vitest-pool-workers": "catalog:",
     "@gadgets/scripts": "workspace:*",
     "@phosphor-icons/react": "^2.1.10",
@@ -34,7 +34,7 @@
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "tailwindcss": "^4.3.3",
-    "terser": "^5.49.2",
+    "terser": "^5.51.2",
     "typescript": "catalog:",
     "vite": "catalog:",
     "vite-plugin-singlefile": "^2.3.3",

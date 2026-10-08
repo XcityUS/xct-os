@@ -103,3 +103,10 @@ export class FakeGatekeeperAccount
     return accountCalls.get(this.ctx.props.name) ?? [];
   }
 }
+
+/** A chat gateway response target that never accepts, as one whose Worker has gone away. */
+export class FailingChatGateway extends WorkerEntrypoint {
+  async onGadgetResponse(): Promise<void> {
+    throw new Error("chat gateway unavailable");
+  }
+}

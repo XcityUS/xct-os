@@ -6,6 +6,7 @@ import {
   completeRun,
   createSchedule,
   failRun,
+  quarantineRun,
   rejectRun,
   retryDelay,
   type ScheduleRegistration,
@@ -260,6 +261,27 @@ describe("schedule state", () => {
     const admitted = admitRun(pending, "current", 66_000, 366_000);
     expect(rejectRun(admitted, "stale", 72_000)).toBe(admitted);
     expect(completeRun(admitted, "stale", 72_000)).toBe(admitted);
+  });
+
+  it("quarantines any live state as dead without re-validating its spec", () => {
+    const broken = { ...recurring, spec: { kind: "interval" as const, everyMs: 0, anchorMs: 0 } };
+    const active = { ...broken, status: "active" as const, nextFire: 60_000 };
+    expect(() => failRun(
+      { ...active, status: "pending", stage: "delivery", runId: "r", scheduledTime: 0,
+        attempts: 1, leaseExpiresAt: 0 },
+      "r", "callback_failed", 1,
+    )).toThrow();
+
+    expect(quarantineRun(active, 5)).toEqual({
+      ...broken, occurrences: undefined, occurrenceCount: undefined,
+      status: "dead", runId: "", attempts: 0, failedAt: 5, failureCode: "callback_failed",
+    });
+    const pending = beginDueRun(createSchedule(recurring, 0), 60_000, "run", 360_000);
+    expect(quarantineRun(pending, 7)).toEqual(expect.objectContaining({
+      status: "dead", runId: "run", attempts: 0, failedAt: 7,
+    }));
+    const completed = { ...recurring, status: "completed" as const, completedAt: 1 };
+    expect(quarantineRun(completed, 9)).toBe(completed);
   });
 });
 

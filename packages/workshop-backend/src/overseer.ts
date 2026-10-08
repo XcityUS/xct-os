@@ -67,6 +67,7 @@ import { WebFetchEnv } from "./web-fetch";
 import { UserDurableObject, type UserChatContext, type XcityChatAgentPersona } from "./user";
 import type { AgentSpawnerBinding, CallableAgent, SpawnCallableOptions } from "./agent-spawner-binding";
 import { recordAnalytics } from "./analytics";
+import { alarmsDisabled, guardedAlarm } from "@gadgets/observability/alarm-guard";
 import { reportIssue } from "@gadgets/observability/error-reporting";
 import type { ProductAnalyticsConnectionType, ProductAnalyticsGadgetInput } from "./analytics";
 import { checkUsageAndBalance } from "./ai-gateway-billing/limits/usage-checker";
@@ -439,6 +440,10 @@ const CHAT_CHANGE_RETIRED_TTL_MS = 60_000;
 const CHAT_CHANGE_CLIENT_ID_PATTERN = /^[0-9A-Za-z_-]{1,64}$/;
 
 const AGENT_RESPONSE_DELIVERED_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+// A ready response re-arms the alarm at `now` until delivered, so a target that never accepts would
+// spin it forever; past this many failures the response is abandoned (see docs/alarm-audit.md, O1).
+const MAX_RESPONSE_DELIVERY_ATTEMPTS = 8;
 
 // How long after agent work becomes outstanding (a turn starts, or a call to a callable agent is
 // recorded) the keep-alive alarm fires. See #agentKeepAliveTime.
@@ -6343,7 +6348,20 @@ class OverseerImpl implements AgentHooks {
         chatId: record.chatId,
         error: err,
       });
-      throw err;
+      // Count against the stored record (another delivery may have raced this one), and once the
+      // budget is spent settle it as delivered, which keeps retries of the submission idempotent.
+      let current = this.storage.gadgetResponseDeliveries.get(record.idempotencyKey);
+      if (current?.status !== "ready") throw err;
+      let deliveryAttempts = (current.deliveryAttempts ?? 0) + 1;
+      if (deliveryAttempts < MAX_RESPONSE_DELIVERY_ATTEMPTS) {
+        this.storage.gadgetResponseDeliveries.put({ ...current, deliveryAttempts });
+      }
+      current.chatGatewayRpcTarget[Symbol.dispose]();
+      if (deliveryAttempts < MAX_RESPONSE_DELIVERY_ATTEMPTS) throw err;
+      this.logger.error("abandoned undeliverable external message response", {
+        event: "external.message.response.delivery.abandoned",
+        chatId: record.chatId,
+      });
     }
     this.storage.gadgetResponseDeliveries.put({
       idempotencyKey: record.idempotencyKey,
@@ -9360,10 +9378,14 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
    *   alarm, picking the work up yet again.
    * - External-message responses ready to deliver, and delivered records due to be swept.
    *
-   * See OverseerImpl.runAlarmTasks for how the concerns are run together.
+   * See OverseerImpl.runAlarmTasks for how the concerns are run together. It runs under
+   * guardedAlarm: the ALARMS_DISABLED kill switch, an hourly cap, and backoff in place of the
+   * `now` re-arm when it throws (see docs/alarm-audit.md).
    */
   async alarm() {
-    await this.impl.runAlarmTasks();
+    await guardedAlarm(this.ctx, {
+      key: "overseer", disabled: alarmsDisabled(this.env), maxPerHour: 1200, deferWhenOpen: true,
+    }, () => this.impl.runAlarmTasks());
   }
 
   // Initialize a brand-new workspace's storage. (Before git-backed code storage this also wrote

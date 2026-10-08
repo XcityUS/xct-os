@@ -38,6 +38,7 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { ConnectHandoff, GatekeeperConnectCallback, GatekeeperUser } from "@gadgets/workshop-shared/gatekeeper";
 import { createWorkshopLogger } from "../observability";
+import { haltIfAlarmsDisabled } from "@gadgets/observability/alarm-guard";
 import { CLOUDFLARE_VENDOR_ID, type UserDurableObject } from "../user.js";
 import { readAdminConfig } from "../admin-config.js";
 import {
@@ -173,6 +174,7 @@ export class PendingLogin extends DurableObject<Cloudflare.Env> {
   }
 
   async alarm(): Promise<void> {
+    if (await haltIfAlarmsDisabled(this.ctx, this.env, "pending-login")) return;
     this.ctx.storage.kv.delete(RESULT_KEY);
   }
 }

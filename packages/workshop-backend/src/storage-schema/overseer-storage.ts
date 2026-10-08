@@ -732,7 +732,8 @@ type PendingAgentCallRecord = {
 /**
  * External message gateways pass a response target when submitting a prompt. While the agent turn is
  * in progress, `waiting` records persist that target across DO eviction/restart; once response
- * text is known, `ready` records retry delivery until acknowledged; `delivered` records are
+ * text is known, `ready` records retry delivery until acknowledged (or abandoned after
+ * MAX_RESPONSE_DELIVERY_ATTEMPTS failures); `delivered` records are
  * retained briefly so retries of the same external message remain idempotent.
  */
 export type ExternalMessageRecord = {
@@ -754,6 +755,8 @@ export type ExternalMessageRecord = {
       status: "ready";
       chatGatewayRpcTarget: NativeRpcStub<ChatGatewayRpcTarget>;
       responseText: string;
+      /** Failed deliveries so far; bounded by MAX_RESPONSE_DELIVERY_ATTEMPTS in overseer.ts. */
+      deliveryAttempts?: number;
     }
   | {
       status: "delivered";

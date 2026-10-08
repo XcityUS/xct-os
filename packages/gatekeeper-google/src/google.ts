@@ -2,6 +2,7 @@ import { WorkerEntrypoint, DurableObject, RpcTarget, RpcStub } from "cloudflare:
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import { GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, ResourceDescription, ApprovalQueue, ObservationDescription, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription, SupportedResource, ResourceConfiguratorFrame, Cursor, ActionKind, GitCache, type ConnectHandoff } from '@gadgets/workshop-shared/gatekeeper';
 import { buildDescription, codeSpan, plainInline } from "@gadgets/gatekeeper-kit/action-description";
+import { haltIfAlarmsDisabled } from "@gadgets/gatekeeper-kit/alarm-guard";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import {
@@ -698,6 +699,7 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async alarm(_alarmInfo?: AlarmInvocationInfo): Promise<void> {
+    if (await haltIfAlarmsDisabled(this.ctx, this.env, "connect-timeout")) return;
     await this.#credentials.run(async () => {
       if (shouldDeleteCredentialsOnAlarm(this.ctx.storage.kv)) {
         this.ctx.storage.deleteAll();

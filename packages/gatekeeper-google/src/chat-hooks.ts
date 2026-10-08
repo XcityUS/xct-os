@@ -23,6 +23,7 @@ import { ChatApiError, chatApiFailure, type ChatMessageRaw } from "./chat-api";
 import type { ChatMessageHook } from "./chat-types";
 import { getBaseUrl, type GoogleOAuthEnv } from "./oauth";
 import { obsContext } from "./observability";
+import { haltIfAlarmsDisabled } from "@gadgets/gatekeeper-kit/alarm-guard";
 
 const logger = obsContext.createLogger({ component: "gatekeeper.google.chat-hooks", vendorId: "google" });
 
@@ -167,6 +168,7 @@ export class ChatHookDriver extends DurableObject<Env> {
    * - dropping expired subscriptions no hook uses any more.
    */
   async alarm(): Promise<void> {
+    if (await haltIfAlarmsDisabled(this.ctx, this.env, "chat-hooks")) return;
     const now = Date.now();
     const rows = [...this.ctx.storage.kv.list<Pending | Delivered>({ prefix: "msg:" })];
     await Promise.all(rows.map(async ([key, row]) => {

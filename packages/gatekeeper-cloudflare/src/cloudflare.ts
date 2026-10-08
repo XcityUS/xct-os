@@ -6,6 +6,7 @@ import {
   SupportedResource, ResourceConfiguratorFrame, ResourceDescription, ApprovalQueue, ActionKind,
   GitCache, stripTrailingSlashes, type ConnectHandoff,
 } from "@gadgets/workshop-shared/gatekeeper";
+import { haltIfAlarmsDisabled } from "@gadgets/gatekeeper-kit/alarm-guard";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
@@ -430,6 +431,7 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    if (await haltIfAlarmsDisabled(this.ctx, this.env, "connect-timeout")) return;
     // Drop the account if the flow never completed, or if this was a transient auth-only sign-in
     // grant (used once to read the email for login).
     if (!this.hasRefreshToken() || this.ctx.storage.kv.get<boolean>("ephemeral")) {

@@ -31,6 +31,7 @@ import {
   type SupportedResource,
   type VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
+import { haltIfAlarmsDisabled } from "@gadgets/gatekeeper-kit/alarm-guard";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import {
@@ -480,6 +481,7 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async alarm() {
+    if (await haltIfAlarmsDisabled(this.ctx, this.env, "connect-timeout")) return;
     if (!this.ctx.storage.kv.get<string>("accessToken")) {
       this.ctx.storage.deleteAll();
     }

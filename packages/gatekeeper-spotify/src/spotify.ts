@@ -17,6 +17,7 @@ import {
   type VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { buildDescription, type RenderedDescription } from "@gadgets/gatekeeper-kit/action-description";
+import { haltIfAlarmsDisabled } from "@gadgets/gatekeeper-kit/alarm-guard";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
@@ -649,6 +650,7 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    if (await haltIfAlarmsDisabled(this.ctx, this.env, "connect-timeout")) return;
     if (!this.ctx.storage.kv.get<string>("refreshToken")) {
       await this.ctx.storage.deleteAll();
     }

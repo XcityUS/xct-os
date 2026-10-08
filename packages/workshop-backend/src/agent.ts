@@ -36,6 +36,7 @@ import {
 } from "./agent-compaction";
 import { formatGrep, type GrepScan } from "./grep";
 import { formatAgentPersona } from "./xcity/agent-persona";
+import { isXcityModelThrottle } from "./xcity/tokenhub-errors";
 
 const logger = createWorkshopLogger("workshop.agent");
 
@@ -4125,7 +4126,10 @@ async function runAgentPass(
     // it can be determined) for the overseer's triage; runAgent retries a transient one first.
     let message = turnFailure.errorMessage ?? "The model request failed.";
     let error = new AgentTurnError(message, httpStatusFromError(message, handle.lastResponse));
-    if (isRetryableAssistantError(turnFailure)) return {type: "transientFailure", error};
+    // (Xcity: a TokenHub plan throttle is not transient; the overseer reports it instead.)
+    if (isRetryableAssistantError(turnFailure) && !isXcityModelThrottle(modelConfig, error)) {
+      return {type: "transientFailure", error};
+    }
     throw error;
   }
 

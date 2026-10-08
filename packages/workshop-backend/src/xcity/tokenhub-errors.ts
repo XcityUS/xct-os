@@ -132,6 +132,16 @@ export function parseTokenHubThrottle(error: unknown): TokenHubThrottle | null {
   }
 }
 
+/**
+ * Whether `error`, from a request to `config`, is a TokenHub throttle on a model served by the
+ * Xcity model plane. runAgent must not retry such a failure as transient: the plan's per-minute
+ * limit doesn't lift in the seconds its backoff waits, and every retry spends another request of
+ * it. False for every non-Xcity model, leaving upstream's retry behaviour unchanged. Never throws.
+ */
+export function isXcityModelThrottle(config: AiModelConfig, error: unknown): boolean {
+  return getXcityModelMetadata(config) !== undefined && parseTokenHubThrottle(error) !== null;
+}
+
 function formatWait(ms: number): string {
   let seconds = Math.ceil(ms / 1000);
   if (seconds < 60) return `${seconds}s`;

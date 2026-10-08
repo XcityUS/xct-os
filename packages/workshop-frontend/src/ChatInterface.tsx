@@ -1,4 +1,4 @@
-import { logRpcFailure } from "./rpcErrors";
+import { logRpcFailure, rpcFailureDescription } from "./rpcErrors";
 import {
   Fragment,
   isValidElement,
@@ -80,12 +80,14 @@ import {
   ChatAttachmentRef,
   ChatCodeBase,
   WorkpieceId,
+  BlueprintMerge,
   BlueprintOutput,
   MessageFormatRef,
   XcityCatalogAgent,
 } from "@gadgets/workshop-shared/api";
-import { composeCodeChange, type CodeChange } from "@gadgets/workshop-shared/code-change";
-import type { ChatChangeRow } from "./features/code/otClient";
+import { composeEpochChanges, type CodeChange } from "@gadgets/workshop-shared/code-change";
+import type { ChatChangeRow, ChatContentReader } from "./features/code/otClient";
+import { commitFileStore, type CommitFileReader } from "./features/code/commitFileStore";
 import { ActionKind } from "@gadgets/workshop-shared/gatekeeper";
 import {
   useSlashCommandChoice, type OverseerSource,
@@ -116,6 +118,12 @@ import { isImeComposing } from "./keyboardEvent";
 import { formatAttachmentSize } from "./features/chat/attachmentFormatting";
 import { ChatComposer } from "./features/chat/composer/ChatComposer";
 import { composerDraftStorageKey } from "./features/chat/composer/draft/composerDraft";
+import {
+  findUnresolvedConflicts, listConflictedFiles, type UnresolvedConflict,
+} from "./features/chat/mergeConflicts";
+import { UnresolvedConflictsDialog } from "./features/chat/UnresolvedConflictsDialog";
+import { BlueprintProposalNotice } from "./features/blueprint-updates/BlueprintProposalNotice";
+import { appliedBlueprintMerges } from "./features/blueprint-updates/blueprintProposal";
 
 /**
  * The selected chat's live (accepted but not yet materialized) change row stream, delivered via
@@ -1834,6 +1842,19 @@ type ChatDisplayEntry =
       type: "savedChanges";
       key: string;
       message: ChangeChatMessage;
+    }
+  | {
+      // Blueprint releases someone proposed merging into gadgets (see
+      // GadgetClient.applyBlueprint()). Unlike saved edits, the row outlives the proposal's
+      // acceptance or discard: the agent's review of a merge follows it with no message from
+      // anyone in between, and would otherwise be answering nothing.
+      type: "blueprintProposal";
+      key: string;
+      message: ChangeChatMessage;
+      merges: BlueprintMerge[];
+      status: "pending" | "merged" | "reverted";
+      /** Whether an agent has written in the chat since, as the one reviewing a merge does. */
+      agentFollowed: boolean;
     };
 
 function isObservationActionMessage(msg: AiChatMessage): msg is ObservationChatMessage {
@@ -2074,6 +2095,10 @@ export function buildChatDisplayEntries(
     msg.conversionBoundary !== true &&
     (changeStatus.get(msg.sequence) ?? "pending") === "pending";
 
+  // Whether a "changes" message gets a row of its own, which ends the run of work before it.
+  const startsOwnRow = (msg: AiChatMessage) =>
+    appliedBlueprintMerges(msg).length > 0 || isVisibleSavedChangesMessage(msg);
+
   for (let i = 0; i < messages.length; ) {
     const msg = messages[i];
     maybePushBoundaries(msg.sequence);
@@ -2122,7 +2147,17 @@ export function buildChatDisplayEntries(
     }
 
     if (msg.type === "changes") {
-      if (isVisibleSavedChangesMessage(msg)) {
+      const merges = appliedBlueprintMerges(msg);
+      if (merges.length > 0) {
+        result.push({
+          type: "blueprintProposal",
+          key: `blueprint-proposal-${msg.chatId}-${msg.sequence}`,
+          message: msg,
+          merges,
+          status: changeStatus.get(msg.sequence) ?? "pending",
+          agentFollowed: messages.slice(i + 1).some((later) => later.author.type === "agent"),
+        });
+      } else if (isVisibleSavedChangesMessage(msg)) {
         result.push({
           type: "savedChanges",
           key: `saved-changes-${msg.chatId}-${msg.sequence}`,
@@ -2151,7 +2186,7 @@ export function buildChatDisplayEntries(
       while (j < messages.length) {
         const nextMsg = messages[j];
         if (nextMsg.type === "changes") {
-          if (isVisibleSavedChangesMessage(nextMsg)) break;
+          if (startsOwnRow(nextMsg)) break;
           j++;
           continue;
         }
@@ -2191,7 +2226,7 @@ export function buildChatDisplayEntries(
       while (j < messages.length) {
         const nextMsg = messages[j];
         if (nextMsg.type === "changes") {
-          if (isVisibleSavedChangesMessage(nextMsg)) break;
+          if (startsOwnRow(nextMsg)) break;
           j++;
           continue;
         }
@@ -2359,7 +2394,8 @@ export function computeMessageStates(
 
 /**
  * The durable part of a chat's uncommitted code state (see ChatCodeChanges): the current
- * epoch's non-reverted "changes" messages composed into one change, plus the generation revision
+ * epoch's non-reverted "changes" messages composed into one change, each gadget's from its last
+ * pin declaration on (see composeEpochChanges), plus the generation revision
  * their watermarks reach. `codeBase` is the chat's current ChatCodeBase; only messages at or
  * after its `epoch` participate ("at" matters for a migrated chat, whose epoch points at its own
  * conversionBoundary changes message) -- accepting changes resets the chat's code base, so
@@ -2380,25 +2416,20 @@ export function computeChatEpochChanges(
   const { changeStatus } = computeMessageStates(messages, compacted);
   const epoch = codeBase?.epoch;
   const generation = codeBase?.generation ?? 0;
-  const changes: CodeChange[] = [];
+  let seed: CodeChange | undefined;
   let rowsThrough = 0;
 
   if (compacted && (messages.length === 0 || messages[0].sequence >= compacted.to) &&
       (epoch === undefined || compacted.to - 1 >= epoch)) {
     // The boundary's proposed-changes entry is folded in at sequence `to - 1` by
     // computeMessageStates, so a revert reaching across the boundary marks that sequence.
-    if (compacted.proposedChange !== undefined &&
-        changeStatus.get(compacted.to - 1) !== "reverted") {
-      changes.push(compacted.proposedChange);
-    }
+    if (changeStatus.get(compacted.to - 1) !== "reverted") seed = compacted.proposedChange;
   }
 
-  for (const msg of messages) {
-    if (msg.type !== "changes" || (epoch !== undefined && msg.sequence < epoch) ||
-        changeStatus.get(msg.sequence) === "reverted") {
-      continue;
-    }
-    if (msg.change !== undefined) changes.push(msg.change);
+  const batches = messages.filter((msg): msg is ChangeChatMessage =>
+    msg.type === "changes" && (epoch === undefined || msg.sequence >= epoch) &&
+    changeStatus.get(msg.sequence) !== "reverted");
+  for (const msg of batches) {
     // Revisions restart per generation, so only the current generation's watermarks position
     // the live-row cursor (an older generation's rows were retired by its closing bump).
     if (msg.watermark !== undefined && msg.watermark.changesGeneration === generation) {
@@ -2406,11 +2437,7 @@ export function computeChatEpochChanges(
     }
   }
 
-  return {
-    epochChange:
-        changes.length === 0 ? undefined : changes.reduce((a, b) => composeCodeChange(a, b)),
-    rowsThrough,
-  };
+  return { epochChange: composeEpochChanges(batches, seed), rowsThrough };
 }
 
 // The agent that last spoke in the chat: the author of the most recent agent message or agent error.
@@ -2466,6 +2493,9 @@ interface ChatInterfaceProps {
   // ChatLiveEditPreviews).
   onLiveEditPreviewsChange?: (previews: ChatLiveEditPreviews | undefined) => void;
   onStreamingActiveFileChange?: (chatId: number, file: ActiveFileTarget | null | undefined) => void;
+  // The selected chat's uncommitted content, which accepting its changes first checks for merge
+  // conflicts nobody resolved. Without it the changes are accepted unchecked.
+  chatContent?: ChatContentReader;
   pendingConsoleLogCount: number;
   consoleLogPreview: string;
   consoleLogSeverity: "error" | "warn" | "info";
@@ -2662,6 +2692,7 @@ function ChatInterface({
   onLiveRowsChange,
   onLiveEditPreviewsChange,
   onStreamingActiveFileChange,
+  chatContent,
   pendingConsoleLogCount,
   consoleLogPreview,
   consoleLogSeverity,
@@ -2748,6 +2779,9 @@ function ChatInterface({
   // decision in the update-from-mainline dialog.
   const [staleAcceptChatId, setStaleAcceptChatId] = useState<number | null>(null);
   const [isUpdatingFromMainline, setIsUpdatingFromMainline] = useState(false);
+  // The conflict markers that held up an accept of the selected chat's changes, awaiting the
+  // user's decision in the unresolved-conflicts dialog.
+  const [unresolvedConflicts, setUnresolvedConflicts] = useState<UnresolvedConflict[] | null>(null);
 
   const [expandedToolCalls, setExpandedToolCalls] = useState<Set<string>>(
     new Set(),
@@ -2944,7 +2978,7 @@ function ChatInterface({
 
   // Get sorted list of chats from cache
   const chatList = useMemo(
-    () => Array.from(cacheRef.current.chats.values()).sort(
+    () => Array.from(cacheRef.current.chats.values()).toSorted(
       (a, b) => b.lastActive.getTime() - a.lastActive.getTime(),
     ),
     [chatListVersion],
@@ -3330,6 +3364,7 @@ function ChatInterface({
   useEffect(() => {
     setDiscardChangesTarget(null);
     setStaleAcceptChatId(null);
+    setUnresolvedConflicts(null);
   }, [selectedChatId]);
 
   // Initialize title input when selecting a chat
@@ -3629,6 +3664,13 @@ function ChatInterface({
       }
 
       switch (event.type) {
+        case "streamReset":
+          // A failed model request is being retried: drop everything it streamed, as an error
+          // message would, so the retry's output doesn't append to the failed attempt's.
+          clearProvisionalTextState(provisional);
+          clearProvisionalCodeState(provisional);
+          resetEditPreviews(chatId);
+          break;
         case "compacting":
           provisional.compacting = true;
           break;
@@ -4045,7 +4087,11 @@ function ChatInterface({
       }
     } catch (err) {
       if (!logRpcFailure("Failed to send message:", err, { reportSite: "chat.send" })) {
-        toasts.add({ title: "Failed to send message", variant: "error" });
+        toasts.add({
+          title: "Failed to send message",
+          description: rpcFailureDescription(err),
+          variant: "error",
+        });
       }
       throw err;
     }
@@ -4069,7 +4115,11 @@ function ChatInterface({
       onNavigateToChatRef.current(newChatId);
     } catch (err) {
       if (!logRpcFailure("Failed to create new chat:", err, { reportSite: "chat.new" })) {
-        toasts.add({ title: "Failed to start conversation", variant: "error" });
+        toasts.add({
+          title: "Failed to start conversation",
+          description: rpcFailureDescription(err),
+          variant: "error",
+        });
       }
       throw err;
     }
@@ -4220,6 +4270,52 @@ function ChatInterface({
     }
   };
 
+  // What "Accept changes" does. The server merges whatever the chat's files hold, so leftover
+  // conflict markers are caught here: the files that the chat's merges listed as conflicted are
+  // searched for one, and finding any puts the decision to the user. Content that has not
+  // loaded cannot be searched, and holds nothing up. A file nobody has edited since its merge
+  // is read from the commit the chat is pinned at, which the merge wrote.
+  const overseerFileReader: CommitFileReader = {
+    listTree: (commitId) => overseer.listTree(commitId),
+    readFilesAtCommit: (commitId, paths) => overseer.readFilesAtCommit(commitId, paths),
+    listChangedPaths: (fromCommit, toCommit) => overseer.listChangedPaths(fromCommit, toCommit),
+  };
+  const handleAcceptChanges = async () => {
+    const chatId = selectedChatId;
+    const reader = chatContent?.chatId === chatId ? chatContent : undefined;
+    const content = reader?.read();
+    if (reader !== undefined && content !== undefined) {
+      const conflicted = listConflictedFiles(currentMessages, messageStates.changeStatus);
+      // What is searched is the content on screen, and what the server merges is the content
+      // it has been sent. While an edit is on its way the two differ, and the edit may be the
+      // one that removed the last marker.
+      if (conflicted.length > 0 && reader.hasLocalEdits()) {
+        toasts.add({
+          title: "Your latest edits are still being saved. Try accepting again in a moment.",
+        });
+        return;
+      }
+      const pins = currentChatMetadata?.codeBase?.pins ?? [];
+      let unresolved: UnresolvedConflict[];
+      try {
+        unresolved = await findUnresolvedConflicts(
+          conflicted, content,
+          (gadgetId) => pins.find((pin) => pin.gadgetId === gadgetId)?.baseCommit,
+          (commitId, paths) => commitFileStore.readFiles(overseerFileReader, commitId, paths));
+      } catch (err) {
+        console.error("Failed to check for merge conflicts:", err);
+        toasts.add({ title: "Failed to check the changes for merge conflicts", variant: "error" });
+        return;
+      }
+      if (selectedChatIdRef.current !== chatId) return;
+      if (unresolved.length > 0) {
+        setUnresolvedConflicts(unresolved);
+        return;
+      }
+    }
+    void handleMergeChanges();
+  };
+
   // Merge mainline commits that landed after this chat's pins into the chat's uncommitted state
   // (see Overseer.updateChatFromMainline()). Offered when an accept comes back stale. Conflicts
   // are left inline as 3-way markers for the user (or their agent) to resolve; once the chat is
@@ -4245,8 +4341,14 @@ function ChatInterface({
         });
       }
     } catch (err) {
+      // The server refuses an update that needs a file too large to merge, in a message
+      // naming the file and what to do about it (see Overseer.updateChatFromMainline()).
       console.error("Failed to update from mainline:", err);
-      toasts.add({ title: "Failed to bring in the latest changes", variant: "error" });
+      toasts.add({
+        title: err instanceof Error && err.message
+          ? err.message : "Failed to bring in the latest changes",
+        variant: "error",
+      });
     } finally {
       setIsUpdatingFromMainline(false);
     }
@@ -4578,7 +4680,11 @@ function ChatInterface({
       await overseer.retryAgent(selectedChatId, selectedModel);
     } catch (err) {
       console.error("Failed to retry agent:", err);
-      toasts.add({ title: "Failed to retry agent", variant: "error" });
+      toasts.add({
+        title: "Failed to retry agent",
+        description: rpcFailureDescription(err),
+        variant: "error",
+      });
     }
   };
 
@@ -4604,6 +4710,23 @@ function ChatInterface({
 
       return null;
     },
+    [currentMessages, messageStates],
+  );
+
+  // A blueprint proposal of a release the gadget's history already holds writes no commit and
+  // pins nothing, and so is not among the chat's proposedChangeWorkpieces. Its record in the log
+  // is then all that says the chat has something to accept or discard (see
+  // AiChatMessageBody.blueprintMerges).
+  //
+  // TODO: Only the loaded pages of history are looked through. A chat reopened after a
+  // compaction loads what follows the checkpoint, so such a proposal recorded before it gets
+  // no accept or discard until the user scrolls back that far. The fix is the one described
+  // at listConflictedFiles(): the checkpoint carrying the pending merge records.
+  const hasPendingBlueprintProposal = useMemo(
+    () => currentMessages.some((msg) =>
+      msg.type === "changes" &&
+      (msg.blueprintMerges?.length ?? 0) > 0 &&
+      messageStates.changeStatus.get(msg.sequence) === "pending"),
     [currentMessages, messageStates],
   );
 
@@ -5740,11 +5863,19 @@ function ChatInterface({
                           ? `${actor} created ${createdGadgets.length === 1 ? "gadget" : "gadgets"} ${
                               createdGadgets.map((g) => `“${g.title}”`).join(", ")}`
                           : `${actor} saved edits`;
-                        // A still-proposed mainline merge can't be reverted: it advanced the
-                        // chat's pins, and erasing it would let a later accept silently overwrite
-                        // the mainline content it brought in (the server refuses too).
-                        const discardLabel = mainlineMerge
+                        // A mainline merge recorded before merges were commits can't be
+                        // reverted while still proposed: it advanced the chat's pins with no
+                        // record of where they were, and erasing it would let a later accept
+                        // silently overwrite the mainline content it brought in (the server
+                        // refuses too). One that records its `gadgets` puts the pins back.
+                        const irrevocableMerge =
+                          mainlineMerge !== undefined && mainlineMerge.gadgets === undefined;
+                        const discardLabel = irrevocableMerge
                           ? "This update can't be discarded: it brought in changes already accepted elsewhere. Edit the files instead."
+                          : mainlineMerge
+                          ? entry.message.sequence === lastDurablePendingChange?.sequence
+                            ? "Discard this update"
+                            : "Discard this update and later changes"
                           : getSavedEditsDiscardLabel(
                               entry.message.sequence === lastDurablePendingChange?.sequence,
                               createdWorkpiecesOf(entry.message),
@@ -5766,7 +5897,7 @@ function ChatInterface({
                                 <Tooltip content={discardLabel} asChild>
                                   <button
                                     type="button"
-                                    disabled={isAgentActive || mainlineMerge !== undefined}
+                                    disabled={isAgentActive || irrevocableMerge}
                                     onClick={() => handleRevertChanges(entry.message.sequence)}
                                     className="flex cursor-pointer items-center rounded-md p-1 text-kumo-inactive transition-[color,opacity,transform] duration-150 ease-out hover:text-kumo-default focus-visible:text-kumo-default focus-visible:outline-none active:scale-[0.96] disabled:cursor-not-allowed disabled:opacity-40"
                                     aria-label={discardLabel}
@@ -5785,6 +5916,21 @@ function ChatInterface({
                                 </Tooltip>
                               </div>
                             </div>
+                          </div>
+                        );
+                      }
+
+                      if (entry.type === "blueprintProposal") {
+                        return (
+                          <div key={entry.key} className={`${entryTopClass} max-w-[860px] space-y-2`}>
+                            {entry.merges.map((merge) => (
+                              <BlueprintProposalNotice
+                                key={merge.gadgetId}
+                                merge={merge}
+                                status={entry.status}
+                                reviewed={entry.agentFollowed || isAgentActive}
+                              />
+                            ))}
                           </div>
                         );
                       }
@@ -6440,7 +6586,8 @@ function ChatInterface({
                     }
                     draftUpdateBanner={(() => {
                       if (!currentChatMetadata ||
-                          !chatHasProposedChanges(currentChatMetadata)) return null;
+                          !(chatHasProposedChanges(currentChatMetadata) ||
+                            hasPendingBlueprintProposal)) return null;
 
                       // Accepting always merges everything the chat proposes (drafts swept in,
                       // no partial accepts -- see Overseer.mergeChanges()), so the banner needs
@@ -6475,7 +6622,7 @@ function ChatInterface({
                               : "Keep this draft and make it the gadget's current version."} asChild>
                             <WorkshopButton
                               disabled={changesActionsDisabled}
-                              onClick={() => handleMergeChanges()}
+                              onClick={() => { void handleAcceptChanges(); }}
                               tone="primary"
                               className="!h-7 !cursor-pointer !rounded-md !border-transparent !shadow-none gap-1 text-[12px]"
                             >
@@ -6567,6 +6714,17 @@ function ChatInterface({
           </div>
         </Dialog>
       </Dialog.Root>
+
+      {unresolvedConflicts !== null && (
+        <UnresolvedConflictsDialog
+          conflicts={unresolvedConflicts}
+          onCancel={() => setUnresolvedConflicts(null)}
+          onAcceptAnyway={() => {
+            setUnresolvedConflicts(null);
+            void handleMergeChanges();
+          }}
+        />
+      )}
 
       <DeleteConfirmationDialog
         open={deleteTarget !== null}

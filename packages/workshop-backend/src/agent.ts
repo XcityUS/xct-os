@@ -1,12 +1,14 @@
-import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, AiChatStreamEvent, BlueprintOutput, ChatGadgetPin, WorkpieceId, type AiModelConfig, isTextLikeAttachmentMimeType, validateBindingName } from '@gadgets/workshop-shared/api';
+import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AiChatStreamEvent, BlueprintBinding, BlueprintMerge, BlueprintOutput, ChatGadgetPin, ChatGadgetPinRecord, MainlineMergeGadget, WorkpieceId, type AiModelConfig, isTextLikeAttachmentMimeType, validateBindingName } from '@gadgets/workshop-shared/api';
 import { applyCodeChange, codeChangeSerializedSize, replaceSpanChange, type CodeContent,
   type CodeChange, type FileChange } from '@gadgets/workshop-shared/code-change';
 import { PDF_MIME_TYPE, modelApiSupportsPdfAttachments } from './chat-attachment-pdf';
 import { AgentCatalog, ObservationDescription } from '@gadgets/workshop-shared/gatekeeper';
 import { createWorkshopLogger } from "./observability";
-import { Type, toToolDeclaration } from "@earendil-works/pi-ai";
+import {
+  Type, getSystemMessageText, isRetryableAssistantError, toToolDeclaration,
+} from "@earendil-works/pi-ai";
 import type {
-  AssistantMessage, ImageContent, Message, TSchema, TextContent, ThinkingContent, ToolCall, Usage,
+  AssistantMessage, ImageContent, Message, SystemMessage, TSchema, TextContent, ToolCall, Usage,
 } from "@earendil-works/pi-ai";
 import {
   runAgentLoopContinue, type AgentContext, type AgentEvent, type AgentTool,
@@ -22,6 +24,10 @@ import { traceRejectedToolCall, traceTool } from "./agent-tracing";
 import { AgentTurnError, completeText, httpStatusFromError, zeroUsage } from "./ai-invoke";
 import type { ModelHandle } from "./ai-models";
 import { blobOid } from "./git-store";
+import type {
+  AiChatAgentContext, ChatBindingEntry, CompactionCheckpoint, StoredAssistantMessage,
+  StoredChatMessage, StoredToolCall,
+} from "./storage-schema/overseer-storage";
 import {
   buildCompactionState, buildSummaryPrompt, chatChangeStatuses, COMPACTION_SYSTEM_PROMPT,
   estimateProjectionTokens, findCompactionBoundary, findProtectedFromSequence,
@@ -30,6 +36,7 @@ import {
 } from "./agent-compaction";
 import { formatGrep, type GrepScan } from "./grep";
 import { formatAgentPersona } from "./xcity/agent-persona";
+import { isXcityModelThrottle } from "./xcity/tokenhub-errors";
 
 const logger = createWorkshopLogger("workshop.agent");
 
@@ -158,66 +165,6 @@ export interface WorktreeTurnAccess {
   appendCommit(worktreeId: WorkpieceId, commit: string, previousHead: string): void;
 }
 
-/** Additional per-chat-thread info needed by the AI agent but not by the client. */
-export type AiChatAgentContext = {
-  /** Chat ID, corresponds to `chatMeta`. */
-  chatId: number;
-
-  /**
-   * If present, this chat was spawned using a spawner, and this was the spawner config at the
-   * time.
-   */
-  spawnerConfig?: AgentSpawnerConfig;
-
-  /**
-   * If present, this chat was spawned with `spawnCallable()`, and these are the TypeScript
-   * declarations of the interface the agent implements, frozen at spawn time like
-   * `spawnerConfig`. Kept here rather than in the chat log so the system-prompt builder can read
-   * them without a log scan and they don't render in the chat.
-   */
-  spawnerTypes?: SpawnCallableOptions;
-
-  /**
-   * Initial `env` binding set gathered when this chat was started, typically including all gadgets
-   * and all gatekeepers which those gadgets bind to, but the contents may be different depending
-   * on how the chat thread was started (e.g. agent spawners initialize env in a specific way).
-   *
-   * This map is frozen after the chat starts. "changes" messages in the chat log may introduce
-   * new bindings, but they aren't added here; instead, the chat log must be replayed to find out
-   * the current binding set.
-   *
-   * This is absent for chats created before named chat bindings existed; such chats are seeded
-   * lazily at their next turn start.
-   *
-   * If any workpieces referenced here are deleted, this will be detected when the env is
-   * materialized for a particular execution, and the corresponding bindings will be dropped.
-   */
-  bindings?: Record<string, WorkpieceId>;
-
-  /**
-   * Gatekeeper IDs for ambient capsules which were instantiated into this chat when it started.
-   * This array predates the creation of per-chat named bindings; back then, ambient gatekeepers
-   * were delivered as numbered "capsules", occupying the lowest numbers in the capsules array, and
-   * this array specified their order. But with the advent of per-chat named bindings, these are now
-   * folded into `bindings`, above. This array continues to exist to support migrations from old
-   * chats (`bindings` will be initialized on next use), and as a record of which bindings came
-   * from ambient gatekeepers (though arguably some other data structure might make more sense for
-   * that).
-   */
-  alwaysAvailableCapsuleIds?: WorkpieceId[];
-
-  /**
-   * Xcity marketplace persona selected when this chat was created. `persona === null` records
-   * that the catalog selection was valid but tokenhub did not have the persona prompt at creation
-   * time, so the chat intentionally behaves like an ordinary coding-agent chat.
-   */
-  xcityAgent?: {
-    slug: string;
-    displayName: string;
-    persona: string | null;
-  };
-};
-
 /**
  * One entry of the chat's seed binding layer, as returned by AgentHooks.prepareChatBindings():
  * a name in the chat's env, its target workpiece, and display info for the system prompt.
@@ -241,89 +188,13 @@ export type SeedBindingInfo = {
 };
 
 /**
- * One entry of the chat's binding map: what a name in the agent's executeCode `env` resolves to.
- * Either a workpiece (a gadget or gatekeeper -- the overseer distinguishes at env-build time) or
- * the value arguments of an agent callback.
- */
-export type ChatBindingEntry =
-  | { type: "workpiece"; id: WorkpieceId }
-  | { type: "value"; messageSequence: number };
-
-/**
- * Stores replay state for one compacted chat prefix. Checkpoints are immutable, and a chat keeps
- * every one it has published, so reading history or reverting can select the newest checkpoint below
- * any sequence.
- */
-export type CompactionCheckpoint = {
-  /** Chat this checkpoint belongs to. */
-  chatId: number;
-
-  /** First sequence replay starts at. Messages before this are represented by the checkpoint. */
-  compactedTo: number;
-
-  /** The summary the model wrote. We send it as one user message before the retained messages. */
-  summary: string;
-
-  /**
-   * The chat's named bindings. Retained messages and the summary refer to these names as
-   * `env.NAME`.
-   */
-  chatBindings: [string, ChatBindingEntry][];
-
-  /** The next change ID for replayed tool results. Change IDs remain sequential across boundaries. */
-  nextChangeId: number;
-
-  /**
-   * Historical (pre-git-storage): the workspace-wide code version the chat's retired Yjs replay
-   * base was anchored to. Survives only as stored data on checkpoints written before the
-   * git-storage conversion (the migration's conversion anchor reads it); new checkpoints never
-   * record it, and replay ignores it (pre-conversion reads are elided).
-   */
-  observedCodeVersion?: number;
-
-  /**
-   * The pins active at the boundary (see ChatGadgetPin). Replay establishes their base trees
-   * before applying `proposedChange`.
-   */
-  pins?: ChatGadgetPin[];
-
-  /**
-   * Sequence of the message that opened the epoch the boundary lies in, mirroring
-   * ChatCodeBase.epoch; absent when the boundary is in the chat's first epoch.
-   */
-  epoch?: number;
-
-  /**
-   * Historical (pre-git-storage): still-proposed and accepted Yjs updates from before the
-   * boundary. Survive only as stored data on pre-conversion checkpoints, read by the migration's
-   * conversion; new checkpoints record `proposedChange` instead.
-   */
-  acceptedChanges?: Uint8Array;
-  proposedChanges?: Uint8Array;
-
-  /**
-   * Still-proposed code changes from before the boundary, composed into one change (bounded by
-   * content size, not edit history). Individual batches remain addressable through the chat
-   * log, so reverting to a point before the boundary is still possible.
-   *
-   * Provisional gadget creations and binding additions from before the boundary are deliberately
-   * absent: they carry no change, and the registry rows they created (`GadgetRecord.pending`,
-   * `BindingRecord.pending`) already record them with the sequence that did, untouched by
-   * compaction. Merge and revert promote and delete from there rather than from the log, so
-   * duplicating them here would be a second source of truth. See getProposedChanges(), which
-   * reports the compacted prefix as pending when either this or such a row exists.
-   */
-  proposedChange?: CodeChange;
-};
-
-/**
  * The history one agent pass replays: the active compaction checkpoint, if any, the chat log from
  * it on, and the token total the provider reported for the chat's last model step (zero when none
  * is recorded). See AgentHooks.loadChatHistory.
  */
 export type ChatHistory = {
   checkpoint?: CompactionCheckpoint;
-  chatMessages: AiChatMessage[];
+  chatMessages: StoredChatMessage[];
   measuredTokens: number;
 };
 
@@ -333,7 +204,8 @@ export type ChatHistory = {
 type AgentPassOutcome =
   | {type: "finished"}
   | {type: "reloadForCompaction"}
-  | {type: "compacted"; checkpoint: CompactionCheckpoint};
+  | {type: "compacted"; checkpoint: CompactionCheckpoint}
+  | {type: "transientFailure"; error: AgentTurnError};
 
 /**
  * Summary of one of the workspace's gadgets, as needed by the agent: identity and its named
@@ -398,30 +270,6 @@ async function describeBinding(
 }
 
 /**
- * A tool-call block as persisted in a StoredAssistantMessage: everything pi produced except the
- * arguments, which the step's AiToolCall record already stores (as `input`) and which replay
- * rehydrates by id (see rehydrateStoredAssistantMessage). Tool arguments are the one genuinely
- * large duplicate (writeFile/executeCode payloads are whole files); everything else is kept.
- */
-export type StoredToolCall = Omit<ToolCall, "arguments">;
-
-/**
- * The AssistantMessage for one agent step, persisted exactly as pi produced it (except for
- * StoredToolCall's deliberate subtraction) so later turns can replay the step verbatim. This is
- * what preserves reasoning across turns and restarts: thinking blocks keep their provider
- * signatures (including encrypted/redacted payloads), and the message keeps its true
- * api/provider/model provenance, so pi's transformMessages can reflect same-model reasoning back
- * to the provider and apply its cross-model conversions when the user switches models. The
- * snapshot is subtractive on purpose -- copy everything, delete only what's provably redundant --
- * so fields pi adds in the future are retained by default (dropping them would silently reduce
- * fidelity and break prompt caching). Stored server-side only (see `chatModelData` in
- * overseer.ts); clients never receive these.
- */
-export type StoredAssistantMessage = Omit<AssistantMessage, "content"> & {
-  content: (TextContent | ThinkingContent | StoredToolCall)[];
-};
-
-/**
  * A chat message body as the agent loop hands it to AgentHooks.commitAgentStep: the
  * client-visible body, plus (for agent steps) the model-facing snapshot to persist alongside it.
  * The overseer strips `modelData` into separate storage; it must never reach clients.
@@ -462,9 +310,10 @@ export interface AgentHooks {
    * messages (`msgs`, the tool-call record among them), validate and append each buffered
    * change as a chat change row -- one row per tool call, in call order, with the same
    * pin/codeBase bookkeeping the appends always had -- materialize the rows into the step's
-   * single "changes" message carrying the step's gadget creations, binding additions, and
-   * worktree head advancements (stamping pending gadget and binding records, making created
-   * worktrees permanent, and advancing worktree heads), and retire the rows. The step's effects
+   * single "changes" message carrying the step's gadget creations (with the blueprint release
+   * each was created from, if any), binding additions, and worktree head advancements (stamping
+   * pending gadget and binding records, making created worktrees permanent, and advancing
+   * worktree heads), and retire the rows. The step's effects
    * are thus durable iff its transcript record is; a crash mid-step loses both, and the resumed
    * model re-runs the step against unmodified content. Returns whether a "changes" message was
    * written (change-ID numbering counts messages).
@@ -488,6 +337,7 @@ export interface AgentHooks {
         createdWorktrees: {worktreeId: WorkpieceId, title: string, bindingName: string}[],
         addedBindings: {gadgetId: WorkpieceId, name: string, target: WorkpieceId}[],
         worktreeCommits: {worktreeId: WorkpieceId, commit: string, previousHead: string}[],
+        blueprintMerges: BlueprintMerge[],
       },
       usage?: Usage, aiGatewayLogId?: string,
       aiGatewayLogRoute?: AiGatewayLogRoute): Promise<boolean>;
@@ -510,7 +360,7 @@ export interface AgentHooks {
   getGadgetHead(gadgetId: WorkpieceId): string | undefined;
 
   /**
-   * A worktree's accepted commit (WorktreeRecord.pinBase in overseer.ts): what an unpinned
+   * A worktree's accepted commit (WorktreeRecord.pinBase in overseer-storage.ts): what an unpinned
    * worktree reads at, lazily by path, and what its first modification pins it at -- the
    * worktree analog of getGadgetHead. Only an accept moves it, and none can run mid-turn.
    * Undefined for anything that is not a live worktree.
@@ -522,6 +372,13 @@ export interface AgentHooks {
    * so results are cacheable by oid (and the store's parse cache makes repeats cheap).
    */
   readCommitFiles(oid: string): Promise<Map<string, string>>;
+
+  /**
+   * The paths of the files whose entry differs between two commits' trees, added and removed
+   * ones included, in sorted order. Compares tree objects by id, so no file is read, and a
+   * subtree that is the same on both sides is not read either.
+   */
+  listChangedPaths(fromCommit: string, toCommit: string): Promise<string[]>;
 
   /**
    * Summarize the workspace's gadgets for the system prompt and for describeBinding's `gadget`
@@ -543,13 +400,14 @@ export interface AgentHooks {
   /**
    * Create a new, empty gadget workpiece with the given title and binding name, provisional to
    * the given chat: it becomes permanent only when the user accepts the chat's changes through
-   * the "changes" message that records the creation (see GadgetRecord.pending in overseer.ts).
+   * the "changes" message that records the creation (GadgetRecord.pending in overseer-storage.ts).
    * Throws if the binding name is invalid or already claimed by another gadget (including one
-   * still pending in another chat). Returns the id and the (trimmed) title as created. `output`
-   * is the format declared by the blueprint being instantiated, if any (see fetchBlueprint).
+   * still pending in another chat). Returns the id and the (trimmed) title as created.
+   * `blueprint` is the blueprint being instantiated, if any, and `output` the format it declares
+   * (see fetchBlueprint). A gadget created from none is recorded as made from scratch.
    */
-  createGadget(title: string, bindingName: string, chatId: number, output?: BlueprintOutput)
-      : {id: WorkpieceId, title: string};
+  createGadget(title: string, bindingName: string, chatId: number,
+               blueprint?: {output?: BlueprintOutput}): {id: WorkpieceId, title: string};
 
   /**
    * Create a new worktree workpiece rooted at the given commit id (a full oid, resolved against
@@ -693,6 +551,9 @@ export interface AgentHooks {
    */
   getInstanceInstructions(): Promise<string>;
 
+  /** A random string that belongs to this workspace and never changes. */
+  getPromptCacheSalt(): string;
+
   /**
    * Connection-request hooks for the agent.
    *
@@ -751,11 +612,15 @@ export interface AgentHooks {
    * Fetch a blueprint's decoded files, plus formatted notes describing the copied files and the
    * bindings the blueprint's code expects the agent to wire up. Used by the createGadget tool to
    * instantiate the blueprint as a new gadget, along with the output format the blueprint declares
-   * (if any), which the created gadget inherits. Throws an agent-readable error if the blueprint
-   * doesn't exist.
+   * (if any), which the created gadget inherits. `merge` is the record of the release the files
+   * are, for the creation's "changes" message once the gadget has an id (see
+   * AiChatMessageBody.blueprintMerges). Throws an agent-readable error if the blueprint doesn't
+   * exist.
    */
-  fetchBlueprint(blueprintId: string)
-      : Promise<{files: Record<string, string>, notes: string, output?: BlueprintOutput}>;
+  fetchBlueprint(blueprintId: string): Promise<{
+    files: Record<string, string>, notes: string, output?: BlueprintOutput,
+    merge: Omit<BlueprintMerge, "gadgetId">,
+  }>;
 }
 
 // =======================================================================================
@@ -933,7 +798,7 @@ To construct a persistent stub, you must use the \`ctx.restore(params)\` API, wh
 Here is an example Gadget implementing the restore pattern:
 
 \`\`\`
-import { DurableObject, Greeter, restore } from "cloudflare:workers";
+import { DurableObject, RpcTarget, restore } from "cloudflare:workers";
 
 export class Gadget extends DurableObject {
   constructor(ctx, env) {
@@ -965,7 +830,7 @@ class Greeter extends RpcTarget {
 
 Notice that the restore method is named using a symbol. This allows the system to access it, without making the method directly available over RPC.
 
-Within a Gadget class with a restore method, you can call \`this.ctx.restore(params)\`. The given \`params\` (which must be serializable) will be passed back to the Gadget's restore method, and the resulting persistent RpcStub will be returned. This can then be passed to an API that requires persistent stubs, e.g.:
+Within a Gadget class with a restore method, you can call \`this.ctx.restore(params)\`. The given \`params\` (which must be serializable, though they may include persistent stubs) will be passed back to the Gadget's restore method, and the resulting persistent RpcStub will be returned. This can then be passed to an API that requires persistent stubs, e.g.:
 
 \`\`\`
 let greeter = await this.ctx.restore({type: "greeter", greeting: "Howdy"});
@@ -984,6 +849,8 @@ export default async function(self, env, ctx) {
 \`\`\`
 
 The call to \`env.MY_GADGET[restore](params)\` is equivalent to calling \`this.ctx.restore(params)\` from within the Gadget itself. This returns a persistent stub which you can then use as a hook callback.
+
+A Gadget can hold many persistent stubs at once, such as one hook per conversation it watches. Each is restored from its own \`params\`, so put whatever tells them apart there.
 `.trim();
 
 let SPAWNER_SYSTEM_PROMPT = `
@@ -1028,6 +895,240 @@ The Gadget expects you to implement the TypeScript interface \`${mainType}\`, de
 ${types.trim()}
 \`\`\`
 `.trim();
+}
+
+/**
+ * Tells the agent which bindings a blueprint's code expects that a gadget lacks, and how to wire
+ * each one up. `gadget` is what the text calls the gadget, as in "the new gadget". Shared by
+ * the createGadget tool's result for a gadget made from a blueprint (see
+ * AgentHooks.fetchBlueprint) and the summary of a blueprint merged into an existing gadget.
+ */
+export function formatMissingBlueprintBindings(
+    bindings: Record<string, BlueprintBinding>, gadget: string): string {
+  let lines = [
+      `The blueprint's code expects the following bindings, which ${gadget} does not ` +
+      `have yet. Wire up each one under the exact binding name given. For external ` +
+      `resources, use setGadgetBinding on ${gadget} (first requesting a connection via ` +
+      `requestConnection if your env doesn't already hold a suitable resource). AI-model ` +
+      `and agent-spawner bindings cannot be created from chat; ask the user to add those ` +
+      `from the gadget's Connections panel.`];
+  for (let [name, binding] of Object.entries(bindings)) {
+    let details: string;
+    switch (binding.type) {
+      case "gatekeeper":
+        details = `external resource via the "${binding.gatekeeperName}" gatekeeper; ` +
+            `resource URL pattern ${JSON.stringify(binding.typeUrlPattern)}` +
+            (binding.resourceUrl
+                ? `; the blueprint author suggests ${JSON.stringify(binding.resourceUrl)}`
+                : ``);
+        break;
+      case "aiModel":
+        details = `an AI model binding`;
+        break;
+      case "agentSpawner":
+        details = `an agent-spawner binding`;
+        break;
+      default:
+        binding satisfies never;
+        details = `unknown`;
+        break;
+    }
+    lines.push(`* ${name} — ${JSON.stringify(binding.title)} (${details})` +
+        (binding.description ? `: ${binding.description}` : ``));
+  }
+  return lines.join("\n");
+}
+
+// How many files each list in the agent's summary of a merge, of a blueprint or from mainline,
+// names before it counts the rest instead, so that a merge of very many files cannot fill the
+// context with paths.
+const MERGE_SUMMARY_PATH_LIMIT = 50;
+
+// One list of files in such a summary: nothing if there are none, else the heading and the
+// paths. The paths are quoted because someone else chose them, such as a blueprint's author.
+function formatMergedPaths(heading: string, paths: string[]): string[] {
+  if (paths.length === 0) return [];
+  let lines = paths.slice(0, MERGE_SUMMARY_PATH_LIMIT).map(path => `* ${JSON.stringify(path)}`);
+  if (paths.length > lines.length) lines.push(`* (and ${paths.length - lines.length} more)`);
+  return ["", heading, ...lines];
+}
+
+/**
+ * The files that a three-way merge changed and did not report as conflicted, by whether the
+ * side the files were merged into had changes of its own to them. `base` is the commit the two
+ * sides have in common, `incoming` the side merged in, and `own` the side merged into. A file is
+ * listed if it differs between `base` and `incoming` and between `own` and `incoming`, so a file
+ * that both sides changed alike is not. Compares trees by id, so no file is read.
+ */
+async function classifyMergedPaths(
+    hooks: Pick<AgentHooks, "listChangedPaths">,
+    sides: {base: string, incoming: string, own: string}, conflictPaths: string[])
+    : Promise<{bothChanged: string[], incomingChanged: string[]}> {
+  let [incomingChanges, ownToIncoming, ownChanges] = await Promise.all([
+    hooks.listChangedPaths(sides.base, sides.incoming),
+    hooks.listChangedPaths(sides.own, sides.incoming),
+    hooks.listChangedPaths(sides.base, sides.own),
+  ]);
+  let differs = new Set(ownToIncoming);
+  let changedByOwn = new Set(ownChanges);
+  let conflicted = new Set(conflictPaths);
+  let bothChanged: string[] = [];
+  let incomingChanged: string[] = [];
+  for (let path of incomingChanges) {
+    if (!differs.has(path) || conflicted.has(path)) continue;
+    (changedByOwn.has(path) ? bothChanged : incomingChanged).push(path);
+  }
+  return {bothChanged, incomingChanged};
+}
+
+// The opening of the agent's summary of an update from mainline, before each gadget's part.
+const MAINLINE_MERGE_INTRO =
+    `The user updated this chat with the changes accepted from other chats since it was last ` +
+    `brought up to date.`;
+
+/**
+ * Renders one gadget's part of an update from mainline (see Overseer.updateChatFromMainline())
+ * for the model, which sees it as an observation of the user's changes, after
+ * MAINLINE_MERGE_INTRO. `entry` is the gadget's part of the message's record, `declaration` the
+ * message's pin declaration for it, and `gadget` its name in the chat's env. `forgotten` names
+ * the files the model had read whose text the update changed (see applyReplayedPin), which it
+ * must read again: readFile promises to say when that happens.
+ *
+ * The update merged the chat's files with mainline, so its diff could be as large as everything
+ * the other chats changed. The summary names the commits of the merge instead, with a way to
+ * diff any two, and lists the files by what the merge did with them. Its size does not depend on
+ * what is in the files. It sets no task: the chat is the user's.
+ */
+async function formatMainlineMerge(
+    entry: MainlineMergeGadget, declaration: ChatGadgetPinRecord, gadget: string,
+    forgotten: string[], hooks: Pick<AgentHooks, "listChangedPaths">): Promise<string> {
+  let mainline = declaration.mergedCommit ?? declaration.baseCommit;
+  let {bothChanged, incomingChanged} = await classifyMergedPaths(hooks,
+      {base: entry.baseCommit, incoming: mainline, own: entry.chatCommit}, entry.conflictPaths);
+  let lines = [
+    `The files of \`env.${gadget}\` in this chat are now the result of a three-way merge.`,
+    ``,
+    `The commits that were merged, and the result:`,
+    `* merged base, the version this chat was last based on: ${entry.baseCommit}`,
+    `* mainline, with the other chats' changes: ${mainline}`,
+    `* this chat, before the update: ${entry.chatCommit}`,
+    `* the result, which this chat's files now start from: ${declaration.baseCommit}`,
+    ``,
+    `To see what changed from one commit to another, run in \`executeCode\`:`,
+    `  (await env.GIT.newWorktree("<to>")).diff("<from>")`,
+    `From merged base to mainline is what the other chats changed. From this chat before the ` +
+        `update to the result is what the update did to this chat's files.`,
+    ...formatMergedPaths(`Files with conflicts:`, entry.conflictPaths),
+  ];
+  if (entry.conflictPaths.length > 0) {
+    lines.push(
+        `A file listed as conflicted that has no markers in it was deleted on one side and ` +
+        `changed on the other: it holds the changed version.`);
+  }
+  lines.push(
+      ...formatMergedPaths(
+          `Files that this chat and mainline both changed, merged with no conflict found:`,
+          bothChanged),
+      ...formatMergedPaths(`Files that only mainline changed:`, incomingChanged));
+  if (forgotten.length > 0) {
+    // Not capped like the lists above: the model read every one of these itself.
+    lines.push(``,
+        `Files you read earlier that the update changed, which you must read again before ` +
+            `editing them:`,
+        ...forgotten.map(path => `* ${JSON.stringify(path)}`));
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Renders a blueprint that the user applied to a gadget (see GadgetClient.applyBlueprint()) as
+ * the model's input, from the record of the proposal and the "changes" message `msg` that
+ * carries it. `gadget` is the gadget's name in the chat's env, if it has one.
+ *
+ * A merge is rendered for review: a summary of it and the task of checking it. That is what
+ * prompts the turn applyBlueprint() starts, which has no message to answer. The merge is a
+ * commit, whose diff could be as large as everything the blueprint changed. So the summary
+ * names the commits of the merge instead, with a way to diff any two, and lists the files by
+ * what the merge did with them. Its size does not depend on what is in the files.
+ *
+ * Any other proposal left the agent nothing to check. It is rendered as a note of what
+ * happened, for a later turn in the chat to know of.
+ */
+async function formatBlueprintProposal(
+    merge: BlueprintMerge, msg: Pick<Extract<AiChatMessage, {type: "changes"}>, "pins">,
+    gadget: string | undefined, hooks: Pick<AgentHooks, "listChangedPaths">): Promise<string> {
+  let applied = `The user applied version ${merge.version} of the blueprint ` +
+      `${JSON.stringify(merge.title)} to ` +
+      (gadget !== undefined ? `the gadget \`env.${gadget}\`` : `a gadget`) +
+      `, as a proposed change in this chat.`;
+  if (merge.kind === "follow") {
+    return `${applied} None of the gadget's files change: accepting it only has the gadget ` +
+        `take its future updates from that blueprint.`;
+  }
+  if (merge.kind === "fastForward") {
+    return `${applied} The gadget had no changes of its own to keep, so its files are now ` +
+        `that version's exactly.`;
+  }
+
+  // A merge is always recorded with its base, on the message that re-roots the gadget at the
+  // merge commit, whose `mergedCommit` is the head it merged into (see applyBlueprint in
+  // overseer.ts).
+  let base = merge.baseCommit!;
+  let declaration = msg.pins!.find(pin => pin.gadgetId === merge.gadgetId)!;
+  let head = declaration.mergedCommit ?? declaration.baseCommit;
+  let {bothChanged, incomingChanged: blueprintChanged} = await classifyMergedPaths(hooks,
+      {base, incoming: merge.commitId, own: head}, merge.conflictPaths);
+
+  let lines = [
+    `${applied} The gadget has changes of its own, so the blueprint's changes were merged ` +
+        `with them, three ways. The gadget's files in this chat are now the result.`,
+    ``,
+    `The commits that were merged, and the result:`,
+    `* base, the version the two have in common: ${base}`,
+    `* this gadget, before the merge: ${head}`,
+    `* blueprint: ${merge.commitId}`,
+    `* the result, which the gadget's files in this chat start from: ${declaration.baseCommit}`,
+    ``,
+    `To see what changed from one commit to another, run in \`executeCode\`:`,
+    `  (await env.GIT.newWorktree("<to>")).diff("<from>")`,
+    `From base to blueprint is what the blueprint changed. From this gadget before the merge ` +
+        `to the result is what the merge did to the gadget's files. To read a commit's files ` +
+        `with \`readFile\` and \`grep\`, mount it with \`createWorktree\`.`,
+  ];
+  if (merge.unverifiedBase) {
+    lines.push(``,
+        `The gadget and the blueprint share no history, so that base is a guess at what the ` +
+        `gadget was built from. A change that the gadget's owner made, if the guess happens ` +
+        `to include it, looks like something the blueprint removed: the merge undid it and ` +
+        `reported no conflict. Compare the gadget before the merge with the result, and ` +
+        `tell the user of anything lost that looks like their own work.`);
+  }
+  lines.push(
+      ...formatMergedPaths(`Files with conflicts:`, merge.conflictPaths),
+      ...formatMergedPaths(
+          `Files that the gadget and the blueprint both changed, merged with no conflict found:`,
+          bothChanged),
+      ...formatMergedPaths(`Files that only the blueprint changed:`, blueprintChanged));
+  if (merge.missingBindings) {
+    lines.push(``, formatMissingBlueprintBindings(merge.missingBindings, `the gadget`));
+  }
+
+  lines.push(``, `Review the merge now, without waiting to be asked:`);
+  if (merge.conflictPaths.length > 0) {
+    lines.push(
+        `* Resolve every conflict. A file listed as conflicted that has no markers in it was ` +
+        `deleted by one side and changed by the other: it holds the changed version, and ` +
+        `whether it should stay is yours to decide.`);
+  }
+  lines.push(
+      `* Check that the gadget's own changes and the blueprint's still work together, ` +
+      `starting with any files that both changed. Changes that merge cleanly can still ` +
+      `disagree, as when one side renames something that the other side's new code uses.`);
+  if (merge.missingBindings) lines.push(`* Wire up the bindings listed above.`);
+  lines.push(
+      `Change nothing else: the user asked for the update, not for other improvements. When ` +
+      `you are done, tell the user briefly what the update changed and what you did.`);
+  return lines.join("\n");
 }
 
 let READ_FILE_TOOL_DESCRIPTION = `
@@ -1122,7 +1223,7 @@ Executes one-off JavaScript code, returning the output it logs to the console. T
 `.trim();
 
 let EXECUTE_CODE_SELF_PARAM = `
-The function also receives a \`self\` parameter which is a magic object that points back to this chat thread. Calling any method on \`self\`, like \`self.foo(123)\`, records a callback to this chat, which is delivered to you as a message on a later turn and activates you to respond. The call resolves as soon as the callback is recorded and returns nothing; it never waits for you (so awaiting it within the same executeCode run is fine, but it cannot yield a result). The arguments must be storable: any RPC stubs among them must be persistent stubs. \`self\` can be passed over RPC (e.g. to a subscription method) and stored in a Durable Object's KV storage for long-term callbacks. When a callback is received, its arguments appear in your env as an array, under a name like \`foo_ARGS\` given in the callback message.
+The function also receives a \`self\` parameter which is a magic object that points back to this chat thread. Calling any method on \`self\`, like \`self.foo(123)\`, records a callback to this chat, which is delivered to you as a message on a later turn and activates you to respond. The call resolves as soon as the callback is recorded and returns nothing; it never waits for you (so awaiting it within the same executeCode run is fine, but it cannot yield a result). The arguments must be storable: any RPC stubs among them must be persistent stubs. \`self\` is itself a persistent stub: it can be passed over RPC, stored in a Durable Object's KV storage, or included in \`[restore]\` params for long-term callbacks. Code that receives it should store it as is, without \`.dup()\`. When a callback is received, its arguments appear in your env as an array, under a name like \`foo_ARGS\` given in the callback message.
 `.trim();
 
 let EXECUTE_CODE_TOOL_DESCRIPTION = `
@@ -1316,13 +1417,17 @@ function defineTool<TParameters extends TSchema>(def: AgentTool<TParameters>): A
   return def as unknown as AgentTool;
 }
 
+/** How many times one agent turn retries a model request that failed transiently. */
+const TRANSIENT_FAILURE_RETRIES = 2;
+
 /**
  * Runs one agent turn against the chat's history, compacting as needed. A pass over the history
  * may compact instead of prompting the model, or end after a persisted tool step because the next
  * request would cross the compaction trigger; either way the loop reloads the durable history,
  * which the next pass compacts first, and goes again. Each compaction moves the boundary strictly
  * forward and can never pass the newest turn start, so the loop is bounded. `/compact` is done once
- * it has compacted; the model is never prompted.
+ * it has compacted; the model is never prompted. A pass whose model request failed transiently is
+ * also run again, a bounded number of times.
  */
 export async function runAgent(
     hooks: AgentHooks,
@@ -1332,10 +1437,18 @@ export async function runAgent(
     abortSignal: AbortSignal,
     initiator: AiChatAuthorInfo,
     modelConfig: AiModelConfig): Promise<void> {
+  let retries = 0;
   while (true) {
     let history = hooks.loadChatHistory(chatId);
     let outcome = await runAgentPass(
         hooks, handle, chatId, author, history, abortSignal, initiator, modelConfig);
+    if (outcome.type === "transientFailure") {
+      if (++retries > TRANSIENT_FAILURE_RETRIES) throw outcome.error;
+      // The failed request persisted nothing, so the retry starts from the last saved step. What
+      // it streamed was only provisional; clients drop it so the retry doesn't append to it.
+      hooks.emitChatStreamEvent(chatId, {type: "streamReset"});
+      await scheduler.wait(1000 * retries);
+    }
     if (outcome.type === "compacted") hooks.commitChatCompaction(chatId, outcome.checkpoint);
     if (outcome.type === "finished" || isCompactionTurn(history.chatMessages)) return;
     abortSignal.throwIfAborted();
@@ -1387,9 +1500,13 @@ async function runAgentPass(
   // reconciliation reaps (see reconcilePendingGadgets in overseer.ts).
   let pendingCreatedGadgets: {gadgetId: WorkpieceId, title: string, bindingName: string}[] = [];
 
+  // The blueprint release that each of those created from a blueprint was created from,
+  // awaiting the same barrier and message (see AiChatMessageBody.blueprintMerges).
+  let pendingBlueprintMerges: BlueprintMerge[] = [];
+
   // Worktrees created this step (see the createWorktree tool), awaiting the same barrier: its
   // "changes" message records each creation (`createdWorktrees`) and makes the pending record
-  // permanent (see WorktreeRecord.pending in overseer.ts).
+  // permanent (see WorktreeRecord.pending in overseer-storage.ts).
   let pendingCreatedWorktrees: {worktreeId: WorkpieceId, title: string, bindingName: string}[] =
       [];
 
@@ -1628,9 +1745,10 @@ async function runAgentPass(
   // the knowledge is anchored to committed code -- an unpinned read of a gadget's head or a
   // worktree's accepted commit (AiToolCall.observedOid) -- or undefined while it tracks the
   // session content instead (a pinned workpiece, or a gadget with no committed code), which
-  // cannot go stale within an epoch: everything that changes it is the model's own edit or a
-  // user/mainline change shown to it as a diff. The one way knowledge goes stale is another
-  // chat's accept moving an unpinned gadget's head, and a stamp is checked against the head at
+  // cannot go stale within an epoch: everything that changes it is the model's own edit, a
+  // user's change shown to it as a diff, or a re-root, which drops the knowledge of what it
+  // changed (see applyReplayedPin). The one way knowledge goes stale is another chat's accept
+  // moving an unpinned gadget's head, and a stamp is checked against the head at
   // the two points where it would otherwise be trusted: editFile's gate on an unpinned gadget,
   // and the establishment of a pin (anchorKnowledgeToPin), after which reads are session-served
   // and the gate is skipped. At an epoch boundary session-tracking entries take an oid stamp of
@@ -1766,7 +1884,12 @@ async function runAgentPass(
   // Establishes a pin's base tree in the session content during replay and marks the gadget
   // pinned. Idempotent: commits are immutable, so re-establishing the same base is harmless --
   // which is what lets ensureReplayContentForWrite below establish a base *early*.
-  let applyReplayedPin = async (pin: ChatGadgetPin) => {
+  //
+  // A declaration for a gadget already pinned re-roots it (see ChatGadgetPinRecord): the
+  // session content restarts at the new base, and what the model knows of a file whose text
+  // that changed is dropped, so editFile requires a re-read rather than match against text the
+  // model saw before. Returns the names of those files, sorted, for telling the model.
+  let applyReplayedPin = async (pin: ChatGadgetPin): Promise<string[]> => {
     if (hooks.isWorktree(pin.gadgetId)) {
       // A worktree's base is a whole repository tree, so it is never materialized: the entry
       // holds only touched/read files, resolved lazily against the pinned base (accumulated
@@ -1778,13 +1901,25 @@ async function runAgentPass(
         sessionContent.set(pin.gadgetId, new Map());
       }
       pinnedGadgets.add(pin.gadgetId);
-      return;
+      return [];
     }
     let files = await hooks.readCommitFiles(pin.baseCommit);
+    let known = filesRead.get(pin.gadgetId);
+    let forgotten: string[] = [];
+    if (pinnedGadgets.has(pin.gadgetId) && known !== undefined) {
+      let before = sessionContent.get(pin.gadgetId);
+      for (let [filename, stamp] of known) {
+        if (stamp === undefined && before?.get(filename) !== files.get(filename)) {
+          known.delete(filename);
+          forgotten.push(filename);
+        }
+      }
+    }
     sessionContent = new Map(sessionContent);
     sessionContent.set(pin.gadgetId, files);
     pinnedGadgets.add(pin.gadgetId);
     await anchorKnowledgeToPin(pin.gadgetId, pin.baseCommit);
+    return forgotten.toSorted();
   };
 
   // Ensures the session content holds a base for a replayed write's target workpiece -- or, for
@@ -2338,11 +2473,26 @@ async function runAgentPass(
         // the converted content is not what those writes produced).
         if (msg.conversionBoundary) await resetSessionEpoch();
 
+        // A blueprint that the user applied is described to the model (see
+        // formatBlueprintProposal). Its message has no change, only the pin at the merge
+        // commit, which is applied below. A proposal since reverted is described all the same:
+        // the description is what the turn that reviewed it was answering, and the revert is
+        // reported where it happened. (An entry on a message of the agent's own is a gadget it
+        // created from a blueprint, which the model already sees in its createGadget call.)
+        for (let merge of msg.author.type === "user" ? msg.blueprintMerges ?? [] : []) {
+          modelMessages.push({
+            role: "user",
+            content: await formatBlueprintProposal(merge, msg, chatNameFor(merge.gadgetId), hooks),
+            timestamp: msgTimestamp,
+          });
+        }
+
         if (chatMessageStatus.get(msg.sequence) !== "reverted") {
           // Pins this batch establishes enter the content before the change applies (a no-op for
           // gadgets ensureReplayContentForWrite already established early; see there).
+          let forgotten = new Map<WorkpieceId, string[]>();
           for (let pin of msg.pins ?? []) {
-            await applyReplayedPin(pin);
+            forgotten.set(pin.gadgetId, await applyReplayedPin(pin));
           }
           // A batch with no `change` records only creations/binding additions; there is nothing to
           // apply to the session content (and no diff), but user-authored creations/additions
@@ -2370,9 +2520,25 @@ async function runAgentPass(
                   `Added binding "${name}" to ` +
                   (gadgetName !== undefined ? `gadget ${gadgetName}` : `a gadget`) + `.`);
             }
+            if (msg.mainlineMerge?.gadgets !== undefined) {
+              // An update from mainline is a re-root with no change, described by its commits
+              // (see formatMainlineMerge). One recorded before merges were commits has a change
+              // instead, which is shown as a diff like any other.
+              let summaries: string[] = [];
+              for (let entry of msg.mainlineMerge.gadgets) {
+                let name = chatNameFor(entry.gadgetId);
+                let declaration = msg.pins?.find(pin => pin.gadgetId === entry.gadgetId);
+                if (name === undefined || declaration === undefined) continue;
+                summaries.push(await formatMainlineMerge(entry, declaration, name,
+                    forgotten.get(entry.gadgetId) ?? [], hooks));
+              }
+              if (summaries.length > 0) {
+                observations.push(MAINLINE_MERGE_INTRO, ...summaries);
+              }
+            }
             if (diff !== undefined) {
               observations.push(diff);
-            } else if ((msg as {update?: Uint8Array}).update !== undefined) {
+            } else if (msg.update !== undefined) {
               // A pre-conversion batch (see AiChatMessageBody.conversionBoundary): its retired
               // Yjs payload -- still on the stored record -- can't be applied or diffed, so the
               // user's edits get a generic note instead of a diff. The conversion boundary
@@ -2687,9 +2853,11 @@ async function runAgentPass(
   let instanceInstructions = formatInstanceInstructions(await hooks.getInstanceInstructions());
 
   // The two system prompt slots: the non-project-specific parts, followed by the
-  // project-specific parts. Kept as a two-part construction (static slot first) so the shared
-  // prefix stays byte-stable for prompt caching; they are concatenated into the leading system
-  // message in pi's transcript below.
+  // project-specific parts. They become the leading system message's content and its one
+  // section, which pi renders as `${slot0}\n\n${slot1}`. On APIs with cache breakpoints, the
+  // model handle sends that as two blocks with a breakpoint between them (see
+  // system-prompt-blocks.ts), so the static prefix stays cached when the project-specific part
+  // changes.
   let systemPromptSlots: [string, string];
 
   if (agentContext.spawnerConfig) {
@@ -2847,7 +3015,17 @@ async function runAgentPass(
   let agentPersona = agentContext.spawnerConfig ? "" : formatAgentPersona(
       agentContext.xcityAgent?.displayName ?? "", agentContext.xcityAgent?.persona);
   if (agentPersona) systemPromptSlots[0] += `\n\n${agentPersona}`;
-  let systemPrompt = `${systemPromptSlots[0]}\n\n${systemPromptSlots[1]}`;
+  // Prompt caches are shared across the provider account, so anyone on it could probe for a cached
+  // prefix. The workspace's random salt leads the project-specific part, so nobody without this
+  // prompt can probe that part, or the chat after it.
+  let systemMessage: SystemMessage = {
+    role: "system", content: systemPromptSlots[0],
+    sections: {
+      environment: `Prompt cache salt (ignore): ${hooks.getPromptCacheSalt()}\n\n` +
+          systemPromptSlots[1],
+    },
+    timestamp: 0,
+  };
 
   // Some models charge their response to the same window as the prompt, so the reservation is both
   // withheld from the prompt's budget and sent as the response cap -- the two can't disagree.
@@ -2866,7 +3044,8 @@ async function runAgentPass(
         projection.filter(({message, sequence}) => sequence !== undefined &&
           (sequence > lastMeasuredSequence ||
            (sequence === lastMeasuredSequence && message.role === "toolResult"))))
-    : estimateProjectionTokens(projection) + Math.ceil(systemPrompt.length / 4);
+    : estimateProjectionTokens(projection) +
+        Math.ceil(getSystemMessageText(systemMessage).length / 4);
 
   let compactionTurn = isCompactionTurn(chatMessages);
   if (compactionTurn || shouldCompactChat(contextTokens, inputBudget)) {
@@ -3385,7 +3564,7 @@ async function runAgentPass(
             emitStreamEvent({type: "toolCallOutputFormat", toolCallId, output: blueprint.output});
           }
 
-          let created = hooks.createGadget(title, bindingName, chatId, blueprint?.output);
+          let created = hooks.createGadget(title, bindingName, chatId, blueprint);
           pendingCreatedGadgets.push({gadgetId: created.id, title: created.title, bindingName});
           chatBindings.set(bindingName, {type: "workpiece", id: created.id});
 
@@ -3406,6 +3585,12 @@ async function runAgentPass(
             if (fileChanges.length > 0) {
               appendAgentEdit(created.id, {[created.id]: fileChanges});
             }
+            // Recorded with the creation, so that accepting it writes the release into the new
+            // gadget's history and has the gadget follow the blueprint -- but only now that the
+            // gadget has the release's files. The copy fails if the step has no room left for
+            // it, and a gadget recorded as made from files it never got would pass for up to
+            // date with the blueprint.
+            pendingBlueprintMerges.push({gadgetId: created.id, ...blueprint.merge});
             // (The files are deliberately NOT added to filesRead: unlike a writeFile, the agent
             // hasn't seen their contents, so it must read before editing.)
 
@@ -3652,11 +3837,11 @@ async function runAgentPass(
   let executedToolCalls = new Set<string>();
   let toolList = Object.values(tools).map(tool => traceTool(tool, executedToolCalls));
 
-  // Records a turn that ended with a provider error, so it can be rethrown for the overseer's
-  // error triage after the loop settles. (pi never throws for provider failures; the loop
-  // reports them as a final assistant message with stopReason "error"/"aborted".) Nothing from a
-  // failed turn is persisted.
-  let turnFailure: {message: string} | undefined;
+  // Records a turn that ended with a provider error, so it can be retried or rethrown for the
+  // overseer's error triage after the loop settles. (pi never throws for provider failures; the
+  // loop reports them as a final assistant message with stopReason "error"/"aborted".) Nothing
+  // from a failed turn is persisted.
+  let turnFailure: AssistantMessage | undefined;
 
   // Set when the next provider request would cross the preferred compaction budget. The
   // turn_end barrier persists this step before the caller reloads durable history.
@@ -3741,9 +3926,9 @@ async function runAgentPass(
         // the model has seen.
         let message = event.message as AssistantMessage;
         if (message.stopReason === "error" || message.stopReason === "aborted") {
-          // Persist nothing from a failed or cancelled model request; rethrown after the loop
-          // returns.
-          turnFailure = {message: message.errorMessage ?? "The model request failed."};
+          // Persist nothing from a failed or cancelled model request; retried or rethrown after
+          // the loop returns.
+          turnFailure = message;
           break;
         }
         // Note: a turn the model completed is persisted even if the user cancelled while its
@@ -3844,9 +4029,11 @@ async function runAgentPass(
         pendingAddedBindings = [];
         let worktreeCommits = pendingWorktreeCommits;
         pendingWorktreeCommits = [];
+        let blueprintMerges = pendingBlueprintMerges;
+        pendingBlueprintMerges = [];
         if (await hooks.commitAgentStep(chatId, author, msgs,
             {changes: stepChanges, createdGadgets, createdWorktrees, addedBindings,
-             worktreeCommits},
+             worktreeCommits, blueprintMerges},
             message.usage, handle.lastResponse?.aiGatewayLogId, handle.aiGatewayLogRoute)) {
           ++nextChangeId;
         }
@@ -3872,10 +4059,9 @@ async function runAgentPass(
   }
 
   let context: AgentContext = {
-    messages: [{
-      role: "system", content: systemPrompt, toolsAdded: toolList.map(toToolDeclaration),
-      timestamp: 0,
-    }, ...modelMessages],
+    messages: [
+      {...systemMessage, toolsAdded: toolList.map(toToolDeclaration)}, ...modelMessages,
+    ],
     tools: toolList,
   };
 
@@ -3937,9 +4123,14 @@ async function runAgentPass(
 
   if (turnFailure) {
     // Other failures become an AgentTurnError carrying the failing request's HTTP status (when
-    // it can be determined) for the overseer's triage.
-    throw new AgentTurnError(
-        turnFailure.message, httpStatusFromError(turnFailure.message, handle.lastResponse));
+    // it can be determined) for the overseer's triage; runAgent retries a transient one first.
+    let message = turnFailure.errorMessage ?? "The model request failed.";
+    let error = new AgentTurnError(message, httpStatusFromError(message, handle.lastResponse));
+    // (Xcity: a TokenHub plan throttle is not transient; the overseer reports it instead.)
+    if (isRetryableAssistantError(turnFailure) && !isXcityModelThrottle(modelConfig, error)) {
+      return {type: "transientFailure", error};
+    }
+    throw error;
   }
 
   return {type: reloadForCompaction ? "reloadForCompaction" : "finished"};

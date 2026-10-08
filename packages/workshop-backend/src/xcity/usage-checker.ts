@@ -11,6 +11,17 @@ const logger = createWorkshopLogger("workshop.xcity.usage");
 
 type UserStub = DurableObjectStub<UserDurableObject>;
 
+/**
+ * Cached Xcity wallet balance, stored in the user DO (`xcityWalletBalance`). The GoTrue tokens live
+ * in the connected Xcity gatekeeper account (vendorId "xcity"); the usage checker reads a usable
+ * token from there via getUsableAccessToken.
+ */
+export type XcityWalletBalance = {
+  /** Cached wallet balance in Xcity credits and when it was last fetched (unix ms). */
+  creditsRemaining?: number | null;
+  creditsUpdatedAt?: number;
+};
+
 type WalletBalanceResponse = {
   balance?: unknown;
 };

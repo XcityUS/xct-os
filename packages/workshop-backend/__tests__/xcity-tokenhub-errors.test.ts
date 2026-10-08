@@ -3,6 +3,7 @@ import type { AiModelConfig } from "@gadgets/workshop-shared/api";
 import { AgentTurnError } from "../src/ai-invoke.js";
 import {
   formatTokenHubThrottleMessage,
+  isXcityModelThrottle,
   parseTokenHubThrottle,
   redactTokenHubErrorText,
   translateXcityModelError,
@@ -197,5 +198,16 @@ describe("translateXcityModelError", () => {
     expect(translateXcityModelError(xcityEnv(), xcityModel, original)).toBe(original);
     let abort = new DOMException("aborted", "AbortError");
     expect(translateXcityModelError(xcityEnv(), xcityModel, abort)).toBe(abort);
+  });
+});
+
+describe("isXcityModelThrottle", () => {
+  it("marks a TokenHub throttle on an Xcity model, which runAgent then does not retry", () => {
+    expect(isXcityModelThrottle(xcityModel, turnError(REAL_SAMPLE))).toBe(true);
+  });
+
+  it("leaves other models and other failures to upstream's transient retry", () => {
+    expect(isXcityModelThrottle(plainModel, turnError(REAL_SAMPLE))).toBe(false);
+    expect(isXcityModelThrottle(xcityModel, turnError("503: service unavailable"))).toBe(false);
   });
 });

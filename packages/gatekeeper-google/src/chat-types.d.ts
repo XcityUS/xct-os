@@ -1,4 +1,4 @@
-import type { RpcTarget } from "cloudflare:workers";
+import type { RpcStub, RpcTarget } from "cloudflare:workers";
 
 /**
  * A pagination cursor.
@@ -24,6 +24,16 @@ export type ChatUser = {
   name?: string;
   /** Whether this identity is a person or a Chat app. */
   type: "human" | "app";
+};
+
+/** A person in the connected account's Google Workspace organization directory. */
+export type ChatPerson = {
+  /** Chat identity, such as `users/123`: the same `id` their messages' `sender` carries. */
+  id: string;
+  /** Display name, when the directory has one. */
+  name?: string;
+  /** Primary email address. */
+  email: string;
 };
 
 /** The kind of Google Chat conversation. */
@@ -139,7 +149,11 @@ export type ChatMessageInfo = {
    * is committed.
    */
   id: string;
-  /** ID of the containing conversation. */
+  /**
+   * ID of the containing conversation. A message you sent with
+   * `ChatSession.sendDirectMessage()` that is creating its conversation has a temporary
+   * `pending:space:{id}` here until that conversation exists; read the message again for the real ID.
+   */
   spaceId: string;
   /**
    * Containing thread ID, such as `spaces/AAAA1234/threads/CCCC`. Only meaningful where the
@@ -339,6 +353,30 @@ export interface ChatSession extends RpcTarget {
    * See {@link ChatMessageSearch} for what search covers.
    */
   searchMessages(query: ChatMessageSearch): Promise<Cursor<ChatMessageEntry>>;
+
+  /**
+   * Find people in your Google Workspace organization's directory whose name or email address
+   * starts with `query`, such as `ada` or `ada.lovelace@`. Contacts and people outside the
+   * organization are never returned.
+   */
+  searchPeople(query: string): Promise<Cursor<ChatPerson>>;
+
+  /**
+   * Send a message to one person, in your direct message with them, or to several, in the group
+   * chat with exactly them and you. Each person is `users/{user}` or an email address; leave
+   * yourself out. At most 49 people. `text` is formatted as for `ChatSpace.post()`.
+   *
+   * When that conversation already exists the message goes there. Otherwise sending also
+   * creates it, so each person must be named by email address and be in your organization's
+   * directory (see {@link searchPeople}): conversations with people outside your organization
+   * cannot be started this way. A group chat that also holds anyone else, Chat apps and Google
+   * Groups included, doesn't count, and if anyone joins it before the message is approved,
+   * nothing is posted.
+   *
+   * Until its conversation exists, a message that creates it has a temporary `spaceId`, and until
+   * it is committed it can be edited but not replied to.
+   */
+  sendDirectMessage(people: string[], text: string): Promise<ChatMessageEntry>;
 }
 
 /**
@@ -416,6 +454,65 @@ export interface ChatSpace extends RpcTarget {
    * with its temporary ID until it is committed.
    */
   post(text: string): Promise<ChatMessageEntry>;
+
+  /**
+   * Have `hook.receiveMessage()` called with each new message anyone else posts in this
+   * conversation, including thread replies; the connected account's own posts are never
+   * delivered. The hook starts disabled, and nothing is delivered until the user enables it.
+   * Every call creates a distinct hook, so subscribe once per conversation or thread to watch.
+   *
+   * `hook` must be a persistent stub: from `executeCode`, create it with
+   * `env.MY_GADGET[restore](params)` on the Gadget's binding; inside the Gadget, with
+   * `this.ctx.restore(params)`. The Gadget's `[restore]()` receives those `params` for every
+   * delivery, so they can tell its subscriptions apart, as can each message's `spaceId` and
+   * `threadId`. The restored target is a separate object; pass it what it needs from
+   * `[restore]()`, such as `this`, the Gadget, to use its storage and methods.
+   *
+   * Throws if this deployment has not configured Google Chat hooks.
+   *
+   * @example
+   * // server.js
+   * import { DurableObject, RpcTarget, restore } from "cloudflare:workers";
+   * export class Gadget extends DurableObject {
+   *   async [restore](params) {
+   *     if (params.type === "chat") return new StatusHook(params.name);
+   *     if (params.type === "report") return new Reporter(params.callback);
+   *     throw new TypeError(`Unknown restore type: ${params.type}`);
+   *   }
+   * }
+   * class StatusHook extends RpcTarget {
+   *   constructor(name) {
+   *     super();
+   *     this.name = name;
+   *   }
+   *   async receiveMessage({ info, message }) {
+   *     if (info.text?.includes("status?")) await message.reply(`${this.name}: all systems normal.`);
+   *   }
+   * }
+   *
+   * // Forwards each message to the chat that subscribed it. Pass on only `info`: `message` and
+   * // `conversation` are live capabilities, which `self` cannot store.
+   * class Reporter extends RpcTarget {
+   *   constructor(callback) {
+   *     super();
+   *     this.callback = callback;
+   *   }
+   *   async receiveMessage({ info }) {
+   *     await this.callback.newMessage(info);
+   *   }
+   * }
+   *
+   * // executeCode: one hook per conversation, told apart by its params, and one that reports
+   * // each ops message back to this chat through `self`
+   * import { restore } from "cloudflare:workers";
+   * export default async function(self, env) {
+   *   for (const [name, conversation] of [["standup", env.STANDUP_CHAT], ["ops", env.OPS_CHAT]]) {
+   *     await conversation.subscribeNewMessages(await env.MY_GADGET[restore]({ type: "chat", name }));
+   *   }
+   *   await env.OPS_CHAT.subscribeNewMessages(await env.MY_GADGET[restore]({ type: "report", callback: self }));
+   * }
+   */
+  subscribeNewMessages(hook: RpcStub<ChatMessageHook>): Promise<void>;
 }
 
 /**
@@ -443,6 +540,12 @@ export interface ChatThread extends RpcTarget {
    * `ChatSpace.post()`. Fails rather than starting a new thread.
    */
   post(text: string): Promise<ChatMessageEntry>;
+
+  /**
+   * As `ChatSpace.subscribeNewMessages()`, for replies in this thread only. Throws while the
+   * thread's first message is still pending.
+   */
+  subscribeNewMessages(hook: RpcStub<ChatMessageHook>): Promise<void>;
 }
 
 /**
@@ -507,4 +610,26 @@ export interface ChatAttachment extends RpcTarget {
    * 25 MiB safe-read limit.
    */
   getContent(): Promise<ArrayBuffer>;
+}
+
+/** A new message delivered to a `ChatMessageHook`, with what the hook watches. */
+export type ChatNewMessageEntry = ChatMessageEntry & {
+  /**
+   * The `ChatSpace` or `ChatThread` whose `subscribeNewMessages()` created the hook. Use it to
+   * read around the message, or to post where the conversation has no threads and
+   * `message.reply()` throws.
+   */
+  conversation: ChatSpace | ChatThread;
+};
+
+/** Implemented by a gadget to receive new messages; see `ChatSpace.subscribeNewMessages()`. */
+export interface ChatMessageHook {
+  /**
+   * Called with each new message. `entry.message` can read it in full and reply, and
+   * `entry.conversation` reaches the rest of what the hook watches; writes through either are
+   * queued for approval, and both are released when this call returns. Delivery is at least once
+   * and unordered, and a message this throws for is retried with backoff, eight attempts in all,
+   * so key any work on `entry.info.id` to keep it idempotent. Disabling the hook ends its retries.
+   */
+  receiveMessage(entry: ChatNewMessageEntry): Promise<void>;
 }

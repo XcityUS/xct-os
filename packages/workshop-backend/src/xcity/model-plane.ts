@@ -6,7 +6,7 @@ import type {
 import type { Singleton } from "@gadgets/typed-storage";
 import type { Model, Api } from "@earendil-works/pi-ai";
 import { createWorkshopLogger } from "../observability.js";
-import type { UserAiModelRecord } from "../user.js";
+import type { UserAiModelRecord } from "../storage-schema/user-storage.js";
 import type { XcityConfig } from "./config.js";
 import { fetchWithOneRetry } from "./fetch-retry.js";
 

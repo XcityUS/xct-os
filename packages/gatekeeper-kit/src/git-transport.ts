@@ -1,4 +1,6 @@
-// Git smart-HTTP transport framing behind the GitHub gatekeeper's git operations (see github.ts):
+// Git smart-HTTP transport framing behind a gatekeeper's git operations (`Gatekeeper.gitPull()`
+// and a `push` action). Provider-neutral: the caller supplies the HTTP transport (URL, auth,
+// timeouts) as a `fetch`-shaped callback, and this module composes and parses only the protocol.
 //
 // - The protocol v2 *fetch* client behind `Gatekeeper.gitPull()`: pkt-line framing, fetch-command
 //   composition from `GitPullHints`, and sideband demultiplexing of the packfile response. The
@@ -18,16 +20,19 @@
 //   exact-object fault explicitly `want`s. Every fetch sends an empty have list and an immediate
 //   `done` (the same noop negotiation stance git itself takes for partial-clone lazy fetches).
 // - **At most one `filter` line per fetch.** upload-pack accepts a single filter-spec (a second
-//   `filter` line is not merged; GitHub rejects the request), so combining hints is spelled in
-//   the filter-spec grammar or not at all -- see `filterSpecForHints()`.
+//   `filter` line is not merged; GitHub rejects the request outright), so combining hints is
+//   spelled in the filter-spec grammar or not at all -- see `filterSpecForHints()`.
 //
 // Everything the composer relies on was verified against live GitHub upload-pack (spike 1 of
-// plans/worktrees.md); the findings are documented on `filterSpecForHints()`.
+// plans/worktrees.md); the findings are documented on `filterSpecForHints()`. Other servers may
+// accept more (upstream git does), but every spelling used here is valid on any server that
+// supports partial clone at all, so the mapping is conservative rather than provider-specific.
 //
-// This module deliberately has no runtime imports (in particular no `cloudflare:workers`), so its
-// logic runs under the package's Node vitest project.
+// This module deliberately has no runtime imports beyond other Node-safe kit leaves (in particular
+// no `cloudflare:workers`), so its logic runs under the kit's Node vitest project.
 
 import type { GitOid, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
+import { readBytesCapped, ResponseTooLargeError } from "./response-body";
 
 /**
  * Maximum raw HTTP body size accepted from one upload-pack fetch, enforced while streaming (the
@@ -76,7 +81,7 @@ export function encodePktLine(line: string): Uint8Array {
  * Incremental pkt-line parser. `push()` accepts arbitrary chunk boundaries and returns the items
  * completed so far; `finish()` throws if bytes of an incomplete pkt remain. Defensive against
  * malformed input (a non-hex length or the meaningless length 3 is an error, not a skip), though
- * the input here always came from GitHub over TLS.
+ * the input here always came from the provider over TLS.
  */
 export class PktLineParser {
   #chunks: Uint8Array[] = [];
@@ -169,7 +174,8 @@ const OID_PATTERN = /^[0-9a-f]{40}$/;
  * Map `GitPullHints` to the single filter-spec this fetch sends, or undefined for none.
  *
  * The mapping is bounded by what GitHub's upload-pack actually supports, verified live (spike 1
- * of plans/worktrees.md):
+ * of plans/worktrees.md) -- the most restrictive server this module has been run against, so
+ * every spelling below is valid everywhere partial clone is:
  *
  * - `blob:none`, `blob:limit=<n>`, and `tree:0` are supported; `tree:<depth>` for any depth >= 1
  *   is rejected ("tree filter allows max depth 0"), and so is the `combine:` filter-spec grammar
@@ -182,7 +188,8 @@ const OID_PATTERN = /^[0-9a-f]{40}$/;
  * - `filterTreeDepth` 0 or 1 → `tree:0`. Exact for both shapes the overseer sends: a commit want
  *   with depth 0 yields just the commit, and a tree want with depth 1 yields just the tree,
  *   because the wants themselves always arrive.
- * - `filterTreeDepth` >= 2 → `blob:none`. The depth is inexpressible on GitHub; this preserves
+ * - `filterTreeDepth` >= 2 → `blob:none`. The depth is inexpressible on GitHub (a server that
+ *   accepts `tree:<depth>` could do better; an optimisation, not a correctness gap); this preserves
  *   the hint's no-blobs property at the cost of over-fetching subtree *structure*, which is
  *   consistent with trees being eager everywhere else.
  * - When `filterBlobSize` is set alongside `filterTreeDepth`, the tree mapping wins -- the
@@ -266,16 +273,21 @@ const BAND_ERROR = 3;
  * discarded, band 3 = fatal server error). An `ERR` pkt or band-3 message fails the stream with
  * the server's message; `maxBytes` bounds the raw body (see MAX_GIT_FETCH_BYTES); a response
  * that ends without a flush-pkt, or without ever reaching a packfile section, is an error --
- * a truncated pack must never look like a short success.
+ * a truncated pack must never look like a short success. `onFailure` is told what the stream
+ * failed with, which a reader across an RPC hop never learns.
  */
 export function demuxGitFetchResponse(
   body: ReadableStream<Uint8Array>,
   maxBytes: number,
+  onFailure?: (error: unknown) => void,
 ): ReadableStream<Uint8Array> {
   let iterator = demuxPackData(body, maxBytes);
   return new ReadableStream({
     async pull(controller) {
-      let next = await iterator.next();
+      let next = await iterator.next().catch((error: unknown) => {
+        onFailure?.(error);
+        throw error;
+      });
       if (next.done) controller.close();
       else controller.enqueue(next.value);
     },
@@ -373,16 +385,23 @@ export async function pullGitObjectsIntoCache(
 ): Promise<void> {
   let response = await fetchUploadPack(buildGitFetchRequest(oids, hints));
   if (!response.ok) {
-    // The transport normally throws its own richer error first (see GitHubApi); this is a
-    // defensive backstop for transports that don't.
+    // The caller's transport normally throws its own richer error first (e.g. GitHubApi's
+    // status-aware error); this is a defensive backstop for transports that don't.
     await response.body?.cancel().catch(() => {});
     throw new Error(`git fetch failed: HTTP ${response.status}`);
   }
   if (response.body === null) {
     throw new Error("git fetch failed: response had no body");
   }
-  let stored = new Set(await cache.consumePack(
-      demuxGitFetchResponse(response.body, MAX_GIT_FETCH_BYTES)));
+  // A failed pack stream reaches consumePack() across RPC only as a premature disconnect, so
+  // that is what it rejects with; the stream's own failure says why.
+  let failure: unknown;
+  let pack = demuxGitFetchResponse(response.body, MAX_GIT_FETCH_BYTES, error => {
+    failure = error;
+  });
+  let stored = new Set(await cache.consumePack(pack).catch((error: unknown) => {
+    throw failure ?? error;
+  }));
   let missing = oids.filter(oid => !stored.has(oid));
   if (missing.length > 0 && !(hints.type === "blob" && hints.filterBlobSize !== undefined)) {
     throw new Error(`git fetch did not provide the requested object${
@@ -445,8 +464,8 @@ function validateOid(oid: GitOid): GitOid {
  *
  * Only `report-status` (and the `agent`) is requested: no side-band, so the response is a bare
  * report-status body (see `parseReceivePackResponse`), and no `delete-refs` is needed for the
- * one-command deletes revert issues (servers accept a zero-id new-sha regardless; GitHub
- * advertises the capability).
+ * one-command deletes revert issues (servers accept a zero-id new-sha regardless; GitHub and
+ * GitLab both advertise the capability).
  */
 export function buildRefUpdateRequest(update: GitRefUpdate): Uint8Array {
   validateOid(update.oldSha);
@@ -574,34 +593,11 @@ export async function pushGitRefUpdate(
   if (response.body === null) {
     throw new Error("git push failed: response had no body");
   }
-  let report = await collectStream(response.body, MAX_RECEIVE_PACK_RESPONSE_BYTES);
-  parseReceivePackResponse(report, `refs/heads/${update.branch}`);
-}
-
-// Collects a byte stream into one buffer, enforcing a size cap as chunks arrive.
-async function collectStream(stream: ReadableStream<Uint8Array>, maxBytes: number)
-    : Promise<Uint8Array> {
-  let chunks: Uint8Array[] = [];
-  let total = 0;
-  let reader = stream.getReader();
-  try {
-    while (true) {
-      let result = await reader.read();
-      if (result.done) break;
-      total += result.value.byteLength;
-      if (total > maxBytes) {
-        throw new Error(`git push response exceeded the ${maxBytes}-byte limit`);
-      }
-      chunks.push(result.value);
+  let report = await readBytesCapped(response, MAX_RECEIVE_PACK_RESPONSE_BYTES).catch((error: unknown) => {
+    if (error instanceof ResponseTooLargeError) {
+      throw new Error(`git push response exceeded the ${MAX_RECEIVE_PACK_RESPONSE_BYTES}-byte limit`);
     }
-  } finally {
-    await reader.cancel().catch(() => {});
-  }
-  let out = new Uint8Array(total);
-  let offset = 0;
-  for (let chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return out;
+    throw error;
+  });
+  parseReceivePackResponse(report, `refs/heads/${update.branch}`);
 }

@@ -2,13 +2,7 @@ import { createFileRoute } from '@tanstack/react-router'
 import { useState, useEffect, useRef } from 'react'
 import { DropdownMenu, useKumoToastManager } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from '../AuthContext'
-import {
-  AiChatAuthorInfo,
-  AiGatewayInfo,
-  AiModelProvider,
-  SUGGESTED_MODELS,
-  XcityProviderInfo,
-} from '@gadgets/workshop-shared/api'
+import { AiChatAuthorInfo, AiGatewayInfo, XcityProviderInfo } from '@gadgets/workshop-shared/api'
 import {
   Plus,
   Trash,
@@ -29,8 +23,6 @@ export const Route = createFileRoute('/providers')({ component: ProvidersPage })
 
 // ─── constants ────────────────────────────────────────────────────────────────
 
-const PROVIDER_ORDER = Object.keys(SUGGESTED_MODELS) as AiModelProvider[]
-
 const PRIMARY_BTN =
   'press inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-lg bg-kumo-brand px-3.5 text-[13px] font-medium tracking-[-0.25px] text-white transition-colors hover:bg-kumo-brand-hover'
 
@@ -43,6 +35,7 @@ function ModelRow({
   isQuick,
   isBuiltIn,
   isTokenhub,
+  canEdit,
   onEdit,
   onClone,
   onDelete,
@@ -53,6 +46,8 @@ function ModelRow({
   isQuick: boolean
   isBuiltIn: boolean
   isTokenhub: boolean
+  /** Whether Edit and Clone are offered. Both save a model of the user's own. */
+  canEdit: boolean
   onEdit: () => void
   onClone: () => void
   onDelete: () => void
@@ -124,7 +119,7 @@ function ModelRow({
               <Lightning size={13} className="mr-2" weight={isQuick ? 'fill' : 'regular'} />
               {isQuick ? 'Clear default model' : 'Set as default model'}
             </DropdownMenu.Item>
-            {!isBuiltIn && !isTokenhub && (
+            {!isBuiltIn && !isTokenhub && canEdit && (
               <>
                 <DropdownMenu.Item onClick={onEdit} className={MENU_ITEM}>
                   <PencilSimple size={13} className="mr-2" />
@@ -134,10 +129,6 @@ function ModelRow({
                   <Copy size={13} className="mr-2" />
                   Clone provider
                 </DropdownMenu.Item>
-                <DropdownMenu.Item variant="danger" onClick={onDelete} className={MENU_ITEM_DANGER}>
-                  <Trash size={13} className="mr-2" />
-                  Delete provider
-                </DropdownMenu.Item>
               </>
             )}
             {/* Tokenhub rows are hidden, not deleted: re-addable any time via "Add model". */}
@@ -145,6 +136,12 @@ function ModelRow({
               <DropdownMenu.Item onClick={onRemove} className={MENU_ITEM}>
                 <EyeSlash size={13} className="mr-2" />
                 Remove from list
+              </DropdownMenu.Item>
+            )}
+            {!isBuiltIn && !isTokenhub && (
+              <DropdownMenu.Item variant="danger" onClick={onDelete} className={MENU_ITEM_DANGER}>
+                <Trash size={13} className="mr-2" />
+                Delete provider
               </DropdownMenu.Item>
             )}
           </DropdownMenu.Content>
@@ -197,6 +194,13 @@ function ProvidersPage() {
       setQuickModel(qm)
       setAiConfig(cfg)
       setXcityInfo(xcity)
+      // Each dialog saves a model of the user's own, so none stays open, or opens late, once the
+      // deployment says users may not add theirs. (On Xcity the dialog adds a TokenHub model.)
+      if (!xcity && cfg.enabled && !cfg.userModelsEnabled) {
+        ++openRequest.current
+        setSheetOpen(false)
+        setSourceMode(null)
+      }
     } catch (err) {
       console.error('Failed to load providers:', err)
       setLoadError(true)
@@ -208,12 +212,11 @@ function ProvidersPage() {
   useEffect(() => { fetchAll() }, [authenticatedApi])
 
   const gatewayMode = aiConfig?.enabled === true
+  // False only on an AI Gateway deployment whose administrator turned adding models off.
+  const canAddModels = aiConfig?.enabled !== true || aiConfig.userModelsEnabled
 
-  const isBuiltIn = (modelId: string): boolean => {
-    if (!aiConfig?.enabled) return false
-    const enabled = new Set((aiConfig as Extract<AiGatewayInfo, { enabled: true }>).enabledProviders)
-    return PROVIDER_ORDER.some((p) => enabled.has(p) && modelId in SUGGESTED_MODELS[p])
-  }
+  const isBuiltIn = (modelId: string): boolean =>
+    aiConfig?.enabled === true && aiConfig.builtInModelIds.includes(modelId)
 
   // Bumped whenever the user opens a dialog, so a configuration that finishes loading after a later
   // click doesn't open its editor over the dialog the user chose.
@@ -307,10 +310,18 @@ function ProvidersPage() {
             Configure the AI models available to your workspaces.
           </p>
         </div>
-        <button type="button" onClick={openAdd} className={`${PRIMARY_BTN} h-11 justify-center text-[14px] sm:h-9 sm:text-[13px]`}>
-          <Plus size={14} weight="bold" />
-          {xcityInfo ? 'Add model' : 'Add provider'}
-        </button>
+        {(xcityInfo || canAddModels) && (
+          <button
+            type="button"
+            onClick={openAdd}
+            // Until the deployment's configuration loads, nothing says whether adding is allowed.
+            disabled={aiConfig === null}
+            className={`${PRIMARY_BTN} h-11 justify-center text-[14px] disabled:cursor-not-allowed disabled:opacity-60 sm:h-9 sm:text-[13px]`}
+          >
+            <Plus size={14} weight="bold" />
+            {xcityInfo ? 'Add model' : 'Add provider'}
+          </button>
+        )}
       </header>
 
       {/* Default Xcity TokenHub provider — only on Xcity deployments with a connected identity */}
@@ -344,9 +355,12 @@ function ProvidersPage() {
               <Notice>
                 <Lightning size={15} className="mt-px shrink-0 text-kumo-brand" />
                 <span>
-                  <strong className="font-medium text-kumo-default">AI Gateway mode:</strong> built-in
-                  models are managed by your deployment. You can still add other models from the
-                  enabled providers.
+                  <strong className="font-medium text-kumo-default">AI Gateway mode:</strong>{' '}
+                  {canAddModels
+                    ? 'built-in models are managed by your deployment. You can still add other ' +
+                      'models from the enabled providers.'
+                    : 'your deployment’s administrator provides the models. Adding your own is ' +
+                      'turned off.'}
                 </span>
               </Notice>
             )}
@@ -387,18 +401,24 @@ function ProvidersPage() {
             </div>
             <div>
               <p className="text-sm font-medium text-kumo-default">
-                {xcityInfo ? 'No models in your list' : 'No AI providers yet'}
+                {xcityInfo
+                  ? 'No models in your list'
+                  : canAddModels ? 'No AI providers yet' : 'No AI models available'}
               </p>
               <p className="mt-1 text-[13px] leading-[18px] text-kumo-subtle">
                 {xcityInfo
                   ? 'Add a TokenHub model to start building workspaces with AI.'
-                  : 'Add a provider to start building workspaces with AI.'}
+                  : canAddModels
+                    ? 'Add a provider to start building workspaces with AI.'
+                    : 'Your deployment’s administrator offers no models at the moment.'}
               </p>
             </div>
-            <button type="button" onClick={openAdd} className={PRIMARY_BTN}>
-              <Plus size={14} weight="bold" />
-              {xcityInfo ? 'Add a model' : 'Add your first provider'}
-            </button>
+            {(xcityInfo || canAddModels) && (
+              <button type="button" onClick={openAdd} className={PRIMARY_BTN}>
+                <Plus size={14} weight="bold" />
+                {xcityInfo ? 'Add a model' : 'Add your first provider'}
+              </button>
+            )}
           </div>
         ) : filtered.length === 0 ? (
           <div className="py-12 text-center text-sm text-kumo-inactive">No providers found</div>
@@ -413,6 +433,7 @@ function ProvidersPage() {
                 isQuick={quickModel === model.id}
                 isBuiltIn={isBuiltIn(model.id)}
                 isTokenhub={isTokenhub(model.id)}
+                canEdit={canAddModels}
                 onEdit={() => openWithSource('edit', model)}
                 onClone={() => openWithSource('clone', model)}
                 onDelete={() => handleDelete(model)}

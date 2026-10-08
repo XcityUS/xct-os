@@ -76,6 +76,20 @@ return htmlResponse(connectHandoffPageHtml(handoff));
 Without `ifGeneration`, `connect()` writes unconditionally. That remains appropriate for a pasted
 token or form submission with no round trip to fence.
 
+Call `complete()` at most once per account. Each call stages another Workshop ticket, and an
+unredeemed ticket revokes the account, so a second call can destroy the connection the first made,
+even one that threw or lost its reply. A flow that claimed a single-use nonce reaches `complete()`
+once already. A flow whose link or form has no single-use nonce records the attempt: refuse when
+`isConnectAttempted(kv)` (early, to skip provider work, and again where the live credential is
+written), then mark it in that same synchronous section:
+
+```ts
+if (isConnectAttempted(kv)) return refuse();
+this.#creds.connect(grant);
+markConnectAttempted(kv);
+const handoff = await callback.complete(user, credentialsRefreshabilityExpiry);
+```
+
 RPC rejection does not prove that `complete()` failed. Workshop may already hold a pending handoff,
 or a sign-in may already have linked the account, so a blind rollback can delete credentials the
 Workshop is about to activate. The kit has no mechanism for this. An account that keeps its grant
@@ -804,6 +818,33 @@ refusing valid reads once later pages reveal new collections. `maxObservers` mus
 subrequest ceiling because every observer costs a verifier call on each read. `remotePageSize`
 cannot exceed the provider's page cap.
 
+## Git
+
+`git-transport`, `git-objects`, and `git-diff` implement the worktree contract in
+`plans/worktrees.md` §3 for any smart-HTTP host. The gatekeeper supplies a fetch callback that adds
+the URL, credentials, and timeouts; the kit owns the framing. Two rules of the framing are easy to
+break from the outside and fail late when broken:
+
+- **Never send a `have`.** A `have` asserts full reachability of that commit, but every pull here
+  is filtered or shallow, so the workspace cache holds commits whose blobs or ancestors it lacks.
+  Sending one makes upload-pack withhold objects a later fault will `want`. `buildGitFetchRequest`
+  sends an empty have list and `done`; do not build a fetch request another way to "save bytes".
+- **At most one `filter` line.** upload-pack accepts a single filter-spec — a second `filter` line
+  is not merged, and GitHub rejects the request outright. Combining hints is spelled in the
+  filter-spec grammar or not at all; `filterSpecForHints` is the one place that chooses, and its
+  limits are documented on it (`blob:limit` and `tree:0` are known to work on GitHub; `combine:`
+  is not).
+
+Every ref update goes through `pushGitRefUpdate` with the *queue-time* old sha, so receive-pack's
+compare-and-swap protects a branch that moved between approval and apply; a rejected update is a
+`GitRefUpdateRejectedError` whose `reason` is the server's own line, which the gatekeeper passes
+through rather than matching on. Advertise every commit id a read hands out — `advertiseCommits`
+for a single read, and for a listing a `PageHookCursor` whose hook is `advertisePages` — except
+those served from the cache while queued for push, which both take as `withhold`: advertising one
+of those would record a pull-routing hint for an object the remote does not have. A session's
+`SessionGitCache` (`./cursors`) does both over its own lazily fetched cache stub, with `withhold`
+given once at construction.
+
 ## Other module boundaries
 
 - Use `withAuthRetry` only for token flows without `CredentialSource`. Otherwise,
@@ -811,8 +852,9 @@ cannot exceed the provider's page cap.
 - Use `isNoAccessError` or `probeAccess` for observer ACL checks. Do not use `isNoAccessError` as
   `CredentialSource.isAuthError`; it accepts 403 and 404.
 - Use `readTextCapped` for every textual, JSON, or error body — a provider can return more bytes
-  than the Worker can hold. It decodes UTF-8 and buffers, so binary downloads and streaming
-  protocols (SSE, Git) need their own byte-preserving limit instead.
+  than the Worker can hold — and for a connect form read before its nonce is checked. It decodes
+  UTF-8 and buffers, so binary downloads and streaming protocols (SSE, Git) need their own
+  byte-preserving limit instead.
 - Use `normalizeVendorEndpoint` for user-supplied provider base URLs. It validates that one URL and
   is not a fetch policy: fetch with `redirect: "manual"`, or re-validate each `Location` and drop
   origin-scoped headers when the origin changes, or a redirect carries `Authorization` off the

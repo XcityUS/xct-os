@@ -13,6 +13,7 @@ import {
 } from "./storage-schema/user-storage.js";
 import { recordAnalytics } from "./analytics";
 import { createWorkshopLogger } from "./observability";
+import { haltIfAlarmsDisabled } from "@gadgets/observability/alarm-guard";
 import { getGatewayModels, type GatewayModels } from "./ai-gateway.js";
 import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-billing/limits/config.js";
 import { getXcityAgentMarketplaceConfig, getXcityConfig } from "./xcity/config.js";
@@ -2070,6 +2071,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * nonce was never presented (nothing to revoke for those).
    */
   async alarm(): Promise<void> {
+    if (await haltIfAlarmsDisabled(this.ctx, this.env, "handoff-sweep")) return;
     let now = Date.now();
     let expiredFlows = Array.from(this.storage.pendingConnectFlows.list())
         .filter(flow => flow.expiresAt.getTime() <= now);

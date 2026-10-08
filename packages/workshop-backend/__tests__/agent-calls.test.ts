@@ -673,3 +673,37 @@ describe("durable agent calls", () => {
     });
   });
 });
+
+describe("external response delivery under the alarm guard", () => {
+  it("an undeliverable external response stops re-arming the alarm",
+      () => freshImpl(async (impl, instance) => {
+    seedChat(impl);
+    let target = impl.ctx.exports.FailingChatGateway({});
+    // A real gateway sends a ctx.restore()-minted persistent stub, which is disposable; this
+    // loopback Fetcher stands in for one, so lend its class the same disposal for the test.
+    let fetcherProto = Object.getPrototypeOf(target);
+    fetcherProto[Symbol.dispose] = () => {};
+    try {
+      impl.storage.gadgetResponseDeliveries.put({
+        idempotencyKey: "gateway:1", chatId: CHAT_ID, promptSequence: 0, createdAt: Date.now(),
+        status: "ready", responseText: "done", chatGatewayRpcTarget: target,
+      });
+
+      // Regression (docs/alarm-audit.md, O1): each run used to re-arm at `now` in its `finally`
+      // and then rethrow, so the alarm spun for as long as the target kept failing. Now every
+      // failure backs off, and the record's attempt budget ends it.
+      for (let attempt = 1; attempt < 8; attempt++) {
+        await instance.alarm();
+        expect(await impl.ctx.storage.getAlarm()).toBeGreaterThanOrEqual(Date.now() + 29_000);
+        expect(impl.storage.gadgetResponseDeliveries.get("gateway:1"))
+            .toMatchObject({ status: "ready", deliveryAttempts: attempt });
+      }
+      await instance.alarm();
+      expect(impl.storage.gadgetResponseDeliveries.get("gateway:1")?.status).toBe("delivered");
+      // Only the delivered record's day-later sweep is left.
+      expect(await impl.ctx.storage.getAlarm()).toBeGreaterThan(Date.now() + 23 * 3_600_000);
+    } finally {
+      delete fetcherProto[Symbol.dispose];
+    }
+  }));
+});

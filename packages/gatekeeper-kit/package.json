@@ -8,6 +8,7 @@
     "./action-description": "./src/action-description.ts",
     "./action-files": "./src/action-files.ts",
     "./actions": "./src/actions.ts",
+    "./alarm-guard": "./src/alarm-guard.ts",
     "./auth-retry": "./src/auth-retry.ts",
     "./cache": "./src/cache.ts",
     "./connect-handshake": "./src/connect-handshake.ts",

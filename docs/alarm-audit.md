@@ -36,7 +36,7 @@ Verdicts:
 | BUG | 2 | S1 scheduler poison row, O1 overseer undeliverable external response |
 | NEEDS-BACKOFF | 2 | S2 scheduler admission re-lease, O2 overseer pending-call drain (low; documented, not changed) |
 | NEEDS-CIRCUIT-BREAKER | 1 | S3 scheduler handler failing permanently |
-| SAFE | 16 handlers | the 12 OAuth/connect timeouts, xcity ×2, mcp-shared, PendingLogin, UserDurableObject handoff sweep |
+| SAFE | 17 handlers | the 12 vendor connect timeouts, xcity ×2 (connect timeout, media poll), mcp-shared, PendingLogin, UserDurableObject handoff sweep |
 
 ## Table
 
@@ -92,8 +92,8 @@ all schedule rows: `nextFire`, `nextAttempt` or `leaseExpiresAt`.
 | `:237` `alarm()` → `#runAlarm` `:266` | arms recovery `now+5 min` first (`:273`), then delivers ≤20 due rows (4 concurrently) and calls `#planAlarm` | logs, `reportIssue`, rethrows; the recovery alarm (+5 min) is already armed | yes, the +5 min watchdog | see S1–S3 | see S1–S3 | **S1 BUG / S2 NEEDS-BACKOFF / S3 NEEDS-CIRCUIT-BREAKER** |
 | `:549` `#planAlarm` (`:552`, `:561`, `:562`) | `setAlarm(min target)`, which may be in the past; `setAlarm(Date.now())` when revoked | propagates | **yes when revoked (`now`)**; the target is in the past whenever a due row was not advanced | **yes**: the target comes from row state that delivery is supposed to advance | see S1 | BUG (S1) |
 | `:313` `#armRecoveryAlarm` (`:315`, `:316`) | from `enable()`: arms `now+5 min` if nothing earlier is armed | throws to the caller | no | no | 1 per enable | SAFE |
-| `:213` `revoke()` (`:216`) | RPC: `setAlarm(Date.now())` before marking the account revoked | throws to the caller | `now`, but driven by the caller | no | 1 per call; a client that calls it repeatedly only re-arms the same one alarm | SAFE (rule violation `setAlarm(now)`; now floored) |
-| `:565` `#cleanupRevokedAccount` (`:579`, `:580`) | deletes ≤100 rows per run; `setAlarm(Date.now())` while rows remain | throws; recovery +5 min | **yes (`now`)** | yes, but each run deletes 100 rows atomically, so it always makes progress | ≤ rows/100 runs (≤ 11 for a full account), 101 reads + ≤100 deletes each | SAFE (bounded by progress; now floored) |
+| `:213` `revoke()` (`:216`) | RPC: `setAlarm(Date.now())` before marking the account revoked | throws to the caller | `now`, but driven by the caller | no | 1 per call; a client that calls it repeatedly only re-arms the same one alarm | SAFE (a caller-driven `setAlarm(now)`; left as is) |
+| `:565` `#cleanupRevokedAccount` (`:579`, `:580`) | deletes ≤100 rows per run; `setAlarm(Date.now())` while rows remain | throws; recovery +5 min | **yes (`now`)** | yes, but each run deletes 100 rows atomically, so it always makes progress | ≤ rows/100 runs (≤ 11 for a full account), 101 reads + ≤100 deletes each | SAFE (bounded by progress; left as is) |
 
 ### Overseer (`workshop-backend/src/overseer.ts`, `OverseerDurableObject`)
 
@@ -131,10 +131,17 @@ pattern.
 - `#deliverSafely` and `#deliver` now quarantine a row whose delivery throws unexpectedly: it is
   marked `dead` in one transaction, and its capability is released. The row can never be due
   again, and the user sees it as dead in the management UI.
-- `#planAlarm`, `revoke` and the revoked cleanup arm through `scheduleAlarm`, which floors the
-  alarm time at `now + 1 s`.
-- The handler is wrapped in `guardedAlarm`. Regression test: `schedule-driver.test.ts`, "a row
-  whose transition throws is quarantined instead of spinning the alarm".
+- The handler is wrapped in `guardedAlarm` as a backstop. Its cap of 3600 runs/h means any
+  remaining spin (for example, a quarantine write that itself fails) stops within the hour.
+- `#planAlarm` still continues a backlog of more than 20 due rows immediately. A 1 s floor there
+  would slow legitimate draining and break the existing "immediately continues a due backlog"
+  test, and the root cause is now fixed.
+- The revoked-account cleanup's `setAlarm(Date.now())` is likewise left as is: every pass deletes
+  100 rows.
+- Regression test: `schedule-driver.test.ts`, "quarantines a lease-expired row whose transition
+  throws instead of spinning the alarm". It fails without the fix.
+- The existing test "isolates unexpected failures and settles sibling deliveries" now expects the
+  broken row to be `dead`. It used to stay `pending` forever.
 
 ### S2: scheduler admission re-lease retries forever (NEEDS-BACKOFF)
 
@@ -152,7 +159,9 @@ the top of `#runAlarm` keeps it alive forever: 288 runs a day, each followed by 
 platform retries, each with an error report. **Fix:** `guardedAlarm` (key `scheduler`,
 `maxPerHour: 3600`, `deferWhenOpen: true`). It catches the failure, takes over the next alarm
 with 30 s → 1 h exponential backoff, and gives up after 8 consecutive failures. A later
-`enable`/`disable` re-arms it.
+`enable`/`disable` re-arms it. The test "reports alarm infrastructure failures and backs off
+instead of rethrowing" covers this; it replaces "reports and rethrows". The failure is still
+logged and passed to `reportIssue`.
 
 ### O1: overseer undeliverable external response re-arms at `now` (BUG)
 
@@ -182,7 +191,7 @@ fast as the runtime reschedules, per affected workspace.
 - `alarm()` is wrapped in `guardedAlarm` (key `overseer`, `maxPerHour: 1200`,
   `deferWhenOpen: true`), which replaces the `now` re-arm with backoff when the handler throws.
 - Regression test: `agent-calls.test.ts`, "an undeliverable external response stops re-arming
-  the alarm".
+  the alarm". It fails without the fix.
 
 ### O2: overseer pending-call drain retries every 60 s (NEEDS-BACKOFF, low; not changed)
 
@@ -191,3 +200,79 @@ DO keeps failing, the calls stay recorded, and `#updateAlarm` re-arms the keep-a
 `now + 60 s` forever. That is 60 runs/h, each doing a few reads and 1 RPC; the rate is bounded
 and the cost small. Fixing it needs per-call attempt state in kernel storage, so it is left as a
 follow-up. The kill switch and the hourly cap still cover it.
+
+## What was applied
+
+Only the non-SAFE sites were changed. Every handler gained the kill switch.
+
+| Site | Change |
+|---|---|
+| All 19 `alarm()` handlers | The first statement is the `ALARMS_DISABLED` check: `haltIfAlarmsDisabled`, or `guardedAlarm`'s `disabled` option. |
+| Scheduler `alarm()` | Runs under `guardedAlarm` (`scheduler`, 3600/h, defer when open). Unexpected per-row failures quarantine the row as `dead` (`quarantineRun`). |
+| Overseer `alarm()` | Runs under `guardedAlarm` (`overseer`, 1200/h, defer when open). Ready external responses are abandoned after 8 failed deliveries. |
+| The 13 connect-timeout handlers, xcity media poll, mcp-shared, `PendingLogin`, `UserDurableObject` | Kill switch only. Their behaviour is otherwise unchanged. |
+
+The helper is `@gadgets/observability/alarm-guard`, re-exported as
+`@gadgets/gatekeeper-kit/alarm-guard`. It lives in `observability` because the workshop backend,
+the scheduler, `mcp-shared` and `gatekeeper-kit` all depend on that package already.
+`workshop-backend` does not depend on `gatekeeper-kit` and should not start.
+
+How `guardedAlarm` stores its state:
+
+- It keeps one key per guarded alarm, `alarm-guard:<key>`. The key holds the clock hour, the run
+  count, and the consecutive-failure count.
+- The hourly count is kept in memory. A spinning object stays resident, so the in-memory count
+  is exact.
+- The key is written only while the alarm is failing or past half its hourly cap, and it is
+  removed once neither holds. A healthy alarm therefore writes nothing, and the key never shows
+  up in code that lists or clears its own object's storage (the scheduler's revoked cleanup,
+  `deleteAll()`, tests that assert key sets).
+- Each run does one read and at most one write.
+
+Behaviour changes, all on failure paths only:
+
+- A guarded handler that throws no longer gets the platform's 2 s exponential retry. The guard
+  retries at 30 s, 60 s, ... up to 1 h, and gives up after 8 consecutive failures.
+- The scheduler marks a row it cannot advance as dead instead of retrying it forever.
+- An external response that fails delivery 8 times is dropped and logged as
+  `external.message.response.delivery.abandoned`.
+
+## Alarm rules
+
+1. **Never `setAlarm(now)` (or a past time) from code that can fail and come back.** Use
+   `scheduleAlarm` (from `alarm-guard`), which floors at `now + 1 s`. The only immediate
+   re-arms allowed are ones that delete or advance at least one item on every run, such as the
+   scheduler's backlog and its revoked cleanup.
+2. **Re-arm after the work, and back off on failure.** Re-arming before the work is fine only as
+   a far-off watchdog. A handler that re-arms itself runs under `guardedAlarm`, which owns the
+   next alarm when the body throws.
+3. **Every `alarm()` starts with the kill switch:**
+   `if (await haltIfAlarmsDisabled(this.ctx, this.env, "<key>")) return;`, or `guardedAlarm`'s
+   `disabled: alarmsDisabled(this.env)`.
+4. **No unbounded retries.** An item the handler retries carries an attempt count, or a deadline,
+   and is then removed or marked terminal (a poison item). Do not rely on a global cap alone.
+5. **Prefer one alarm per object, armed at a "next due" time** computed from state, as the
+   scheduler's `#planAlarm` and the user DO's `#armHandoffSweep` do. Avoid self-re-arming
+   polling loops. Where polling is unavoidable, bound it with a deadline, as the xcity media
+   poll does.
+6. **Recompute from state, never from the alarm.** If the item the alarm was for cannot be
+   advanced, the next alarm time must not be that item's (already past) due time.
+
+## Emergency stop and monitoring
+
+- **Kill switch:** set the Worker var `ALARMS_DISABLED` to `"true"` on the backend and on each
+  gatekeeper Worker, then redeploy. Each alarm deletes itself the next time it fires and logs
+  `alarm.disabled`. Remove the var and redeploy to resume. Alarms then come back as RPCs re-arm
+  them: an `enable`, a new connect flow, or agent activity.
+- **Logs:** in Workers Logs, search for `event` = `alarm.circuit.open` (a runaway was capped),
+  `alarm.gave_up` (8 consecutive failures), `alarm.failed`, `schedule.quarantined` and
+  `external.message.response.delivery.abandoned`. Each line carries `alarmKey` and the counts.
+- **Usage:** open Workers & Pages → the Worker → Durable Objects → Metrics. The SQLite storage
+  graphs show rows read and rows written per namespace. A loop looks like a flat, high plateau
+  that does not follow traffic.
+- **Usage over the API:** the GraphQL Analytics API exposes the same totals per namespace in the
+  `durableObjectsPeriodicGroups` dataset (`rowsRead` / `rowsWritten`). Alarm invocations appear
+  in `durableObjectsInvocationsAdaptiveGroups`. Check the exact field names in the schema
+  explorer.
+- **Spend alerts:** set a Usage Based Billing notification (Notifications → Billing) for Durable
+  Objects. That alert is the closest thing Cloudflare has to a spend cap.

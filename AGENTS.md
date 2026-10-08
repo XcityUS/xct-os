@@ -181,3 +181,19 @@ IMPORTANT: Frontend error reporting is a separate, opt-in path:
 - Install automatic capture only in trusted first-party surfaces, never gadget/user-authored code.
   Exception messages and stacks reach the external Reporter, so never intentionally put secrets,
   prompts, tokens, headers, or request/response bodies in thrown errors or report metadata.
+
+IMPORTANT: Durable Object alarm rules. A self-re-arming alarm loop is unbounded spend, because
+Cloudflare has no spend cap. See `docs/alarm-audit.md`; the helpers are in
+`@gadgets/observability/alarm-guard`, re-exported as `@gadgets/gatekeeper-kit/alarm-guard`.
+- Every `alarm()` starts with the kill switch: `if (await haltIfAlarmsDisabled(this.ctx, this.env, "<key>")) return;`
+  (or `guardedAlarm`'s `disabled`). Setting `ALARMS_DISABLED="true"` and redeploying halts every alarm.
+- Never `setAlarm(now)` or a past time on a path that can fail and come back; use `scheduleAlarm`
+  (floor `now + 1 s`). Re-arm after the work, never before it (except as a far-off watchdog).
+- A handler that re-arms itself runs under `guardedAlarm`, which gives an hourly circuit breaker,
+  30 s → 1 h backoff, and a give-up after 8 failures.
+- No unbounded retries: an item the handler retries needs an attempt count or a deadline, then is
+  removed or marked terminal. Fix poison items at the root; a cap alone is not a fix.
+- Prefer one alarm per object armed at a "next due" time computed from state over polling loops.
+- To spot a runaway, watch Durable Objects rows read/written (dashboard metrics or GraphQL
+  `durableObjectsPeriodicGroups`) and the `alarm.circuit.open` / `alarm.gave_up` log events. Set
+  a Usage Based Billing notification as well.

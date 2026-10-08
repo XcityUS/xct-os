@@ -185,7 +185,7 @@ IMPORTANT: Frontend error reporting is a separate, opt-in path:
 IMPORTANT: Durable Object alarm rules. A self-re-arming alarm loop is unbounded spend, because
 Cloudflare has no spend cap. See `docs/alarm-audit.md`; the helpers are in
 `@gadgets/observability/alarm-guard`, re-exported as `@gadgets/gatekeeper-kit/alarm-guard`.
-- Every `alarm()` starts with the kill switch: `if (await haltIfAlarmsDisabled(this.ctx, this.env, "<key>")) return;`
+- Every `alarm()` starts with the kill switch: `if (await haltIfAlarmsDisabled(this.ctx, this.env, "<key>")) return;` `scripts/alarm-guard-coverage.test.ts` fails the build for any source file that defines `async alarm(` without the guard, so a handler arriving in an upstream sync is caught.
   (or `guardedAlarm`'s `disabled`). Setting `ALARMS_DISABLED="true"` and redeploying halts every alarm.
 - Never `setAlarm(now)` or a past time on a path that can fail and come back; use `scheduleAlarm`
   (floor `now + 1 s`). Re-arm after the work, never before it (except as a far-off watchdog).

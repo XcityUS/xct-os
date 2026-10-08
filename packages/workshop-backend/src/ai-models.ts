@@ -937,7 +937,10 @@ export class LanguageModelGatekeeper
     // A session starts on each call of the binding, so a binding minted before an admin disabled
     // its gateway model stops working at its next call. While users may not add their own models,
     // so does a binding for any other model: one a user added, or one the admin added and removed.
-    let models = await getGatewayModels(this.env);
+    // (Xcity TokenHub models are neither gateway models nor the user's own: getModel() routes
+    // them past the gateway, so no gateway policy applies to them.)
+    let models = getXcityConfig(this.env) && getXcityModelMetadata(config)
+        ? null : await getGatewayModels(this.env);
     if (models?.get(config.model)?.provider === config.provider) {
       models.refuseDisabled(config.model);
     } else {

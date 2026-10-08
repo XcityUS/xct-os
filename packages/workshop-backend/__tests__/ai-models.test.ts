@@ -1546,6 +1546,22 @@ describe("LanguageModelGatekeeper.startSession", () => {
       await expect(startSession(config, { ...OFF, ...DISABLED }).session)
           .rejects.toThrow(new Error(DISABLED_MESSAGE));
     });
+
+    // Xcity: TokenHub models bypass the gateway (see getModel), so its policy doesn't apply.
+    it("starts a session for an Xcity TokenHub model once users may not", async () => {
+      const [record] = parseTokenhubModelCatalog({ data: [{ id: "deepseek-v4" }] }, {
+        tokenhubUrl: "https://tokenhub.xcity.ai",
+        apiKey: "sk-tokenhub-user",
+        xcityUserId: "01823f64-8ac8-715e-bf17-0f92801f2af3",
+      })!;
+      const { session, getConfig } = startSession(record.config, OFF, {
+        XCITY_TOKENHUB_URL: "https://tokenhub.xcity.ai",
+        XCITY_WALLET_URL: "https://wallet.xcity.ai",
+        WALLET_SERVICE_TOKEN: "wallet-service-token",
+      });
+      expect((await session).run).toBeTypeOf("function");
+      expect(getConfig).not.toHaveBeenCalled();
+    });
   });
 });
 

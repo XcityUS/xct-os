@@ -9,7 +9,9 @@ export default defineGadgetsWorker({
   compatibilityFlags: ["allow_irrevocable_stub_storage", "nodejs_als"],
   // Every var is deployment configuration (BASE_URL, XCITY_AUTH_URL, XCITY_TOKENHUB_URL,
   // XCITY_MEDIA_WORKER_URL, XCITY_WALLET_URL; secrets CLIENT_ID, CLIENT_SECRET,
-  // WALLET_SERVICE_TOKEN), supplied by the deployment rather than committed here.
+  // WALLET_SERVICE_TOKEN), supplied by the deployment rather than committed here. So is the
+  // optional XCITY_MEDIA service binding to the xcity-media Worker (the starter's
+  // `xcity.mediaWorkerService`), preferred over a public-URL fetch to XCITY_MEDIA_WORKER_URL.
   observability: OBSERVABILITY,
 });
 

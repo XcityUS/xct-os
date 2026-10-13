@@ -78,6 +78,7 @@ Gatekeeper 本身按目录名 `gatekeeper-*` 自动发现并绑定为 `GATEKEEPE
 |---|---|---|
 | `XCITY_TOKENHUB_URL` | tokenhub 基址，如 `https://tokenhub.xcity.ai` | 模型面回落上游行为（BYOK / AI Gateway） |
 | `XCITY_MEDIA_WORKER_URL` | xcity-media Worker 基址，如 `https://media.xcity.ai`；`gatekeeper-xcity` 生成视频/图片后调用它归档到 R2 | `gatekeeper-xcity` 不暴露媒体生成资源 |
+| `XCITY_MEDIA`（**service binding**，可选） | `gatekeeper-xcity` 到 xcity-media Worker 的首选传输：存在时 `/archive`、`/upload` 走 `env.XCITY_MEDIA.fetch()`，请求 URL 仍由 `XCITY_MEDIA_WORKER_URL` 拼出（Worker 看到的 host 不变）。原因：同账号 Worker 之间用公网 URL `fetch` 会重新进入 Workers runtime、累加嵌套 subrequest 深度，而 gatekeeper 调用链本来就深，生产上会报 "Subrequest depth limit exceeded"；service binding 不走这条回环。由 starter 的部署配置 `xcity.mediaWorkerService` 生成，本包的 `cloudflare.config.ts` 不声明它。传输选择集中在 `xcity-media.ts` 的 `resolveMediaWorkerTransport`；失败日志带 `transport: "service-binding" \| "fetch"` 字段 | 回落到对 `XCITY_MEDIA_WORKER_URL` 的全局 `fetch`（行为与引入前一致） |
 | `XCITY_WALLET_URL` | wallet 基址，如 `https://wallet.xcity.ai`；模型面用它铸 per-user litellm key，额度门禁用它查 KWH 余额 | 模型面回落上游行为；额度门禁回落上游 `ENABLE_CLOUDFLARE_LIMITS` 逻辑 |
 | `XCITY_AUTH_URL` | GoTrue 基址，如 `https://auth.xcity.ai` | gatekeeper-xcity 不可用 |
 | `XCITY_HOME_URL` | xct-home 基址，如 `https://xcity.ai`（agent 目录、充值跳转；通过 `ServerConfig` 下发给前端） | agent 目录与充值跳转不可用 |

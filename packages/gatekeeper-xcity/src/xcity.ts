@@ -29,9 +29,11 @@ import {
   normalizeVideoOptions,
   pendingGeneratedMedia,
   readXcityMediaConfig,
+  resolveMediaWorkerTransport,
   retrieveVideoJob,
   xcityMediaResourceUrl,
   XcityMediaApiError,
+  type MediaWorkerTransport,
   type StoredGenerateAction,
   type StoredGenerateImageAction,
   type StoredGenerateVideoAction,
@@ -144,6 +146,10 @@ type Env = Cloudflare.Env & {
   XCITY_AUTH_URL?: string;
   XCITY_TOKENHUB_URL?: string;
   XCITY_MEDIA_WORKER_URL?: string;
+  // Optional service binding to the same-account xcity-media Worker, used as the transport for
+  // XCITY_MEDIA_WORKER_URL calls when present (avoids the nested-subrequest loop of a public-URL
+  // fetch). Added by the deploying starter's generated config (`xcity.mediaWorkerService`), not here.
+  XCITY_MEDIA?: Fetcher;
   XCITY_WALLET_URL?: string;
   WALLET_SERVICE_TOKEN?: string;
 };
@@ -906,6 +912,10 @@ export class XcityMediaGatekeeperImpl extends DurableObject<Env, XcityMediaGatek
     return config;
   }
 
+  #mediaWorker(): MediaWorkerTransport {
+    return resolveMediaWorkerTransport(this.env);
+  }
+
   async #getTokenhubKey(forceMint = false): Promise<string> {
     const record = await this.#userAccount().getTokenhubKey(this.#mediaConfig(), forceMint);
     if (!record) {
@@ -987,6 +997,9 @@ export class XcityMediaGatekeeperImpl extends DurableObject<Env, XcityMediaGatek
         providerJobId: job.id,
         createdAt: new Date(action.submittedAt),
       },
+      fetch,
+      Date.now,
+      this.#mediaWorker(),
     );
     this.#storeResult(result);
     this.ctx.storage.kv.delete(videoFlightKey(action.mediaId));
@@ -1035,6 +1048,9 @@ export class XcityMediaGatekeeperImpl extends DurableObject<Env, XcityMediaGatek
           ...(cost ? { cost } : {}),
           createdAt: new Date(action.submittedAt),
         },
+        fetch,
+        Date.now,
+        this.#mediaWorker(),
       );
       this.#storeResult(result);
     } catch (error) {

@@ -8,6 +8,8 @@ export type XcityObservabilityFields = {
   vendorId: string;
   mediaId: string;
   providerJobId: string;
+  /** How an xcity-media Worker call was sent: the `XCITY_MEDIA` service binding or a public-URL fetch. */
+  transport: "service-binding" | "fetch";
 };
 
 /** Ambient observability fields for one Xcity gatekeeper operation. */

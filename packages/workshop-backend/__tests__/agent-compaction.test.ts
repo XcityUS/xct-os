@@ -3,7 +3,7 @@ import {type AiChatAuthorInfo, type AiChatMessage, type AiChatMessageBody}
   from "@gadgets/workshop-shared/api";
 import {
   buildCompactionState, buildSummaryPrompt, findCompactionBoundary, findProtectedFromSequence,
-  foldProposedChanges, getModelTokenLimits, isCompactionTurn, protectRetainedReverts,
+  foldProposedChanges, getModelTokenLimits, isCompactionTurn,
   shouldCompactChat, startsAgentTurn,
 } from "../src/agent-compaction";
 import { parseTokenhubModelCatalog } from "../src/xcity/model-plane";
@@ -346,35 +346,6 @@ describe("compaction boundary", () => {
   });
 });
 
-describe("retained reverts", () => {
-  it("keeps a revert together with the changes it names", () => {
-    let messages: AiChatMessage[] = [
-      record(2, agent, {type: "changes", change: codeChange("a")}),
-      record(5, user, {type: "revert", revertFrom: 2}),
-    ];
-
-    // The revert stays retained, so its target must stay retained too.
-    expect(protectRetainedReverts(4, messages)).toBe(2);
-  });
-
-  // Lowering the boundary for the later revert retains the earlier one, whose own target would then
-  // be compacted. Walking oldest-first would stop at 4 and leave that revert dangling.
-  it("settles when lowering the boundary retains an earlier revert", () => {
-    let messages: AiChatMessage[] = [
-      record(10, user, {type: "revert", revertFrom: 3}),
-      record(20, user, {type: "revert", revertFrom: 4}),
-    ];
-
-    expect(protectRetainedReverts(15, messages)).toBe(3);
-  });
-
-  it("refuses when protecting a revert would not advance the boundary", () => {
-    let messages: AiChatMessage[] = [record(5, user, {type: "revert", revertFrom: 2})];
-
-    expect(protectRetainedReverts(4, messages, 2)).toBeUndefined();
-  });
-});
-
 describe("compaction checkpoint state", () => {
   it("folds only non-regenerable replay state into the checkpoint", () => {
     let messages: AiChatMessage[] = [
@@ -503,6 +474,32 @@ describe("compaction checkpoint state", () => {
 
     expect(state.pins).toEqual([pin7]);
     expect(state.epoch).toBeUndefined();
+  });
+
+  // A revert recorded after the boundary reaches the changes before it: compaction cuts between
+  // the two, and a revert refolds the checkpoints it reaches.
+  it("drops the changes and pins a revert after the boundary discarded", () => {
+    let state = buildState([
+      record(0, agent, {type: "changes", change: codeChange("a", "kept.js"), pins: [pin7]}),
+      record(1, agent, {type: "changes", change: codeChange("b", "reverted.js"), pins: [pin9]}),
+      message(2, user, "Undo that."),
+      record(3, user, {type: "revert", revertFrom: 1}),
+    ], 2);
+
+    expect(filesIn(state.proposedChange)).toEqual(["kept.js"]);
+    expect(state.pins).toEqual([pin7]);
+  });
+
+  // Replay applies a later merge to the whole checkpoint; until it does, retained messages still
+  // see the proposed changes.
+  it("leaves a merge after the boundary to replay", () => {
+    let state = buildState([
+      record(0, agent, {type: "changes", change: codeChange("a")}),
+      message(1, user, "Ship it."),
+      record(2, user, {type: "merge", mergeThrough: 1, commits: [], epochBoundary: true}),
+    ], 1);
+
+    expect(filesIn(state.proposedChange)).toEqual(["file.js"]);
   });
 
   it("resets pins at an epoch boundary, recording the epoch", () => {

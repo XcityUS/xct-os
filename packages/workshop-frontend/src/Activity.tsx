@@ -5,7 +5,7 @@ import { RpcStub } from 'capnweb'
 import { ActionLogEntry, Overseer, actionChangeTime } from '@gadgets/workshop-shared/api'
 import { ActionKind } from '@gadgets/workshop-shared/gatekeeper'
 import { GatekeeperIcon } from './components/GatekeeperIcon'
-import { HookToggle } from './components/HookToggle'
+import { HookToggle, hookToggleFailureToast } from './components/HookToggle'
 import { AlwaysApproveButton, ResolveButton } from './components/ResolveButton'
 import { WorkshopButton } from './components/WorkshopControls'
 import { useActions } from './useActions'
@@ -195,7 +195,7 @@ export default function Activity({
     return groups
   }, [history.entries])
 
-  const resolveAction = useResolveAction(overseer, setProcessingActions)
+  const { resolveAction, creationAccountModal } = useResolveAction(overseer, setProcessingActions)
 
   const handleToggleHook = async (hookId: number, enabled: boolean) => {
     setTogglingHooks(previous => new Set(previous).add(hookId))
@@ -204,7 +204,7 @@ export default function Activity({
       else await overseer.disableHook(hookId)
     } catch (error) {
       console.error('Failed to toggle hook:', error)
-      toasts.add({ title: `Failed to ${enabled ? 'enable' : 'disable'} hook`, variant: 'error' })
+      toasts.add(hookToggleFailureToast(enabled, error))
     } finally {
       setTogglingHooks(previous => {
         const next = new Set(previous)
@@ -255,8 +255,8 @@ export default function Activity({
                   expanded={expandedActionId === record.id}
                   processing={processingActions.has(record.id)}
                   onToggle={() => toggleExpanded(record.id)}
-                  onApprove={() => void resolveAction(record.id, 'approve')}
-                  onReject={() => void resolveAction(record.id, 'deny')}
+                  onApprove={() => void resolveAction(record, 'approve')}
+                  onReject={() => void resolveAction(record, 'deny')}
                   onAlwaysApprove={
                     autoApproveTarget &&
                     !isTagAutoApproved(autoApproveTarget.gatekeeperId, autoApproveTarget.actionKind.tag)
@@ -465,6 +465,7 @@ export default function Activity({
           }}
         />
       )}
+      {creationAccountModal}
     </div>
   )
 }
@@ -804,8 +805,9 @@ function HistoryRow({
             )}
             {record.type === 'bindHook' && record.hookId !== undefined && (
               <HookToggle
+                hookTitle={record.description.title}
                 enabled={record.enabled}
-                disabled={togglingHook}
+                pending={togglingHook}
                 onToggle={enabled => onToggleHook(record.hookId!, enabled)}
               />
             )}

@@ -22,11 +22,13 @@
     "./git-diff": "./src/git-diff.ts",
     "./git-objects": "./src/git-objects.ts",
     "./git-transport": "./src/git-transport.ts",
+    "./hook-delivery-queue": "./src/hook-delivery-queue.ts",
     "./http-errors": "./src/http-errors.ts",
     "./observers": "./src/observers.ts",
     "./oauth-client": "./src/oauth-client.ts",
     "./preview-oauth": "./src/preview-oauth.ts",
     "./response-body": "./src/response-body.ts",
+    "./serial-queue": "./src/serial-queue.ts",
     "./simulation": "./src/simulation.ts",
     "./single-flight": "./src/single-flight.ts"
   },

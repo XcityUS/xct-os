@@ -1,6 +1,6 @@
-import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AiChatStreamEvent, BlueprintBinding, BlueprintMerge, BlueprintOutput, ChatGadgetPin, ChatGadgetPinRecord, MainlineMergeGadget, WorkpieceId, type AiModelConfig, isTextLikeAttachmentMimeType, validateBindingName } from '@gadgets/workshop-shared/api';
-import { applyCodeChange, codeChangeSerializedSize, replaceSpanChange, type CodeContent,
-  type CodeChange, type FileChange } from '@gadgets/workshop-shared/code-change';
+import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AiChatStreamEvent, AlwaysAvailableResource, BlueprintBinding, BlueprintMerge, BlueprintOutput, ChatGadgetPin, ChatGadgetPinRecord, MainlineMergeGadget, WorkpieceId, type AiModelConfig, isTextLikeAttachmentMimeType, validateBindingName } from '@gadgets/workshop-shared/api';
+import { applyCodeChange, codeChangeSerializedSize, MAX_CODE_CHANGE_SIZE, replaceSpanChange,
+  type CodeContent, type CodeChange, type FileChange } from '@gadgets/workshop-shared/code-change';
 import { PDF_MIME_TYPE, modelApiSupportsPdfAttachments } from './chat-attachment-pdf';
 import { AgentCatalog, ObservationDescription } from '@gadgets/workshop-shared/gatekeeper';
 import { createWorkshopLogger } from "./observability";
@@ -8,7 +8,8 @@ import {
   Type, getSystemMessageText, isRetryableAssistantError, toToolDeclaration,
 } from "@earendil-works/pi-ai";
 import type {
-  AssistantMessage, ImageContent, Message, SystemMessage, TSchema, TextContent, ToolCall, Usage,
+  AssistantMessage, ImageContent, Message, SystemMessage, TSchema, TextContent, ToolCall,
+  ToolResultMessage, Usage,
 } from "@earendil-works/pi-ai";
 import {
   runAgentLoopContinue, type AgentContext, type AgentEvent, type AgentTool,
@@ -16,7 +17,10 @@ import {
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { createTwoFilesPatch, FILE_HEADERS_ONLY } from "diff";
 import { webFetch as webFetchImpl, WebFetchEnv, formatWebFetchResult } from "./web-fetch";
-import { formatAlwaysAvailableResourcesPrompt } from "./agent-catalog";
+import {
+  findCatalogChanges, formatAlwaysAvailableResourcesPrompt, formatCatalogChange,
+  seenAlwaysAvailableResources,
+} from "./agent-catalog";
 import { formatInstanceInstructions } from "./admin-config";
 import type { AiGatewayLogRoute } from "./ai-gateway";
 import type { SpawnCallableOptions } from "./agent-spawner-binding";
@@ -31,7 +35,7 @@ import type {
 import {
   buildCompactionState, buildSummaryPrompt, chatChangeStatuses, COMPACTION_SYSTEM_PROMPT,
   estimateProjectionTokens, findCompactionBoundary, findProtectedFromSequence,
-  getModelTokenLimits, isCompactionTurn, protectRetainedReverts, shouldCompactChat,
+  foldProposedChanges, getModelTokenLimits, isCompactionTurn, shouldCompactChat,
   type CompactionProjectionMessage,
 } from "./agent-compaction";
 import { formatGrep, type GrepScan } from "./grep";
@@ -39,40 +43,6 @@ import { formatAgentPersona } from "./xcity/agent-persona";
 import { isXcityModelThrottle } from "./xcity/tokenhub-errors";
 
 const logger = createWorkshopLogger("workshop.agent");
-
-/**
- * Byte bound on one "changes" message's composed change for the *user* edit path.
- * Materialization writes exactly one message per call (see materializeChatChanges in
- * overseer.ts), so the composition is kept storable by bounding what *accumulates* rather than
- * by splitting the output: submitCodeChange materializes the pending live rows before appending
- * a row that would push their summed size past the budget. Rows are individually bounded
- * (MAX_CODE_CHANGE_SIZE) but a composition of several is not, and an unstorable message would
- * wedge materialization permanently (rows only retire on success, so accept and turn start
- * would retry the same oversized compose forever). A single row may legally exceed the budget:
- * the append-time trigger then guarantees it lands in an empty window and travels alone in one
- * oversized message, which storage already proved it can hold when the row itself was written.
- * Agent tool edits don't accumulate as live rows at all: they buffer in the step and land at
- * the barrier in one message, bounded by STEP_CHANGE_BUDGET at the write call. Measured with
- * codeChangeSerializedSize (composition never exceeds the sum of its inputs' sizes, so summing
- * rows bounds their composed change) and sized well clear of the 2MB storage record cap the
- * estimate upper-bounds against. (Declared here rather than in overseer.ts because agent.ts
- * must not import overseer.ts -- the dependency runs the other way.)
- */
-export const CHAT_CHANGE_MESSAGE_BUDGET = 1024 * 1024;
-
-/**
- * Byte bound on one agent step's buffered changes (their summed codeChangeSerializedSize),
- * enforced at the write call: the file-tool call that would exceed it fails with an
- * agent-visible error, everything buffered before it persists normally at the barrier, and the
- * model adapts mid-turn. The bound exists for correctness -- the barrier writes the step's
- * buffer as *one* "changes" message, which must fit in a 2MB storage record, envelope included
- * -- with bounded buffer memory falling out as a side effect. Sized to admit any single valid
- * file write with margin: a maximal whole-file `set` (MAX_FILE_TEXT_LENGTH, 512K UTF-16 units)
- * measures at most ~1MB under the at-most-two-bytes-per-unit estimate. (Known, accepted gap:
- * createGadget's blueprint copy is a single multi-file change that may legally measure past
- * the budget, but no shipped blueprint comes close.)
- */
-export const STEP_CHANGE_BUDGET = 1536 * 1024;
 
 /**
  * How much text one tool result may put in front of the model. About 8k tokens: a handful of
@@ -186,6 +156,12 @@ export type SeedBindingInfo = {
    */
   catalog?: AgentCatalog | null;
 };
+
+/** The always-available entries of a chat's seed binding layer. */
+export function alwaysAvailableResources(seeds: SeedBindingInfo[]): AlwaysAvailableResource[] {
+  return seeds.flatMap(({name, title, catalog}) =>
+      catalog === undefined ? [] : [{name, title, catalog}]);
+}
 
 /**
  * The history one agent pass replays: the active compaction checkpoint, if any, the chat log from
@@ -304,6 +280,16 @@ export function makeStoredAssistantMessage(message: AssistantMessage): StoredAss
  */
 export interface AgentHooks {
   getChatAgentContext(chatId: number): AiChatAgentContext;
+
+  /** Records the chat's AiChatAgentContext.workspacePrompt. */
+  setChatWorkspacePrompt(chatId: number, workspacePrompt: string): void;
+
+  /** The sequence the chat's next message will get. */
+  nextChatSequencePeek(chatId: number): number;
+
+  /** Appends messages to the chat log, unless the chat has been deleted. */
+  addChatMessages(chatId: number, author: AiChatAuthorInfo,
+      msgs: AiChatMessageBodyWithModelData[]): void;
 
   /**
    * The step's persistence barrier: in one storage transaction, persist the step's chat
@@ -591,6 +577,16 @@ export interface AgentHooks {
   consumeCapturedConnectionRequests(chatId: number): AiChatMessageBody[];
 
   /**
+   * Mint a gatekeeper simulating a new resource of a creatable type, and queue the creation for
+   * the user's approval. Unlike requestConnection, nothing waits on the user: the gatekeeper
+   * simulates the resource until the creation applies. Throws an agent-readable message when the
+   * request can't be met.
+   */
+  createExternalResource(
+      chatId: number, input: Extract<AiToolCall, {toolName: "createExternalResource"}>["input"])
+      : Promise<{gatekeeperId: WorkpieceId}>;
+
+  /**
    * Blueprint hooks for the agent.
    *
    * List the blueprints available to the turn's initiator (their own published blueprints, their
@@ -641,7 +637,7 @@ You are a helpful assistant who helps users get things done. You can answer ques
 
 # Workspaces
 
-You are working within a "workspace". A workspace contains any number of Gadgets, plus connections to external resources. Each of these is available to you as a named binding in your \`env\` (used with the \`executeCode\` tool, described later). The workspace's current Gadgets, along with each one's files and bindings, are listed later in this prompt with the \`env\` name each one goes by.
+You are working within a "workspace". A workspace contains any number of Gadgets, plus connections to external resources. Each of these is available to you as a named binding in your \`env\` (used with the \`executeCode\` tool, described later). The workspace's Gadgets as of the start of this session, along with each one's files and bindings, are listed later in this prompt with the \`env\` name each one goes by.
 
 A new workspace contains no Gadgets. You can answer questions, read connected resources, and perform one-off tasks with \`executeCode\` without creating a Gadget. Create one (via the \`createGadget\` tool) only when the user's request or established context clearly calls for a new application or saved output. An empty workspace or a task that needs code is not by itself a reason to create one.
 
@@ -923,7 +919,8 @@ export function formatMissingBlueprintBindings(
                 : ``);
         break;
       case "aiModel":
-        details = `an AI model binding`;
+        details = binding.modelKind === "decision"
+            ? `an AI decision model binding` : `an AI model binding`;
         break;
       case "agentSpawner":
         details = `an agent-spawner binding`;
@@ -1261,6 +1258,10 @@ let REQUEST_CONNECTION_TOOL_DESCRIPTION = `
 Ask the user to connect a gatekeeper resource (e.g. a ClickHouse cluster, a GitHub repo). Pre-configure as much as you can: always pass vendorId, and pass resourceUrl when you can infer it (use listConnectableResources to learn the URL patterns). The request must resolve to a specific resource: if you pass a resourceUrl it must match one of the vendor's patterns, and if the vendor offers multiple resource types with no whole-instance option you MUST pass a matching resourceUrl. Otherwise the call is rejected with guidance and no card is shown — fix the request and try again. You also choose \`bindingName\`: the name the resource will have in your env once connected (you know why you want the resource, so pick a name that reflects its role). On success this shows the user an accept/deny card in the chat. It does NOT block: your turn ends after a successful call, and you will be resumed once the user accepts (the resource becomes available as \`env.<bindingName>\`, which you can describeBinding and use from executeCode; wire it into a Gadget with setGadgetBinding only if the Gadget's code needs it) or denies (your turn simply ends; wait for the user's next message).
 `.trim();
 
+let CREATE_EXTERNAL_RESOURCE_TOOL_DESCRIPTION = `
+Create a new external resource (e.g. a new document), for resource types listConnectableResources marks creatable; requestConnection is for resources that already exist. The resource is immediately available as \`env.<bindingName>\` and your turn continues. It is created at the provider, in an account the user chooses, only once they approve the creation; until then it is simulated, and changes you make to it apply after the creation.
+`.trim();
+
 // =======================================================================================
 
 import { CodePreviewManager, ExecuteCodeStreamManager } from './code-preview';
@@ -1408,6 +1409,29 @@ function makeReplayAssistantMessage(
     stopReason: "stop",
     timestamp,
   };
+}
+
+// Builds the synthetic observeUserChanges call and result that tell the model about something
+// outside its own tool calls (the user's edits, a revert, a catalog change), keyed by the chat
+// message that records it. The result is plain text, not JSON: a JSON-escaped diff full of quotes
+// and braces would be needlessly hard to read, and the result is only ever fed to the model.
+function makeReplayObservation(
+    sequence: number, text: string, model: ModelHandle["model"], timestamp: number)
+    : [AssistantMessage, ToolResultMessage] {
+  let toolCallId = `synthetic_${sequence}`;
+  return [
+    makeReplayAssistantMessage(
+        [{type: "toolCall", id: toolCallId, name: "observeUserChanges", arguments: {}}],
+        model, timestamp),
+    {
+      role: "toolResult",
+      toolCallId,
+      toolName: "observeUserChanges",
+      content: [{type: "text", text}],
+      isError: false,
+      timestamp,
+    },
+  ];
 }
 
 // Builds an AgentTool while keeping `execute`'s params typed by its TypeBox schema; the cast to
@@ -2018,12 +2042,26 @@ async function runAgentPass(
 
   // Always-available resources (e.g. the Context Library) describe the agent's environment, so
   // they're announced in the system prompt (slot 1, below) alongside the bindings list rather
-  // than as a synthetic user turn.
-  let alwaysAvailable = seedBindings.filter(seed => seed.catalog !== undefined);
+  // than as a synthetic user turn. The prompt lists them as this part of the chat first saw them,
+  // so it stays the same when a catalog changes; the model is told of the change instead (see
+  // AiChatAgentContext.alwaysAvailableResources). One the chat can no longer reach drops out.
+  let currentResources = alwaysAvailableResources(seedBindings);
+  let listedResources = checkpoint?.alwaysAvailableResources ??
+      agentContext.alwaysAvailableResources ?? currentResources;
+  let alwaysAvailable = listedResources.filter(listed =>
+      currentResources.some(current => current.name === listed.name));
   let alwaysAvailableResourcesPrompt = alwaysAvailable.length > 0
-      ? formatAlwaysAvailableResourcesPrompt(alwaysAvailable.map(seed =>
-          ({title: seed.title, name: seed.name, catalog: seed.catalog!})))
-      : "";
+      ? formatAlwaysAvailableResourcesPrompt(alwaysAvailable) : "";
+
+  // Tells the model what changed in each resource since it last saw it (see the "catalogChange"
+  // message).
+  let replayCatalogChange = (
+      sequence: number, resources: AlwaysAvailableResource[], timestamp: number) => {
+    let seen = seenAlwaysAvailableResources(listedResources, chatMessages, sequence);
+    let text = resources.map(resource => formatCatalogChange(resource, seen.get(resource.name)))
+        .join("\n\n");
+    modelMessages.push(...makeReplayObservation(sequence, text, handle.model, timestamp));
+  };
 
   // Rebuild the code the compacted prefix left behind: first the checkpoint's pins establish
   // their base trees, then the composed proposed change applies on top. (A pre-conversion
@@ -2405,6 +2443,16 @@ async function runAgentPass(
                 case "requestConnection":
                   toolOutput = {text: toolCall.output ?? ""};
                   break;
+                case "createExternalResource":
+                  // Like createGadget: replay re-binds the recorded gatekeeper, never re-creates.
+                  if (toolCall.output === undefined) {
+                    throw new Error(
+                        "createExternalResource tool call in log is missing its result");
+                  }
+                  chatBindings.set(toolCall.input.bindingName,
+                      {type: "workpiece", id: toolCall.output.gatekeeperId});
+                  toolOutput = {text: jsonToolResultText(toolCall.output)};
+                  break;
                 default:
                   toolCall satisfies never;
                   throw new Error("Unknown tool.");
@@ -2548,23 +2596,8 @@ async function runAgentPass(
                   "available; read the files to see their current content.)");
             }
             if (observations.length > 0) {
-              let toolCallId = `synthetic_${msg.sequence}`;
-              modelMessages.push(makeReplayAssistantMessage([{
-                type: "toolCall",
-                id: toolCallId,
-                name: "observeUserChanges",
-                arguments: {},
-              }], handle.model, msgTimestamp));
-              modelMessages.push({
-                role: "toolResult",
-                toolCallId,
-                toolName: "observeUserChanges",
-                // Plain text, not JSON: a JSON-escaped diff full of quotes and braces would be
-                // needlessly hard to read, and the result is only ever fed to the model.
-                content: [{type: "text", text: observations.join("\n\n")}],
-                isError: false,
-                timestamp: msgTimestamp,
-              });
+              modelMessages.push(...makeReplayObservation(
+                  msg.sequence, observations.join("\n\n"), handle.model, msgTimestamp));
             }
           }
         }
@@ -2601,29 +2634,24 @@ async function runAgentPass(
         break;
 
       case "revert": {
-        // Synthetic message.
-        let toolCallId = `synthetic_${msg.sequence}`;
-        modelMessages.push(makeReplayAssistantMessage([{
-          type: "toolCall",
-          id: toolCallId,
-          name: "observeUserChanges",
-          arguments: {},
-        }], handle.model, msgTimestamp));
-        let revertedFromChangeId = changeIdMap.get(msg.revertFrom)!;
-        modelMessages.push({
-          role: "toolResult",
-          toolCallId,
-          toolName: "observeUserChanges",
-          content: [{
-            type: "text",
-            text:
-                `The user reverted all changes starting from change ${revertedFromChangeId} ` +
-                `onward. The files have returned to the state they were in immediately ` +
-                `before change ${revertedFromChangeId}.`,
-          }],
-          isError: false,
-          timestamp: msgTimestamp,
-        });
+        // Name the first change the revert discarded: the earliest batch still proposed when it
+        // was recorded. A revert reaching into the summarized turns can't be named that way, since
+        // the batches it may have discarded there aren't replayed.
+        let revertsSummarizedTurns = msg.revertFrom < (checkpoint?.compactedTo ?? 0);
+        let firstReverted = revertsSummarizedTurns ? undefined
+            : foldProposedChanges(chatMessages.slice(0, msgIndex))
+                .find(batch => batch.sequence >= msg.revertFrom);
+        let revertedFromChangeId = firstReverted && changeIdMap.get(firstReverted.sequence);
+        modelMessages.push(...makeReplayObservation(
+            msg.sequence,
+            revertsSummarizedTurns
+                ? "The user reverted all pending changes from a point in the summarized " +
+                  "earlier turns onward."
+                : revertedFromChangeId === undefined ? "The user discarded pending changes."
+                : `The user reverted all changes starting from change ${revertedFromChangeId} ` +
+                  `onward. The files have returned to the state they were in immediately ` +
+                  `before change ${revertedFromChangeId}.`,
+            handle.model, msgTimestamp));
         break;
       }
 
@@ -2711,6 +2739,10 @@ async function runAgentPass(
         break;
       }
 
+      case "catalogChange":
+        replayCatalogChange(msg.sequence, msg.resources, msgTimestamp);
+        break;
+
       case "action":
       case "useGadget":
       case "error":
@@ -2735,8 +2767,8 @@ async function runAgentPass(
   // (AgentHooks.commitAgentStep), so a crash loses the whole step -- transcript and effects
   // together -- and the resumed model re-runs it cleanly. Turn-owned and passed explicitly
   // where needed (the barrier now; executeCodeMode once worktree writes join it). `bytes` is
-  // the buffered changes' summed codeChangeSerializedSize, checked against STEP_CHANGE_BUDGET
-  // at each write call.
+  // the buffered changes' summed codeChangeSerializedSize, checked against MAX_CODE_CHANGE_SIZE
+  // at each write call (see appendAgentEdit).
   let stepBuffer = {changes: [] as AgentStepChange[], bytes: 0};
 
   // (A crashed predecessor leaves no stranded state to recover here: each step's rows, pins,
@@ -2783,13 +2815,21 @@ async function runAgentPass(
       workpieceId: WorkpieceId, change: CodeChange,
       pin?: {baseCommit: string, baseFiles: Map<string, string>}) => {
     // Bound the step's total: the barrier writes the buffer as exactly one "changes" message,
-    // which must fit in one storage record. The failed call buffers nothing -- everything
-    // buffered before it persists normally at the barrier -- and the error tells the model how
-    // to adapt.
+    // which must fit in one storage record, or the step's edits would be lost. Composition never
+    // exceeds the sum of its inputs' sizes, so the summed size bounds the message's change.
+    // The failed call buffers nothing -- everything buffered before it persists normally at the
+    // barrier -- and the error tells the model how to adapt: a single file write that is too
+    // large alone fails the same way every step, so its error says how to write the file
+    // instead. (This also bounds createGadget's blueprint copy, which buffers as one change.)
     let size = codeChangeSerializedSize(change);
-    if (stepBuffer.bytes + size > STEP_CHANGE_BUDGET) {
-      throw new Error("Too many code changes in one step. End this response; the changes made " +
-          "so far are being saved, and you can continue the work in your next step.");
+    if (stepBuffer.bytes + size > MAX_CODE_CHANGE_SIZE) {
+      let oneFile = Object.values(change).flat().length === 1;
+      throw new Error(stepBuffer.changes.length === 0 && oneFile
+          ? "This write is too large to make in one step. Write the file in smaller parts, " +
+            "for example by splitting it into several files, or by writing part of it and then " +
+            "adding the rest with edits."
+          : "Too many code changes in one step. End this response; the changes made so far " +
+            "are being saved, and you can continue the work in your next step.");
     }
     // Apply first: an inapplicable change must throw before anything buffers.
     let newContent = sessionContent;
@@ -2859,6 +2899,8 @@ async function runAgentPass(
   // system-prompt-blocks.ts), so the static prefix stays cached when the project-specific part
   // changes.
   let systemPromptSlots: [string, string];
+  // The regular agent's list of the workspace's gadgets, built for this pass.
+  let systemPromptWorkspace: string | undefined;
 
   if (agentContext.spawnerConfig) {
     // This is a spawned agent. Build an appropriate system prompt. Spawned agents see only the
@@ -2898,16 +2940,13 @@ async function runAgentPass(
 
     // Let's include each gadget's list of files in the system prompt so that the agent doesn't
     // have to call a tool to list files at the start of every thread. In order to avoid cache
-    // misses, we specifically list the files that existed at the start of the thread even if the
-    // agent adds or removes files during the thread. (An unpinned gadget's list can still change
-    // between turns if mainline moves -- a cache miss, but files rarely churn concurrently to a
-    // chat within the cache TTL.)
-    let systemPromptWorkspace: string;
+    // misses, we list the gadgets and files as of the start of the thread (or of its latest
+    // compaction), even if they change during it (see AiChatAgentContext.workspacePrompt).
     if (gadgetInfos.length == 0) {
       systemPromptWorkspace =
-          "This workspace does not contain any gadgets yet. You can use connected resources " +
-          "and executeCode without one. Use `createGadget` tool only when the task calls for a new " +
-          "application or saved output, before writing that gadget's files.";
+          "As of the start of this session, this workspace contained no gadgets. You can use " +
+          "connected resources and executeCode without one. Use `createGadget` tool only when the " +
+          "task calls for a new application or saved output, before writing that gadget's files.";
     } else {
       let sections: string[] = [];
       for (let info of gadgetInfos) {
@@ -2971,6 +3010,10 @@ async function runAgentPass(
       }
       systemPromptWorkspace = `# This workspace's gadgets\n\n${sections.join("\n\n")}`;
     }
+    let savedWorkspace = checkpoint ? checkpoint.workspacePrompt : agentContext.workspacePrompt;
+    if (checkpoint === undefined && savedWorkspace === undefined) {
+      hooks.setChatWorkspacePrompt(chatId, systemPromptWorkspace);
+    }
 
     // Named in the prompt because the request that should trigger them ("make me a doc") may
     // not look trigger the agent to browse blueprints.
@@ -3000,7 +3043,7 @@ async function runAgentPass(
     systemPromptSlots = [
       SYSTEM_PROMPT,
       (standardFormats ? `${standardFormats}\n\n` : "") +
-          `${systemPromptWorkspace}${systemPromptConnections}` +
+          `${savedWorkspace ?? systemPromptWorkspace}${systemPromptConnections}` +
           (alwaysAvailableResourcesPrompt ? `\n\n${alwaysAvailableResourcesPrompt}` : ""),
     ];
   }
@@ -3052,7 +3095,6 @@ async function runAgentPass(
     let compactedTo = findCompactionBoundary(
         projection, inputBudget, contextTokens,
         checkpoint?.compactedTo, findProtectedFromSequence(chatMessages));
-    compactedTo = protectRetainedReverts(compactedTo, chatMessages, checkpoint?.compactedTo);
     if (compactedTo !== undefined) {
       emitStreamEvent({type: "compacting"});
       try {
@@ -3078,6 +3120,10 @@ async function runAgentPass(
           chatId,
           compactedTo,
           summary,
+          workspacePrompt: systemPromptWorkspace,
+          alwaysAvailableResources: [
+            ...seenAlwaysAvailableResources(listedResources, chatMessages, compactedTo).values(),
+          ],
           ...buildCompactionState(
               chatMessages,
               compactedTo,
@@ -3823,6 +3869,44 @@ async function runAgentPass(
         }
       }
     }),
+
+    createExternalResource: defineTool({
+      name: "createExternalResource",
+      label: "Create external resource",
+      description: CREATE_EXTERNAL_RESOURCE_TOOL_DESCRIPTION,
+      parameters: Type.Object({
+        vendorId: Type.String({
+          description: "Vendor id, as listed in the system prompt (e.g. 'google').",
+        }),
+        resourceUrlPattern: Type.String({
+          description: "urlPattern of a creatable resource type, from listConnectableResources.",
+        }),
+        title: Type.String({
+          description: "Title of the new resource, e.g. the document's title.",
+        }),
+        bindingName: Type.String({
+          description:
+              "Name under which the new resource appears in your env. Must be a JavaScript " +
+              "identifier not already in use; style: ALL_CAPS_WITH_UNDERSCORES.",
+        }),
+      }),
+      execute: async (toolCallId, input) => {
+        try {
+          validateBindingName(input.bindingName);
+          if (isNameInScope(input.bindingName)) {
+            throw new Error(`There is already a binding named "${input.bindingName}" in your ` +
+                `env. Choose a different name.`);
+          }
+          let output = await hooks.createExternalResource(chatId, input);
+          chatBindings.set(input.bindingName, {type: "workpiece", id: output.gatekeeperId});
+          // Recorded so replay can re-bind without creating again (see the replay path above).
+          return toolResult(jsonToolResultText(output), {output} as Partial<AiToolCall>);
+        } catch (error) {
+          toolCallNotes.set(toolCallId, { error: toolErrorText(error) });
+          throw error;
+        }
+      }
+    }),
   };
 
   if (agentContext.spawnerConfig) {
@@ -4056,6 +4140,17 @@ async function runAgentPass(
       event: "agent.turn.skipped", chatId,
     });
     return {type: "finished"};
+  }
+
+  // Report the catalogs that changed since the model last saw them. The record is the newest, so
+  // every earlier request stays a prefix of this one. It must not be written before the returns
+  // above: a `/compact` or skipped turn would then no longer be recognized as one.
+  let catalogChanges = findCatalogChanges(
+      seenAlwaysAvailableResources(listedResources, chatMessages, Infinity), currentResources);
+  if (catalogChanges.length > 0) {
+    let sequence = hooks.nextChatSequencePeek(chatId);
+    hooks.addChatMessages(chatId, author, [{type: "catalogChange", resources: catalogChanges}]);
+    replayCatalogChange(sequence, catalogChanges, Date.now());
   }
 
   let context: AgentContext = {

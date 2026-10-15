@@ -3,9 +3,10 @@ import {
   BIGQUERY_RESOURCE, GMAIL_RESOURCE, GOOGLE_CALENDAR_RESOURCE, GOOGLE_CHAT_RESOURCE,
   GOOGLE_CHAT_SPACE_RESOURCE, GOOGLE_CHAT_THREAD_RESOURCE, GOOGLE_DOC_RESOURCE,
   GOOGLE_DRIVE_FILE_RESOURCE, GOOGLE_DRIVE_FOLDER_RESOURCE, GOOGLE_DRIVE_RESOURCE,
-  GOOGLE_SHEETS_RESOURCE, IDENTITY_SCOPES, LEGACY_GRANTED_RESOURCE_URL_PATTERNS,
-  RESOURCE_BY_KIND, RESOURCE_SCOPES, SCOPE_DERIVED_RESOURCE_URL_PATTERNS, SUPPORTED_RESOURCES,
-  grantedResourceUrlPatterns, hasDriveResourceGrant, parseResourceUrl,
+  GOOGLE_SHEETS_RESOURCE, GOOGLE_SLIDES_RESOURCE, IDENTITY_SCOPES,
+  LEGACY_GRANTED_RESOURCE_URL_PATTERNS, RESOURCE_BY_KIND, RESOURCE_SCOPES,
+  SCOPE_DERIVED_RESOURCE_URL_PATTERNS, SUPPORTED_RESOURCES, creatableKind,
+  grantedResourceUrlPatterns, hasDriveResourceGrant, nativeFileUrl, parseResourceUrl,
   recordedResourceUrlPatterns, resourceUrlPatternsToOAuthScopes, resourcesCoveredByScopes,
   validateResourceUrlPatterns,
 } from "../src/resources";
@@ -28,6 +29,7 @@ describe("resource declarations", () => {
       "https://mail.google.com/*",
       "https://docs.google.com/document/d/:docId/*",
       "https://docs.google.com/spreadsheets/d/:spreadsheetId/*",
+      "https://docs.google.com/presentation/d/:presentationId/*",
       "https://calendar.google.com/calendar/:calendarId/*",
       "https://drive.google.com/drive/my-drive",
       "https://drive.google.com/drive/folders/:folderId",
@@ -39,20 +41,19 @@ describe("resource declarations", () => {
     ]);
   });
 
-  it("describes the whole-account Drive authority exactly", () => {
-    expect(GOOGLE_DRIVE_RESOURCE.description).toBe(
-      "Find files and folders anywhere this Google account can read in Drive, including shared " +
-      "drives. Full-text search examines indexed file content, descriptions, and OCR text; search " +
-      "results contain metadata only, while native Google Docs and Sheets can be opened read-only.",
-    );
-  });
-
   it("advertises one batched Calendar connection for scheduling", () => {
     expect(GOOGLE_CALENDAR_RESOURCE.description).toBe(
       "Read and manage one selected calendar. For scheduling across people, request one connection " +
       "using https://calendar.google.com/calendar/primary/?availability=allVisible, then call " +
       "checkAvailability once with up to 50 attendee email addresses. Do not request each " +
       "attendee's calendar.",
+    );
+  });
+
+  it("advertises Sheets value, tab, row, column and formatting changes", () => {
+    expect(GOOGLE_SHEETS_RESOURCE.description).toBe(
+      "Read the values and formatting of a spreadsheet you choose, and change its values, tabs, " +
+      "rows, columns, and formatting, with your approval.",
     );
   });
 
@@ -89,21 +90,6 @@ describe("resource declarations", () => {
       expect(SUPPORTED_RESOURCES).toContain(resource);
     }
     expect(new Set(Object.values(RESOURCE_BY_KIND)).size).toBe(SUPPORTED_RESOURCES.length);
-  });
-
-  it("advertises native Docs and Sheets only on Drive resources", () => {
-    expect([
-      GOOGLE_DRIVE_RESOURCE.description,
-      GOOGLE_DRIVE_FOLDER_RESOURCE.description,
-      GOOGLE_DRIVE_FILE_RESOURCE.description,
-    ]).toEqual([
-      "Find files and folders anywhere this Google account can read in Drive, including shared " +
-      "drives. Full-text search examines indexed file content, descriptions, and OCR text; search " +
-      "results contain metadata only, while native Google Docs and Sheets can be opened read-only.",
-      "Browse a selected folder or shared drive, search its direct children, and read native " +
-      "Google Docs and Sheets.",
-      "Read metadata and, for a native Google Doc or Sheet, content from one Drive file.",
-    ]);
   });
 
   // The gatekeeper is deliberately a user-authenticated Chat client: `chat.bot` and the
@@ -174,21 +160,59 @@ describe("resourceUrlPatternsToOAuthScopes", () => {
       "https://www.googleapis.com/auth/drive.metadata.readonly",
       "https://www.googleapis.com/auth/documents.readonly",
       "https://www.googleapis.com/auth/spreadsheets.readonly",
+      "https://www.googleapis.com/auth/presentations.readonly",
     ]],
     [GOOGLE_DRIVE_FOLDER_RESOURCE, [
       "https://www.googleapis.com/auth/drive.metadata.readonly",
       "https://www.googleapis.com/auth/documents.readonly",
       "https://www.googleapis.com/auth/spreadsheets.readonly",
+      "https://www.googleapis.com/auth/presentations.readonly",
     ]],
     [GOOGLE_DRIVE_FILE_RESOURCE, [
       "https://www.googleapis.com/auth/drive.metadata.readonly",
       "https://www.googleapis.com/auth/documents.readonly",
       "https://www.googleapis.com/auth/spreadsheets.readonly",
+      "https://www.googleapis.com/auth/presentations.readonly",
     ]],
   ] as const)("pins the permanent scopes for $urlPattern", (resource, scopes) => {
     expect(resourceUrlPatternsToOAuthScopes([resource.urlPattern])).toEqual([
       ...IDENTITY_SCOPES, ...scopes,
     ]);
+  });
+
+  it("asks a directly bound spreadsheet for the Sheets write scope", () => {
+    expect(resourceUrlPatternsToOAuthScopes([GOOGLE_SHEETS_RESOURCE.urlPattern])).toEqual([
+      ...IDENTITY_SCOPES,
+      "https://www.googleapis.com/auth/spreadsheets",
+      "https://www.googleapis.com/auth/drive.metadata.readonly",
+    ]);
+  });
+
+  // A direct Sheets binding writes, so a connection holding only spreadsheets.readonly must read
+  // as ungranted, and the Workshop prompts for the wider scope, while a reconnect still asks for
+  // the resource it recorded.
+  it("re-prompts a direct Sheets grant that holds only spreadsheets.readonly", () => {
+    const grant = {
+      resourceUrlPatterns: [GOOGLE_SHEETS_RESOURCE.urlPattern],
+      oauthScopes: [
+        ...IDENTITY_SCOPES,
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+        "https://www.googleapis.com/auth/drive.metadata.readonly",
+      ],
+    };
+    expect(grantedResourceUrlPatterns(grant)).toEqual([]);
+    expect(recordedResourceUrlPatterns(grant)).toEqual([GOOGLE_SHEETS_RESOURCE.urlPattern]);
+  });
+
+  // Drive resources only read spreadsheets, so the direct Sheets binding's wider scope covers them.
+  it("covers a Drive resource's spreadsheets.readonly with a spreadsheets grant", () => {
+    expect(resourcesCoveredByScopes([GOOGLE_DRIVE_FILE_RESOURCE.urlPattern], [
+      ...IDENTITY_SCOPES,
+      "https://www.googleapis.com/auth/drive.metadata.readonly",
+      "https://www.googleapis.com/auth/documents.readonly",
+      "https://www.googleapis.com/auth/spreadsheets",
+      "https://www.googleapis.com/auth/presentations.readonly",
+    ])).toEqual([GOOGLE_DRIVE_FILE_RESOURCE.urlPattern]);
   });
 
   it("requires account and file grants to expand beyond metadata-only consent", () => {
@@ -202,6 +226,24 @@ describe("resourceUrlPatternsToOAuthScopes", () => {
     ]);
     expect(granted).toEqual([]);
   });
+
+  // Drive-native Slides added presentations.readonly to every Drive resource. A connection made
+  // before it must read as ungranted, so the Workshop prompts for it, while a reconnect still asks
+  // for the resource it recorded.
+  it("re-prompts a Drive grant made before Drive resources read Slides", () => {
+    const grant = {
+      resourceUrlPatterns: [GOOGLE_DRIVE_FOLDER_RESOURCE.urlPattern],
+      oauthScopes: [
+        ...IDENTITY_SCOPES,
+        "https://www.googleapis.com/auth/drive.metadata.readonly",
+        "https://www.googleapis.com/auth/documents.readonly",
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+      ],
+    };
+    expect(grantedResourceUrlPatterns(grant)).toEqual([]);
+    expect(recordedResourceUrlPatterns(grant)).toEqual([GOOGLE_DRIVE_FOLDER_RESOURCE.urlPattern]);
+  });
+
   it("deduplicates scopes shared between resources", () => {
     let scopes = resourceUrlPatternsToOAuthScopes(
       [GOOGLE_DOC_RESOURCE.urlPattern, GOOGLE_SHEETS_RESOURCE.urlPattern]);
@@ -291,11 +333,41 @@ describe("resourcesCoveredByScopes", () => {
       "https://www.googleapis.com/auth/drive.metadata",
       "https://www.googleapis.com/auth/documents",
       "https://www.googleapis.com/auth/spreadsheets",
+      "https://www.googleapis.com/auth/presentations",
     ])).toEqual(folderIntent);
+    // Sheets needs the read-write `spreadsheets` scope, which only `drive` subsumes.
     expect(resourcesCoveredByScopes(
       [GOOGLE_DOC_RESOURCE.urlPattern, GOOGLE_SHEETS_RESOURCE.urlPattern],
       ["https://www.googleapis.com/auth/drive.readonly"],
-    )).toEqual([GOOGLE_SHEETS_RESOURCE.urlPattern]);
+    )).toEqual([]);
+  });
+});
+
+describe("creatable resources", () => {
+  it("creates exactly Docs, Sheets and Slides", () => {
+    expect(creatableKind(GOOGLE_DOC_RESOURCE.urlPattern)).toBe("doc");
+    expect(creatableKind(GOOGLE_SHEETS_RESOURCE.urlPattern)).toBe("sheets");
+    expect(creatableKind(GOOGLE_SLIDES_RESOURCE.urlPattern)).toBe("slides");
+    expect(SUPPORTED_RESOURCES.filter(resource => resource.creatable))
+      .toEqual([GOOGLE_DOC_RESOURCE, GOOGLE_SHEETS_RESOURCE, GOOGLE_SLIDES_RESOURCE]);
+    for (let pattern of [GMAIL_RESOURCE.urlPattern, GOOGLE_DRIVE_FILE_RESOURCE.urlPattern, "nonsense"]) {
+      expect(() => creatableKind(pattern)).toThrow(
+        "Google can create only these resource types: " +
+        "Google Doc (https://docs.google.com/document/d/:docId/*), " +
+        "Google Spreadsheet (https://docs.google.com/spreadsheets/d/:spreadsheetId/*), " +
+        "Google Slides Presentation (https://docs.google.com/presentation/d/:presentationId/*).");
+    }
+  });
+
+  // A created file's URL becomes its binding's resource URL, so it must parse back to the same
+  // file; a file not yet created gets one that cannot be bound at all.
+  it.each([
+    ["doc", { kind: "doc", documentId: "abc" }],
+    ["sheets", { kind: "sheets", spreadsheetId: "abc" }],
+    ["slides", { kind: "slides", presentationId: "abc" }],
+  ] as const)("round-trips a created %s's URL", (kind, target) => {
+    expect(parseResourceUrl(nativeFileUrl(kind, "abc"))).toEqual(target);
+    expect(() => parseResourceUrl(nativeFileUrl(kind))).toThrow();
   });
 });
 
@@ -341,8 +413,8 @@ describe("parseResourceUrl", () => {
       expect(() => parseResourceUrl(url)).toThrow(/Unsupported Google/);
     });
 
-    it("rejects a docs.google.com path that is neither a doc nor a sheet", () => {
-      expect(() => parseResourceUrl("https://docs.google.com/presentation/d/abc/edit"))
+    it("rejects a docs.google.com path that is not a doc, sheet or presentation", () => {
+      expect(() => parseResourceUrl("https://docs.google.com/forms/d/abc/edit"))
         .toThrow(/Unsupported Google Docs resource URL/);
     });
 
@@ -365,9 +437,9 @@ describe("parseResourceUrl", () => {
 
       it("omits the fragment, which for Gmail is a search query", () => {
         let message = messageFor(
-          "https://docs.google.com/presentation/d/abc/edit#search/acquisition+target");
+          "https://docs.google.com/forms/d/abc/edit#search/acquisition+target");
         expect(message).not.toContain("acquisition");
-        expect(message).toContain("docs.google.com/presentation/d/abc/edit");
+        expect(message).toContain("docs.google.com/forms/d/abc/edit");
       });
 
       it("omits query parameters", () => {
@@ -376,7 +448,7 @@ describe("parseResourceUrl", () => {
       });
 
       it("omits credentials embedded in the authority", () => {
-        let message = messageFor("https://user:hunter2@docs.google.com/presentation/d/abc");
+        let message = messageFor("https://user:hunter2@docs.google.com/forms/d/abc");
         expect(message).not.toContain("hunter2");
         expect(message).not.toContain("user");
       });
@@ -442,7 +514,7 @@ describe("parseResourceUrl", () => {
     });
   });
 
-  describe("docs and sheets", () => {
+  describe("docs, sheets and slides", () => {
     it("extracts a document ID, ignoring trailing path", () => {
       expect(parseResourceUrl("https://docs.google.com/document/d/DOC123/edit?usp=sharing"))
         .toEqual({ kind: "doc", documentId: "DOC123" });
@@ -453,9 +525,15 @@ describe("parseResourceUrl", () => {
         .toEqual({ kind: "sheets", spreadsheetId: "SHEET123" });
     });
 
+    it("extracts a presentation ID", () => {
+      expect(parseResourceUrl("https://docs.google.com/presentation/d/DECK123/edit#slide=id.p"))
+        .toEqual({ kind: "slides", presentationId: "DECK123" });
+    });
+
     it.each([
       ["document", "https://docs.google.com/document/d/"],
       ["spreadsheet", "https://docs.google.com/spreadsheets/d/"],
+      ["presentation", "https://docs.google.com/presentation/d/"],
     ])("rejects a %s URL with no ID", (_name, url) => {
       expect(() => parseResourceUrl(url)).toThrow(/no .* ID found/);
     });

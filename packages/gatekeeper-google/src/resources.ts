@@ -39,14 +39,33 @@ export const GOOGLE_DOC_RESOURCE: SupportedResource = {
   title: "Google Doc",
   description: "Read and edit documents you choose.",
   grantable: true,
+  creatable: true,
 };
 
-/** A single Google Sheet. */
+/**
+ * A single Google Sheet, read and edited with the read-write `spreadsheets` scope, which creating one
+ * (see GatekeeperVendor.createResource()) needs too.
+ */
 export const GOOGLE_SHEETS_RESOURCE: SupportedResource = {
   urlPattern: "https://docs.google.com/spreadsheets/d/:spreadsheetId/*",
   title: "Google Spreadsheet",
-  description: "Read values from a spreadsheet you choose.",
+  description:
+    "Read the values and formatting of a spreadsheet you choose, and change its values, tabs, " +
+    "rows, columns, and formatting, with your approval.",
   grantable: true,
+  creatable: true,
+};
+
+/** A single Google Slides presentation. */
+export const GOOGLE_SLIDES_RESOURCE: SupportedResource = {
+  urlPattern: "https://docs.google.com/presentation/d/:presentationId/*",
+  title: "Google Slides Presentation",
+  description:
+    "Read a presentation you choose, its slides, layouts, masters, and formatting, and, with " +
+    "your approval, edit its text and design, copy, move, or delete slides, and change its " +
+    "backgrounds and theme colours.",
+  grantable: true,
+  creatable: true,
 };
 
 /** A single Google Calendar. */
@@ -108,7 +127,8 @@ export const BIGQUERY_RESOURCE: SupportedResource = {
 };
 
 /**
- * Files, folders, and read-only native Google Docs and Sheets available to the connected account.
+ * Files, folders, and read-only native Google Docs, Sheets and Slides available to the connected
+ * account.
  *
  * Whole-account, not just My Drive: listings set `includeItemsFromAllDrives`, so a shared drive the
  * account belongs to is inside this grant.
@@ -119,7 +139,8 @@ export const GOOGLE_DRIVE_RESOURCE: SupportedResource = {
   description:
       "Find files and folders anywhere this Google account can read in Drive, including shared " +
       "drives. Full-text search examines indexed file content, descriptions, and OCR text; search " +
-      "results contain metadata only, while native Google Docs and Sheets can be opened read-only.",
+      "results contain metadata only, while native Google Docs, Sheets and Slides can be opened " +
+      "read-only.",
   grantable: true,
 };
 
@@ -129,7 +150,7 @@ export const GOOGLE_DRIVE_FOLDER_RESOURCE: SupportedResource = {
   title: "Google Drive Folder",
   description:
       "Browse a selected folder or shared drive, search its direct children, and read native " +
-      "Google Docs and Sheets.",
+      "Google Docs, Sheets and Slides.",
   grantable: true,
 };
 
@@ -137,7 +158,9 @@ export const GOOGLE_DRIVE_FOLDER_RESOURCE: SupportedResource = {
 export const GOOGLE_DRIVE_FILE_RESOURCE: SupportedResource = {
   urlPattern: "https://drive.google.com/file/d/:fileId/view",
   title: "Google Drive File",
-  description: "Read metadata and, for a native Google Doc or Sheet, content from one Drive file.",
+  description:
+      "Read metadata and, for a native Google Doc, Sheet or Slides presentation, content from one " +
+      "Drive file.",
   grantable: true,
 };
 
@@ -208,8 +231,16 @@ export const RESOURCE_SCOPES: {resource: SupportedResource, scopes: string[]}[] 
   {
     resource: GOOGLE_SHEETS_RESOURCE,
     scopes: [
-      "https://www.googleapis.com/auth/spreadsheets.readonly",
+      "https://www.googleapis.com/auth/spreadsheets",
       // Read-only Drive file metadata, used to power the spreadsheet picker.
+      "https://www.googleapis.com/auth/drive.metadata.readonly",
+    ],
+  },
+  {
+    resource: GOOGLE_SLIDES_RESOURCE,
+    scopes: [
+      "https://www.googleapis.com/auth/presentations",
+      // Read-only Drive file metadata, used to power the presentation picker.
       "https://www.googleapis.com/auth/drive.metadata.readonly",
     ],
   },
@@ -227,6 +258,7 @@ export const RESOURCE_SCOPES: {resource: SupportedResource, scopes: string[]}[] 
       "https://www.googleapis.com/auth/drive.metadata.readonly",
       "https://www.googleapis.com/auth/documents.readonly",
       "https://www.googleapis.com/auth/spreadsheets.readonly",
+      "https://www.googleapis.com/auth/presentations.readonly",
     ],
   },
   {
@@ -235,6 +267,7 @@ export const RESOURCE_SCOPES: {resource: SupportedResource, scopes: string[]}[] 
       "https://www.googleapis.com/auth/drive.metadata.readonly",
       "https://www.googleapis.com/auth/documents.readonly",
       "https://www.googleapis.com/auth/spreadsheets.readonly",
+      "https://www.googleapis.com/auth/presentations.readonly",
     ],
   },
   {
@@ -243,6 +276,7 @@ export const RESOURCE_SCOPES: {resource: SupportedResource, scopes: string[]}[] 
       "https://www.googleapis.com/auth/drive.metadata.readonly",
       "https://www.googleapis.com/auth/documents.readonly",
       "https://www.googleapis.com/auth/spreadsheets.readonly",
+      "https://www.googleapis.com/auth/presentations.readonly",
     ],
   },
   // Every Chat resource requests the same scopes: Google grants Chat authority per API, not per
@@ -337,6 +371,10 @@ const SCOPE_COVERED_BY: Record<string, readonly string[]> = {
   "https://www.googleapis.com/auth/spreadsheets.readonly": [
     "https://www.googleapis.com/auth/spreadsheets", DRIVE_READONLY_SCOPE, DRIVE_READWRITE_SCOPE,
   ],
+  "https://www.googleapis.com/auth/presentations.readonly": [
+    "https://www.googleapis.com/auth/presentations", DRIVE_READONLY_SCOPE, DRIVE_READWRITE_SCOPE,
+  ],
+  "https://www.googleapis.com/auth/spreadsheets": [DRIVE_READWRITE_SCOPE],
   "https://www.googleapis.com/auth/chat.spaces.readonly": [
     "https://www.googleapis.com/auth/chat.spaces",
   ],
@@ -429,6 +467,7 @@ export type ResourceTarget =
   | { kind: "gmail"; searchQuery?: string; labelName?: string }
   | { kind: "doc"; documentId: string }
   | { kind: "sheets"; spreadsheetId: string }
+  | { kind: "slides"; presentationId: string }
   | { kind: "calendar"; calendarId: string; availabilityMode: CalendarAvailabilityMode }
   | { kind: "bigquery"; projectId: string; datasetId?: string; tableId?: string }
   | { kind: "driveAccount" }
@@ -443,6 +482,7 @@ export const RESOURCE_BY_KIND: Record<ResourceTarget["kind"], SupportedResource>
   gmail: GMAIL_RESOURCE,
   doc: GOOGLE_DOC_RESOURCE,
   sheets: GOOGLE_SHEETS_RESOURCE,
+  slides: GOOGLE_SLIDES_RESOURCE,
   calendar: GOOGLE_CALENDAR_RESOURCE,
   bigquery: BIGQUERY_RESOURCE,
   driveAccount: GOOGLE_DRIVE_RESOURCE,
@@ -452,6 +492,30 @@ export const RESOURCE_BY_KIND: Record<ResourceTarget["kind"], SupportedResource>
   chatSpace: GOOGLE_CHAT_SPACE_RESOURCE,
   chatThread: GOOGLE_CHAT_THREAD_RESOURCE,
 };
+
+/** The resource kinds createResource() can make: Google's native editor files. */
+export type CreatableKind = "doc" | "sheets" | "slides";
+const NATIVE_FILE_PATHS: Record<CreatableKind, string> =
+    { doc: "document", sheets: "spreadsheets", slides: "presentation" };
+const CREATABLE_KINDS = Object.keys(NATIVE_FILE_PATHS) as CreatableKind[];
+
+/** The kind of the creatable resource type `resourceUrlPattern`, or an agent-readable refusal. */
+export function creatableKind(resourceUrlPattern: string): CreatableKind {
+  let kind = CREATABLE_KINDS.find(candidate => {
+    let resource = RESOURCE_BY_KIND[candidate];
+    return resource.urlPattern === resourceUrlPattern && resource.creatable;
+  });
+  if (kind) return kind;
+  let types = CREATABLE_KINDS.map(candidate =>
+      `${RESOURCE_BY_KIND[candidate].title} (${RESOURCE_BY_KIND[candidate].urlPattern})`);
+  throw new Error(`Google can create only these resource types: ${types.join(", ")}.`);
+}
+
+/** A native file's canonical URL; with no `id`, its product's home page (a file not yet created). */
+export function nativeFileUrl(kind: CreatableKind, id?: string): string {
+  let base = `https://docs.google.com/${NATIVE_FILE_PATHS[kind]}/`;
+  return id === undefined ? base : `${base}d/${id}/edit`;
+}
 
 /**
  * Parses a bound resource URL into the target its gatekeeper needs.
@@ -524,7 +588,7 @@ function parseGmailUrl(parsed: URL): ResourceTarget {
 }
 
 function parseDocsUrl(parsed: URL): ResourceTarget {
-  // Both forms are /<type>/d/<id>/..., so the id is always the third segment.
+  // Every form is /<type>/d/<id>/..., so the id is always the third segment.
   let id = parsed.pathname.split("/")[3];
   if (parsed.pathname.startsWith("/document/d/")) {
     if (!id) throw new Error("Invalid Google Docs URL: no document ID found");
@@ -533,6 +597,10 @@ function parseDocsUrl(parsed: URL): ResourceTarget {
   if (parsed.pathname.startsWith("/spreadsheets/d/")) {
     if (!id) throw new Error("Invalid Google Sheets URL: no spreadsheet ID found");
     return { kind: "sheets", spreadsheetId: id };
+  }
+  if (parsed.pathname.startsWith("/presentation/d/")) {
+    if (!id) throw new Error("Invalid Google Slides URL: no presentation ID found");
+    return { kind: "slides", presentationId: id };
   }
   throw new Error(`Unsupported Google Docs resource URL: ${describeUrl(parsed)}`);
 }

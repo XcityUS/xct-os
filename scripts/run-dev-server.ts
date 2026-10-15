@@ -4,8 +4,8 @@
 // then launches `wrangler dev` with all discovered workers.
 //
 // Flags:
-//   --use-workers-ai-binding   Include the Workers AI binding in
-//                               workshop-backend (requires Cloudflare login).
+//   --use-workers-ai-binding   Include the Workers AI binding in workshop-backend and in the
+//                               gatekeepers that declare one (requires Cloudflare login).
 //   --port PORT                 Listen on PORT instead of 8787. Overrides VITE_BACKEND_HOST.
 //
 // Env:
@@ -483,6 +483,7 @@ const SHARED_GATEKEEPER_CREDS: Record<string, { id: string; secret: string }> = 
   "gatekeeper-slack": { id: "SLACK_CLIENT_ID", secret: "SLACK_CLIENT_SECRET" },
   "gatekeeper-linear": { id: "LINEAR_CLIENT_ID", secret: "LINEAR_CLIENT_SECRET" },
   "gatekeeper-spotify": { id: "SPOTIFY_CLIENT_ID", secret: "SPOTIFY_CLIENT_SECRET" },
+  "gatekeeper-x": { id: "X_CLIENT_ID", secret: "X_CLIENT_SECRET" },
 };
 
 // Deployment-configured vars a gatekeeper reads that its committed `wrangler.jsonc` deliberately
@@ -502,9 +503,13 @@ const PASSTHROUGH_GATEKEEPER_VARS: Record<string, string[]> = {
     "MCP_PORTAL_TRUST_ANNOTATIONS", "MCP_PORTAL_HIDDEN_SERVER_IDS", "MCP_ALLOW_INSECURE",
   ],
   "gatekeeper-mcp": ["MCP_ALLOW_INSECURE"],
+  // A tunnel's public origin, for GitHub to deliver hook events to; unset, hooks are refused.
+  "gatekeeper-github": ["WEBHOOK_ORIGIN"],
   // The instance a self-hosted GitLab gatekeeper talks to, and the Access service token for one
   // behind Cloudflare Access; unset, it talks to gitlab.com.
   "gatekeeper-gitlab": ["GITLAB_URL", "GITLAB_API_URL", "CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET"],
+  // Each connection's daily read limit; unset, the in-code default.
+  "gatekeeper-x": ["X_DAILY_READ_LIMIT"],
 };
 
 for (const gk of gatekeepers) {
@@ -526,6 +531,12 @@ for (const gk of gatekeepers) {
     if (process.env[name] !== undefined) {
       config.vars[name] = process.env[name];
     }
+  }
+
+  // Workers AI always runs remotely, which needs a Cloudflare login, so it stays opt-in here too.
+  if (config.ai) {
+    if (useWorkersAi) config.ai.remote = true;
+    else delete config.ai;
   }
 
   const outPath = join(gk.dir, "wrangler.dev.jsonc");

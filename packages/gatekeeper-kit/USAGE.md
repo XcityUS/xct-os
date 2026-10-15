@@ -17,9 +17,9 @@ sequencing that span more than one symbol.
 
 These sequences compose Layer-1 leaves; the kit ships no connect assembly. The conformance account
 in [`__tests__/workerd/conformance/gatekeeper.ts`](__tests__/workerd/conformance/gatekeeper.ts) is
-the executable reference. Production gatekeepers stage and commit reconnects, but none fences a
-connect on its connection generation yet, so the fenced variants below are the recommended shape
-rather than established practice. `disposeMintIfSafe`, `revokeLiveGrantBestEffort`, and `toGrant`
+the executable reference. Production gatekeepers stage and commit reconnects; GitLab also fences
+each connect on its connection generation, as the variants below do, and GitHub does not yet.
+`disposeMintIfSafe`, `revokeLiveGrantBestEffort`, and `toGrant`
 are gatekeeper-owned placeholders, not kit exports; `client` is an `OAuthClient` (see
 [OAuth token endpoint](#oauth-token-endpoint)).
 
@@ -53,6 +53,13 @@ const grant = toGrant(await client.exchangeCode({
 The handshake holds one OAuth nonce, so a second `advanceToOAuth` invalidates the first unclaimed
 callback. A claimed attempt can still race with a connection change. Use `startedUnder` in the
 matching initial or reconnect path below.
+
+Decide which path an attempt takes when its link is minted, not when it is used: pass that intent to
+`putInitiation` as metadata, which `advanceToOAuth` carries into the OAuth record (its own `extra`
+wins a name clash) and `claimOAuth` returns. Inferring it at callback time from whether credentials
+exist misroutes a reconnect whose account was disconnected meanwhile. Make the absent value the safe
+one — record `firstConnect: true` from the connect entry point, so anything else, a link minted
+before the field existed included, stages its grant as a reconnect.
 
 ### Initial connect
 
@@ -555,6 +562,11 @@ provider" warning survives.
 substitutes for a provider idempotency key derived from the stable `ActionContext.id`, which is
 what makes a retry safe in the first place.
 
+`submit` refuses a payload whose `dependsOn` names a reference that is neither resolved nor
+provided by a pending or claimed action: once its provider was rejected or failed, every apply
+would fail retryably, and an auto-approvable one would stall the drain behind it. A provider
+decided while the dependent was being delivered fails it instead, as the cascade would have.
+
 ### Describe with `buildDescription`
 
 Write `describe` with `buildDescription` from `@gadgets/gatekeeper-kit/action-description`. The
@@ -747,7 +759,7 @@ is over, or the caller should ask again. The `collections` branch above also ass
 `trackedCollectionObservers`; under a strategy whose `aclChecks` is `"unsupported"` every branch is
 `baseline`, per the table above.
 
-A refusal holds the outgoing page, so the retry re-offers exactly it with no further provider
+A refusal holds the outgoing page, so the retry re-offers its rows with no further provider
 fetch: a page the provider capped short cannot grow between the refusal and the retry, which would
 hand the approver something larger than what they refused. An empty page from a spent window is the
 exception — nothing was disclosed, so the retry opens a fresh window rather than pinning the walk
@@ -772,6 +784,23 @@ return new TokenCursor<Project>({
   // …
 });
 ```
+
+### Merge simulated rows with `inject`
+
+Rows the gatekeeper's own simulation adds to a listing — a branch a queued push will create, a
+commit queued for push — go in `inject: { items, compare, revalidate?, identity? }` rather than a
+wrapper cursor, so they share the walk's serialization, fetch bound and refusal hold. Each injected
+row is served before the first provider row `compare` places it at-or-before, and the rest after the
+last page. They are not provider rows: they never reach `authorizePage`'s `items`, and a page
+made only of them is not authorized, so do not inject anything the provider supplied. Their
+position still says a little — an injected row served first means no fetched provider row sorts
+ahead of it — so a listing whose order is itself sensitive authorizes its observation up front.
+`revalidate` re-reads a row when it is served (`null` drops it), since a page may be drained long
+after the cursor was built. `identity` drops a later row of either source whose identity was
+already served, such as the provider's copy of a create that landed mid-walk; an injected row's
+identity is re-read at each check, so a temporary id that became the provider's still matches.
+A refused page's retry re-reads its injected rows and offers no provider row the refusal did not
+cover; one a dropped injected row had hidden leads the next page instead, with the rows after it.
 
 ### Refusal and failure have different outcomes
 
@@ -803,6 +832,7 @@ The kit supplies defaults where they apply across consumers:
 | `maxTrackedCollections` | 1000 |
 | `maxObservers` | 10 |
 | `remotePageSize` | 100 |
+| cursor `maxProviderPagesPerCall` | 10 |
 | `OAuthClient` `timeoutMs` | 30 000 ms |
 | `OAuthClient` `maxResponseBytes` | 64 KiB |
 
@@ -816,7 +846,9 @@ bounds the distinct collections this binding has *ever* disclosed, including mar
 left behind, so size it from the whole resource rather than one page — a per-page value starts
 refusing valid reads once later pages reveal new collections. `maxObservers` must account for the Workers
 subrequest ceiling because every observer costs a verifier call on each read. `remotePageSize`
-cannot exceed the provider's page cap.
+cannot exceed the provider's page cap. Lower `maxProviderPagesPerCall` for a provider that bills
+each row it returns: a filter that drops whole pages otherwise pays for up to ten per `next()`, and
+`1` with a `pageSize` no provider page exceeds makes each `next()` one provider request.
 
 ## Git
 
@@ -845,6 +877,12 @@ of those would record a pull-routing hint for an object the remote does not have
 `SessionGitCache` (`./cursors`) does both over its own lazily fetched cache stub, with `withhold`
 given once at construction.
 
+A simulated read of a branch with queued pushes takes its head from `simulateBranchHead(realHead,
+pushes)`, the gatekeeper filtering the pushes to that branch; the same call gives the next push its
+`expectedOldSha`, so the simulated head and the compare-and-swap agree. Provider patches go through
+`parseUnifiedPatch`, one file's patch at a time, which shares `diffTextLines`'s hunk shape, so a
+simulated diff and a provider diff read alike.
+
 ## Other module boundaries
 
 - Use `withAuthRetry` only for token flows without `CredentialSource`. Otherwise,
@@ -854,11 +892,19 @@ given once at construction.
 - Use `readTextCapped` for every textual, JSON, or error body — a provider can return more bytes
   than the Worker can hold — and for a connect form read before its nonce is checked. It decodes
   UTF-8 and buffers, so binary downloads and streaming protocols (SSE, Git) need their own
-  byte-preserving limit instead.
+  byte-preserving limit instead. The exception is an excerpt decorating an error already being
+  raised: `readTextPrefix(response, n)` truncates instead of refusing and never throws on the body,
+  so an oversized HTML error page still yields its first bytes. Never redact its result: the cut can
+  split an echoed secret. Read a body that may echo a credential whole with `readTextCapped` and
+  redact before cutting. Use `readTextCapped` whenever the whole body must be read, JSON included.
 - Use `normalizeVendorEndpoint` for user-supplied provider base URLs. It validates that one URL and
   is not a fetch policy: fetch with `redirect: "manual"`, or re-validate each `Location` and drop
   origin-scoped headers when the origin changes, or a redirect carries `Authorization` off the
   allowlisted host.
+- Put agent-supplied ids into request paths with `pathSegment`, or `pathSegments` for a
+  `/`-separated name, not bare `encodeURIComponent`: it leaves `.` and `..` literal, and URL
+  parsing resolves them out of the route prefix. The provider's id grammar is still the
+  gatekeeper's to check.
 - Use `PreviewOAuth` when previews must share one stable callback registered with the OAuth
   provider.
 - Use `OAuthClient` for OAuth 2.0 token-endpoint calls rather than a hand-written `fetch`. It is

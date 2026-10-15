@@ -132,6 +132,16 @@ git rebase upstream/main        # 冲突应该只可能出现在上表接缝点
   真实 SHA），合并完成后 `git replace -d 83d7f40`；本次 merge commit 的第二父是真实的 `upstream/main`，
   以后的同步不再需要 graft。8 个冲突文件均在接缝点内；Xcity 的存储字段随上游挪进
   `storage-schema/{user,overseer}-storage.ts`（类型留在 `xcity/`）。
+- 2026-10-15：merge `upstream/main`（ef34d8e，48 提交，含 decision model / Cloudflare Clef #662、
+  agent 创建外部资源 #694/#716/#731、Google Slides/Sheets 写入、Gmail/GitHub event hooks #696/#717、
+  X / Web Search gatekeeper #721/#685、通知 #687、native app 会话交接 #712/#767/#780、gadget 列表与
+  resource catalog 固定在 system prompt #665/#753）。18 个冲突文件均在接缝点内或为测试/锁文件。
+  随动改动：`refuseRevokedModel`（上游把 #616 的 gateway 模型策略抽成函数，language/decision 共用）
+  内对带 Xcity 元数据的模型直接放行；`#listModels` 新增 `kind` 参数，Xcity 模型面只在
+  `kind === "language"` 时返回 TokenHub 模型；`makeHandle` 的 `onPayload` 在 `openAiRequestUser` 之后
+  接上游新增的 `signGeminiFunctionCalls`；新 vendor `gatekeeper-x` 与 native-app 前端文案执行品牌替换；
+  上游新增的三个 `alarm()`（x connect timeout、`GmailHookDriver`、`GitHubHookDriver`）加了 kill switch，
+  见 `docs/alarm-audit.md`。
 
 ## 部署
 

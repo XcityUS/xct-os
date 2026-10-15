@@ -654,6 +654,21 @@ describe("getModel direct routing (no gateway)", () => {
     });
   }, 15000);
 
+  it("does not send the OpenAI-only `store` parameter to Ollama-style endpoints", async () => {
+    // LiteLLM forwards unknown parameters to the real vendor, so `store` makes a router model
+    // group backed by Anthropic fail with UnsupportedParamsError.
+    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider: "ollama",
+      model: "smart_router",
+      apiToken: "sk-tokenhub-user",
+      apiUrl: "https://tokenhub.xcity.ai",
+    }, INITIATOR);
+
+    const request = await captureRequest(handle);
+    expect(request.url).toBe("https://tokenhub.xcity.ai/v1/chat/completions");
+    expect(JSON.parse(request.body)).not.toHaveProperty("store");
+  }, 15000);
+
   it("sends the config's extra headers, overriding provider defaults", async () => {
     const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
       provider: "openai",

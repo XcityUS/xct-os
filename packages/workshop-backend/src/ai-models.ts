@@ -860,7 +860,14 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
           // native API rather than the OpenAI-compatible endpoint, which would break users using
           // it in this way. That said, if this flag works as a temporary work-around for them
           // util we add a real OpenAI provider option... great.
-          compat: catalog?.compat ?? {supportsDeveloperRole: false},
+          //
+          // Pi also sends `store: false` to any endpoint it takes for standard OpenAI. This
+          // provider fronts arbitrary OpenAI-compatible servers, notably the Xcity tokenhub
+          // (LiteLLM), which forwards the parameter to the real vendor and fails with
+          // UnsupportedParamsError when that vendor (e.g. Anthropic via a router model group)
+          // does not accept it. The chat-completions API is stateless, so omitting it is
+          // equivalent.
+          compat: { ...(catalog?.compat ?? { supportsDeveloperRole: false }), supportsStore: false },
 
           ...window,
         }, config),

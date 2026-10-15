@@ -1,134 +1,110 @@
 // @vitest-environment jsdom
 /* eslint-disable react/react-in-jsx-scope */
 
-// The wizard's "Choose your model" step has to offer TokenHub models on an Xcity deployment —
-// the BYOK dialog is useless there — while staying byte-identical on every other deployment.
+import { act } from 'react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import type * as Kumo from '@cloudflare/kumo'
+import type { GatekeeperVendorInfo } from '@gadgets/workshop-shared/api'
 
-import { act } from "react";
-import { createRoot, type Root } from "react-dom/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+const addToast = vi.hoisted(() => vi.fn<(options: unknown) => void>())
 
-const testState = vi.hoisted(() => ({
-  addToast: vi.fn<(toast: unknown) => void>(),
-  getXcityProviderInfo: vi.fn<() => Promise<unknown>>(async () => null),
-  listModels: vi.fn<() => Promise<unknown[]>>(async () => []),
-  addModelProps: [] as unknown[],
-  xcityAddModelProps: [] as unknown[],
-}));
+vi.mock('@cloudflare/kumo', async (importOriginal) => {
+  const actual = await importOriginal<typeof Kumo>()
+  const toasts = { add: addToast }
+  return { ...actual, useKumoToastManager: () => toasts }
+})
+vi.mock('./ThemeContext', () => ({ useTheme: () => ({ resolvedThemeMode: 'light' }) }))
+const auth = vi.hoisted(() => {
+  const value: { authenticatedApi: Record<string, unknown>, currentUser: { id: string, name: string } } =
+    { authenticatedApi: {}, currentUser: { id: 'alice', name: 'Alice' } }
+  return value
+})
+vi.mock('./AuthContext', () => ({ useAuthenticatedApi: () => auth }))
 
-const authenticatedApi = {
-  listModels: testState.listModels,
-  getAiConfig: async () => ({ enabled: false }),
-  getXcityProviderInfo: testState.getXcityProviderInfo,
-  listGatekeeperVendors: async () => [],
-  subscribeConnectedAccounts: () => {
-    const subscription = Promise.resolve();
-    return Object.assign(subscription, { [Symbol.dispose]: () => {} });
-  },
-};
+import { deferred, makeTestRoot } from './action-test-harness'
+import OnboardingWizard from './OnboardingWizard'
 
-vi.mock("@cloudflare/kumo", () => ({
-  useKumoToastManager: () => ({ add: testState.addToast }),
-}));
+const view = makeTestRoot()
 
-vi.mock("./AuthContext", () => ({
-  useAuthenticatedApi: () => ({
-    authenticatedApi,
-    currentUser: { id: "user-a", name: "User A" },
-  }),
-}));
+afterEach(() => {
+  view.cleanup()
+  addToast.mockReset()
+  vi.restoreAllMocks()
+})
 
-vi.mock("./ThemeContext", () => ({ useTheme: () => ({ resolvedThemeMode: "light" }) }));
-vi.mock("./ServerConfigContext", () => ({ useSiteName: () => "Workshop" }));
-vi.mock("./useDocumentTitle", () => ({ useDocumentTitle: () => {} }));
-vi.mock("./components/SiteLogo", () => ({ default: () => null }));
-vi.mock("./components/XcityMark", () => ({ default: () => null }));
+const tool = (id: string, displayName: string): GatekeeperVendorInfo =>
+  ({ id, description: { url: `https://${id}.example`, displayName }, supportedResources: [] })
+const tools = [tool('scheduler', 'Scheduled Tasks'), tool('websearch', 'Web Search')]
 
-vi.mock("./AddModelModal", () => ({
-  default: (props: unknown) => {
-    testState.addModelProps.push(props);
-    return <div data-testid="byok-add-model" />;
-  },
-}));
-
-vi.mock("./XcityAddModelModal", () => ({
-  default: (props: unknown) => {
-    testState.xcityAddModelProps.push(props);
-    return <div data-testid="xcity-add-model" />;
-  },
-}));
-
-import OnboardingWizard from "./OnboardingWizard";
-
-(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
-const XCITY_INFO = {
-  tokenhubUrl: "https://tokenhub.xcity.ai",
-  modelIds: ["gpt-5.5-xhigh"],
-  catalog: [
-    { id: "gpt-5.5-xhigh", name: "gpt-5.5-xhigh", hidden: false },
-    { id: "cheap-model", name: "cheap-model", hidden: true },
-  ],
-  diagnostics: { identity: true, keyPresent: true },
-};
-
-let container: HTMLDivElement | undefined;
-let root: Root | undefined;
-
-async function renderWizard() {
-  container = document.createElement("div");
-  document.body.append(container);
-  root = createRoot(container);
-  await act(async () => root!.render(<OnboardingWizard onComplete={() => {}} />));
-  // Let the model/provider-info fetches settle.
-  await act(async () => { await Promise.resolve(); });
+// A user API whose built-in tool discovery resolves only when the test says so.
+function fakeApi() {
+  const discovery = deferred<GatekeeperVendorInfo[]>()
+  const provisionAmbientAccount = vi.fn<(vendorId: string) => Promise<void>>(async () => {})
+  const completeOnboarding = vi.fn<() => Promise<void>>(async () => {})
+  auth.authenticatedApi = {
+    listModels: async () => [],
+    getAiConfig: async () => ({ enabled: false }),
+    listGatekeeperVendors: async () => [],
+    listAddableGatekeepers: () => discovery.promise,
+    subscribeConnectedAccounts: () =>
+      Object.assign(new Promise<never>(() => {}), { [Symbol.dispose]() {} }),
+    setPreferredModel: async () => {},
+    provisionAmbientAccount,
+    completeOnboarding,
+  }
+  return { discovery, provisionAmbientAccount, completeOnboarding }
 }
 
-afterEach(async () => {
-  await act(async () => root?.unmount());
-  container?.remove();
-  container = undefined;
-  root = undefined;
-  testState.addModelProps.length = 0;
-  testState.xcityAddModelProps.length = 0;
-  testState.getXcityProviderInfo.mockResolvedValue(null);
-  testState.listModels.mockResolvedValue([]);
-  vi.clearAllMocks();
-});
+const button = (label: RegExp) =>
+  [...document.querySelectorAll('button')].find(b => label.test(b.textContent ?? ''))
+const click = async (label: RegExp) => {
+  const element = button(label)
+  if (!element) throw new Error(`No button labeled ${label}`)
+  await act(async () => element.click())
+}
+// Through the checkbox the switch forwards clicks to, since jsdom has no PointerEvent.
+const flipSwitch = async (name: string) => {
+  const checkbox = document.querySelector(`[role="switch"][aria-label="${name}"]`)?.nextElementSibling
+  if (!(checkbox instanceof HTMLInputElement)) throw new Error(`No switch for ${name}`)
+  await act(async () => checkbox.click())
+}
 
-describe("OnboardingWizard model step", () => {
-  it("offers the TokenHub catalog on an Xcity deployment", async () => {
-    testState.getXcityProviderInfo.mockResolvedValue(XCITY_INFO);
-    await renderWizard();
+async function openConnectionsStep() {
+  await view.render(<OnboardingWizard onComplete={() => {}} />)
+  await click(/^Next$/)
+  await click(/^Next$/)
+}
 
-    expect(container!.querySelector('[data-testid="xcity-add-model"]')).not.toBeNull();
-    expect(container!.querySelector('[data-testid="byok-add-model"]')).toBeNull();
-    // The catalog, including models the user hid, is handed to the picker as-is.
-    expect(testState.xcityAddModelProps.at(-1)).toMatchObject({
-      visible: false,
-      catalog: XCITY_INFO.catalog,
-    });
-    // Wording matches /providers, where the same TokenHub-only choice is presented.
-    expect(container!.textContent).toContain("Add model");
-    expect(container!.textContent).toContain("No models in your list");
-    expect(container!.textContent).toContain("Add a TokenHub model to get started");
-  });
+describe('OnboardingWizard built-in tools', () => {
+  it('keeps the user on Connections until the tools load, then turns on only those left on',
+      async () => {
+    const api = fakeApi()
+    await openConnectionsStep()
+    await click(/^Next$/)
+    expect(button(/Let.s build/)).toBeUndefined()
 
-  it("keeps the BYOK dialog and its wording when the deployment is not Xcity", async () => {
-    await renderWizard();
+    await api.discovery.resolve(tools)
+    await flipSwitch('Web Search')
+    await click(/^Next$/)
+    await click(/Let.s build/)
 
-    expect(container!.querySelector('[data-testid="byok-add-model"]')).not.toBeNull();
-    expect(container!.querySelector('[data-testid="xcity-add-model"]')).toBeNull();
-    expect(container!.textContent).toContain("Add new model...");
-    expect(container!.textContent).toContain("No models configured yet");
-    expect(container!.textContent).not.toContain("TokenHub");
-  });
+    expect(api.provisionAmbientAccount.mock.calls).toEqual([['scheduler']])
+    expect(api.completeOnboarding).toHaveBeenCalledOnce()
+  })
 
-  it("falls back to BYOK when the provider-info RPC is unavailable", async () => {
-    testState.getXcityProviderInfo.mockRejectedValue(new Error("no such method"));
-    await renderWizard();
+  it('completes onboarding and names the tool when one fails to turn on', async () => {
+    const api = fakeApi()
+    api.provisionAmbientAccount.mockImplementation(async (vendorId) => {
+      if (vendorId === 'websearch') throw new Error('disabled on this deployment')
+    })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    await openConnectionsStep()
+    await api.discovery.resolve(tools)
+    await click(/^Next$/)
+    await click(/Let.s build/)
 
-    expect(container!.querySelector('[data-testid="byok-add-model"]')).not.toBeNull();
-    expect(container!.querySelector('[data-testid="xcity-add-model"]')).toBeNull();
-  });
-});
+    expect(api.completeOnboarding).toHaveBeenCalledOnce()
+    expect(addToast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Couldn't turn on Web Search.", variant: 'warning' }))
+  })
+})

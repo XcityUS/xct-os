@@ -21,6 +21,7 @@ export default defineConfig({
         durableObjects: {
           ChatHookDriver: {className: "ChatHookDriver", useSQLite: true},
           GmailGatekeeperImpl: {className: "GmailGatekeeperImpl", useSQLite: true},
+          GmailHookDriver: {className: "GmailHookDriver", useSQLite: true},
           GoogleChatGatekeeperImpl: {className: "GoogleChatGatekeeperImpl", useSQLite: true},
           TestHooks: {className: "TestHooks", useSQLite: true},
           UserAccount: {className: "UserAccount", useSQLite: true},
@@ -29,11 +30,13 @@ export default defineConfig({
     }),
   ],
   test: {
+    testTimeout: 15_000,
     include: [
       "__tests__/workerd/chat-actions.test.ts",
       "__tests__/workerd/chat-hooks.test.ts",
       "__tests__/workerd/configurators.test.ts",
       "__tests__/workerd/gmail-actions.test.ts",
+      "__tests__/workerd/gmail-hooks.test.ts",
       "__tests__/workerd/gmail-state.test.ts",
     ],
     setupFiles: ["@gadgets/scripts/assert-workerd"],

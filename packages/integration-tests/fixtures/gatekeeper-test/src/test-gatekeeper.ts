@@ -25,10 +25,10 @@ import {
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import type {
-  AccountDescription, ActionKind, AgentCatalog, ApprovalQueue, ConnectHandoff, Gatekeeper,
-  GatekeeperConnectCallback, GatekeeperUser, GatekeeperUserVerifier, HookController, HookInitiator,
-  HookTargetMetadata, ResourceDescription, ResourceConfiguratorFrame, SupportedResource,
-  VendorDescription,
+  AccountDescription, ActionDescription, ActionKind, AgentCatalog, ApprovalQueue, ConnectHandoff,
+  Gatekeeper, GatekeeperConnectCallback, GatekeeperUser, GatekeeperUserVerifier, HookController,
+  HookInitiator, HookTargetMetadata, ResourceDescription, ResourceConfiguratorFrame,
+  SupportedResource, VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type {
   ChatGatewayRpcTarget, GadgetResponse, SubmitExternalMessageInput, SubmitExternalMessageResult,
@@ -42,6 +42,7 @@ const SUPPORTED_RESOURCES: SupportedResource[] = [{
   urlPattern: `https://${VENDOR_HOST}/things/*`,
   title: "Test Thing",
   description: "A resource that exists only so tests can bind something.",
+  creatable: true,
 }];
 
 const TYPES_CODE = `
@@ -136,6 +137,14 @@ export class TestControl extends DurableObject<Cloudflare.Env> {
     return this.ctx.storage.kv.get<number>(`ambient-verifications:${label}`) ?? 0;
   }
 
+  setAgentCatalog(label: string, catalog: AgentCatalog): void {
+    this.ctx.storage.kv.put(`agent-catalog:${label}`, catalog);
+  }
+
+  getAgentCatalog(label: string): AgentCatalog | null {
+    return this.ctx.storage.kv.get<AgentCatalog>(`agent-catalog:${label}`) ?? null;
+  }
+
   recordRevocation(label: string): void {
     const key = `revocations:${label}`;
     this.ctx.storage.kv.put(key, (this.ctx.storage.kv.get<number>(key) ?? 0) + 1);
@@ -175,6 +184,25 @@ export class TestControl extends DurableObject<Cloudflare.Env> {
     state.value = action.value;
     state.applyCount++;
     this.ctx.storage.kv.put(`actions:${label}`, state);
+  }
+
+  /** Moves a simulated thing's staged actions to the account it was created in. */
+  adoptActions(from: string, to: string): void {
+    const source = this.getActionState(from);
+    const state = this.getActionState(to);
+    state.pending.push(...source.pending);
+    state.nextId = Math.max(state.nextId, source.nextId);
+    this.ctx.storage.kv.put(`actions:${to}`, state);
+    this.ctx.storage.kv.delete(`actions:${from}`);
+  }
+
+  /** Each applyCreation() into account `label`, by the configuration it was given. */
+  recordCreation(label: string, configuration: string | null): void {
+    this.ctx.storage.kv.put(`creations:${label}`, [...this.getCreations(label), configuration]);
+  }
+
+  getCreations(label: string): (string | null)[] {
+    return this.ctx.storage.kv.get<(string | null)[]>(`creations:${label}`) ?? [];
   }
 
   failNextApply(label: string, reason: string): void {
@@ -385,7 +413,9 @@ function control(exports: Cloudflare.Exports): DurableObjectStub<TestControl> {
 // Vendor
 
 type AccountProps = { label: string };
-type BindingProps = AccountProps & { resourceUrl: string; ambient?: true };
+// `simulated`: minted by GatekeeperVendor.createResource() and not yet created, so nothing may
+// apply through it. It belongs to no account, so its `label` keys only its staged actions.
+type BindingProps = AccountProps & { resourceUrl: string; ambient?: true; simulated?: true };
 
 @validateRpc()
 export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
@@ -426,6 +456,26 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
     const label = newAccountLabel();
     await control(this.ctx.exports).openConnect(label, callback);
     return { url: `https://${VENDOR_HOST}/connect/${label}` };
+  }
+
+  async createResource(_resourceUrlPattern: string, title: string): Promise<{
+    class: DurableObjectClass<Gatekeeper<TestSession>>;
+    resource: SupportedResource;
+    action: ActionDescription;
+  }> {
+    const resourceUrl = `https://${VENDOR_HOST}/things/${encodeURIComponent(title)}`;
+    return {
+      class: this.ctx.exports.TestGatekeeper({
+        props: { label: `creation-${crypto.randomUUID()}`, resourceUrl, simulated: true },
+      }),
+      resource: SUPPORTED_RESOURCES[0],
+      action: {
+        title: `Create the test thing "${title}"`,
+        description: `Create a test thing titled **${title}**.`,
+        descriptionIsComplete: true,
+        implementsRevert: false,
+      },
+    };
   }
 }
 
@@ -690,9 +740,9 @@ export class TestGatekeeper
     return new ConnectionProbeTarget(this.ctx.props.label);
   }
 
-  /** No discovery index: the ambient fixture is reached through its session alone. */
+  /** The discovery index a test set for this account: none unless it set one. */
   async getAgentCatalog(): Promise<AgentCatalog | null> {
-    return null;
+    return control(this.ctx.exports).getAgentCatalog(this.ctx.props.label);
   }
 
   /**
@@ -722,6 +772,7 @@ export class TestGatekeeper
   }
 
   async applyAction(action: number): Promise<void> {
+    if (this.ctx.props.simulated) throw new Error("This test thing has not been created yet.");
     const state = control(this.ctx.exports);
     const { label } = this.ctx.props;
     const held = await state.takeNextApplyHold(label);
@@ -734,6 +785,17 @@ export class TestGatekeeper
 
   async rejectAction(action: number): Promise<void> {
     await control(this.ctx.exports).discardAction(this.ctx.props.label, action);
+  }
+
+  async applyCreation(creator: Fetcher<TestVerifierApi>, configuration: string | null): Promise<{
+    class: DurableObjectClass<Gatekeeper<TestSession>>;
+    resourceUrl: string;
+  }> {
+    const label = await creator.identify();
+    const { resourceUrl } = this.ctx.props;
+    await control(this.ctx.exports).adoptActions(this.ctx.props.label, label);
+    await control(this.ctx.exports).recordCreation(label, configuration);
+    return { class: this.ctx.exports.TestGatekeeper({ props: { label, resourceUrl } }), resourceUrl };
   }
 
   async revertAction(_action: number): Promise<void> {
@@ -845,6 +907,20 @@ export default {
       return Response.json({ count: await control(ctx.exports).getAmbientVerificationCount(label) });
     }
 
+    // Set the account's discovery catalog: one entry per skill title.
+    // Body: {"label": "...", "skills": ["...", ...]}
+    if (url.pathname === "/control/agent-catalog" && req.method === "POST") {
+      const { label, skills } = body as Record<string, unknown>;
+      if (!isNonEmptyString(label)) return badRequest("`label` must be a non-empty string");
+      if (!Array.isArray(skills) || !skills.every(isNonEmptyString)) {
+        return badRequest("`skills` must be an array of non-empty strings");
+      }
+      await control(ctx.exports).setAgentCatalog(label, {
+        entries: skills.map(title => ({ id: title, title, description: `The ${title} skill.` })),
+      });
+      return new Response(null, { status: 204 });
+    }
+
     if (url.pathname === "/control/revocation-count" && req.method === "POST") {
       const { label } = body as Record<string, unknown>;
       if (!isNonEmptyString(label)) return badRequest("`label` must be a non-empty string");
@@ -877,6 +953,13 @@ export default {
         value: state.value,
         applyCount: state.applyCount,
       });
+    }
+
+    // Body: {"label": "..."} -> {"configurations": (string | null)[]}, one per applyCreation().
+    if (url.pathname === "/control/creations" && req.method === "POST") {
+      const { label } = body as Record<string, unknown>;
+      if (!isNonEmptyString(label)) return badRequest("`label` must be a non-empty string");
+      return Response.json({ configurations: await control(ctx.exports).getCreations(label) });
     }
 
     // Body: {"label": "..."} -> {"attempts": number}

@@ -25,13 +25,22 @@ import { homePromptFromSearch } from "../homePrompt";
 import { useServerConfig } from "../ServerConfigContext";
 import { composerDraftStorageKey } from "../features/chat/composer/draft/composerDraft";
 
-type HomeSearch = { prompt?: string; agent?: string };
+type HomeSearch = {
+  prompt?: string;
+  agent?: string;
+  cfos_native_state?: string;
+  cfos_native_key?: string;
+};
 
 export const Route = createFileRoute("/")({
   component: HomePage,
   validateSearch: (search: Record<string, unknown>): HomeSearch => ({
     prompt: homePromptFromSearch(search.prompt),
     agent: typeof search.agent === "string" ? search.agent : undefined,
+    cfos_native_state: typeof search.cfos_native_state === "string"
+      ? search.cfos_native_state : undefined,
+    cfos_native_key: typeof search.cfos_native_key === "string"
+      ? search.cfos_native_key : undefined,
   }),
 });
 

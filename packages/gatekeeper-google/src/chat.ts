@@ -50,10 +50,8 @@ import type {
   ChatWindow,
 } from "./chat-types";
 import type { ChatMessageRaw } from "./chat-api";
-import {
-  chatHooksConfigured, type ChatHookDelivery, type ChatHookParams, type ChatHooksEnv,
-  type ChatMessageHookTarget,
-} from "./chat-hooks";
+import type { ChatHookDelivery, ChatHookParams, ChatMessageHookTarget } from "./chat-hooks";
+import { pushHooksConfigured, type PushHooksEnv } from "./pubsub-push";
 import { getGoogleAccountProfile } from "./google-api";
 import { AccessTokenCache } from "./auth-retry";
 import { CursorPager, CursorPagerOptions } from "./cursor";
@@ -65,7 +63,7 @@ import { obsContext } from "./observability";
 
 const logger = obsContext.createLogger({ component: "gatekeeper.google.chat", vendorId: "google" });
 
-type Env = Cloudflare.Env & ChatHooksEnv;
+type Env = Cloudflare.Env & PushHooksEnv;
 
 export type GoogleChatGatekeeperImplProps = {
   userObjectId: string;
@@ -1538,7 +1536,7 @@ export class GoogleChatGatekeeperImpl
     queue: SharedApprovalQueue, self: ChatUser, spaceName: string, threadName: string | undefined,
     hook: RpcStub<ChatMessageHookTarget>,
   ): Promise<void> {
-    if (!chatHooksConfigured(this.env)) {
+    if (!pushHooksConfigured(this.env)) {
       throw new Error("Google Chat hooks are not configured on this deployment.");
     }
     const params: ChatHookParams = { spaceName, ...(threadName !== undefined ? { threadName } : {}) };

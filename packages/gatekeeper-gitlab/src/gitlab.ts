@@ -103,10 +103,12 @@ type ConnectAttempt = {
   /** The connection generation the attempt began under; a disconnect or reconnect since wins. */
   startedUnder: string;
   /**
-   * Whether the grant is staged rather than made live. Fixed when the attempt starts, so
-   * committing one reconnect while another is in flight does not change how that other lands.
+   * Set when the link was minted to connect a new account, whose grant goes live. Absent -- a
+   * reconnect's link, or one minted before this was recorded -- stages the grant: the safe way for a
+   * bearer link to land on an account that may already be connected. Fixed when the link is minted,
+   * so committing one reconnect while another is in flight does not change how that other lands.
    */
-  reconnect: boolean;
+  firstConnect?: true;
 };
 
 const NOT_CONFIGURED_HTML = errorPageHtml(
@@ -327,7 +329,8 @@ export class UserAccount extends DurableObject<Env> implements AccountCredential
     this.ctx.storage.kv.put<string[]>("requestedScopes", requestedScopes);
     // Auth-only sign-in grants are transient: dropped shortly after the email is read.
     this.ctx.storage.kv.put<boolean>("ephemeral", ephemeral);
-    putInitiation(this.ctx.storage.kv, initiationNonce, Date.now());
+    putInitiation<Pick<ConnectAttempt, "firstConnect">>(this.ctx.storage.kv, initiationNonce, Date.now(),
+      { firstConnect: true });
   }
 
   async prepareReconnect(initiationNonce: string): Promise<void> {
@@ -349,8 +352,6 @@ export class UserAccount extends DurableObject<Env> implements AccountCredential
       codeVerifier: pkce.codeVerifier,
       redirectUri,
       startedUnder: this.#creds.connectionGeneration(),
-      // Only a reconnect finds a grant here: an initial connect's account is new.
-      reconnect: this.#creds.stored() !== undefined,
     });
     if (oauthNonce === null) return null;
     const scopes = this.ctx.storage.kv.get<string[]>("requestedScopes") ?? OAUTH_SCOPES;
@@ -397,7 +398,7 @@ export class UserAccount extends DurableObject<Env> implements AccountCredential
     if (kv.get("callback") === undefined) throw await disconnected();
 
     let handoff: ConnectHandoff;
-    if (attempt.reconnect) {
+    if (!attempt.firstConnect) {
       // The reconnect URL is a bearer capability, so the new grant is only staged until the
       // Workshop has confirmed the browser that finished the flow is the owner's (see
       // commitReconnect). Bound gadgets keep reading the current token meanwhile.
@@ -716,7 +717,7 @@ export interface GitLabVerifierApi extends GatekeeperUserVerifier {
  * The lowest role that sees everything a binding can disclose: the repository, confidential
  * issues, and internal notes.
  */
-export const REPORTER_ACCESS_LEVEL = 20;
+const REPORTER_ACCESS_LEVEL = 20;
 
 /**
  * Decide from a user's effective membership (or its absence) whether they see everything a
@@ -725,7 +726,7 @@ export const REPORTER_ACCESS_LEVEL = 20;
  * project, and a row it has not yet swept may still be listed with the date passed. The date is
  * a day (`2026-09-18`), read as its UTC midnight; a date that does not parse expires too.
  */
-export function membershipGrantsFullRead(
+function membershipGrantsFullRead(
   member: { access_level: number; membership_state?: string; expires_at?: string | null } | null,
   now: Date = new Date(),
 ): boolean {

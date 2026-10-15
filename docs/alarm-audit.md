@@ -19,7 +19,7 @@ How Cloudflare handles a failed alarm:
 
 Audited at `origin/main` 2026-10-08 with
 `git grep -n "setAlarm\|getAlarm\|deleteAlarm\|async alarm(\|alarm()" -- packages`. The search
-found 21 `alarm()` handlers in 19 files (19 / 17 at first audit; the 2026-10 upstream syncs added `gatekeeper-gitlab` and google `ChatHookDriver`). Generated `worker-configuration.d.ts` typings, tests and
+found 21 `alarm()` handlers in 19 files (19 / 17 at first audit; the 2026-10 upstream syncs added `gatekeeper-gitlab` and google `ChatHookDriver`). The 2026-10c sync added three more (24 in all): `gatekeeper-x`'s connect timeout, github `GitHubHookDriver` and google `GmailHookDriver`, listed below without line numbers. Generated `worker-configuration.d.ts` typings, tests and
 comments were excluded. Line numbers are from that commit.
 
 Verdicts:
@@ -36,7 +36,7 @@ Verdicts:
 | BUG | 2 | S1 scheduler poison row, O1 overseer undeliverable external response |
 | NEEDS-BACKOFF | 2 | S2 scheduler admission re-lease, O2 overseer pending-call drain (low; documented, not changed) |
 | NEEDS-CIRCUIT-BREAKER | 1 | S3 scheduler handler failing permanently |
-| SAFE | 19 handlers | the 13 vendor connect timeouts (incl. gitlab), google ChatHookDriver, xcity ×2 (connect timeout, media poll), mcp-shared, PendingLogin, UserDurableObject handoff sweep |
+| SAFE | 22 handlers | the 14 vendor connect timeouts (incl. gitlab, x), google ChatHookDriver and GmailHookDriver, github GitHubHookDriver, xcity ×2 (connect timeout, media poll), mcp-shared, PendingLogin, UserDurableObject handoff sweep |
 
 ## Table
 
@@ -63,6 +63,8 @@ re-arms.
 | `gatekeeper-google/src/google.ts:696` | `:437` (+1 h), `:557` auth mode (+2 min); deleted `:559`, `:710` | under the credentials lock, `deleteAll()` if `shouldDeleteCredentialsOnAlarm` | retry ≤6 | no | no | 1 per attempt | SAFE |
 | `gatekeeper-gitlab/src/gitlab.ts:506` | connect timeout (+1 h), ephemeral grant (+2 min); deleted in `revoke()` | `revoke()` if ephemeral, else `deleteAll()` if no grant | retry ≤6 | no (never re-arms) | no | 1 per connect attempt | SAFE (added by the 2026-10 upstream sync) |
 | `gatekeeper-google/src/chat-hooks.ts:169` (`ChatHookDriver`) | `#wakeBy` / `#reschedule` to the earliest of: queued-message retry, 24 h dedupe expiry, subscription renewal, lapsed-subscription expiry | delivers due messages, prunes finished ones, renews subscriptions, re-arms via `#reschedule` | caught per message / per renewal; failures back off | yes, but every term advances: message retry `min(1 min · 2^n, 1 h)` and dropped after 8 attempts, renewal retry +15 min, expired rows deleted | no: a failed attempt writes a later time before `#reschedule` reads it | at most one pass per due time; a permanently failing renewal is 4/h of Google API calls | SAFE by construction (kill switch added; added by the 2026-10b upstream sync) |
+| `gatekeeper-google/src/gmail-hooks.ts` (`GmailHookDriver`) | `#wakeBy` (push, enable) / `#reschedule` to the earliest of: queued-message retry, `syncAt`, watch `renewAt`, lapsed-watch expiry | reads new Gmail history, renews the watch, delivers due messages through the kit's `HookDeliveryQueue`, re-arms via `#reschedule` | sync and renewal failures are caught and back off (`syncAt` +5 min, `renewAt` +1 h); a throw elsewhere skips `#reschedule`, so the platform retries ≤6 and stops | yes, but every term advances: queue retry `min(1 min · 2^n, 1 h)`, dropped after 8 attempts; `syncAt = now` only while a sync made progress (history page cap, or a hook enabled mid-sync) | no: a failed attempt writes a later time before `#reschedule` reads it | normally hourly; a page-capped backlog continues immediately, bounded by Gmail's own quota | SAFE by construction (kill switch added; added by the 2026-10c upstream sync) |
+| `gatekeeper-github/src/github-hooks.ts` (`GitHubHookDriver`) | `#wakeBy` (webhook receipt) / `#reschedule` to the earliest of: queued-event retry, hourly webhook check (`checkAt`) | checks webhooks (writing `checkAt` +1 h first), delivers due events through `HookDeliveryQueue`, re-arms via `#reschedule` | a throw skips `#reschedule`: platform retries ≤6 and stops | yes, but every term advances: queue retry with backoff, `checkAt` moved forward before the check runs | no | ≤1/h for checks plus one pass per due delivery | SAFE by construction (kill switch added; added by the 2026-10c upstream sync) |
 | `gatekeeper-homeassistant/src/homeassistant.ts:537` | `:410` (+1 h); deleted `:499`, `:544` | `deleteAll()` if no credentials | retry ≤6 | no | no | 1 per attempt | SAFE |
 | `gatekeeper-linear/src/linear.ts:671` | `:529` (+1 h); deleted `:612`, `:689` | `deleteAll()` if no grant | retry ≤6 | no | no | 1 per attempt | SAFE |
 | `gatekeeper-notion/src/notion.ts:482` | `:328` (+1 h); deleted `:489` | `deleteAll()` if no token | retry ≤6 | no | no | 1 per attempt | SAFE |
@@ -70,6 +72,7 @@ re-arms.
 | `gatekeeper-spotify/src/spotify.ts:652` | `:511` (+1 h); deleted `:596`, `:661` | `deleteAll()` if no refresh token | retry ≤6 | no | no | 1 per attempt | SAFE |
 | `gatekeeper-supabase/src/supabase.ts:565` | `:403` (+1 h); deleted `:490`, `:582` | `deleteAll()` if no refresh token | retry ≤6 | no | no | 1 per attempt | SAFE |
 | `gatekeeper-zoominfo/src/zoominfo.ts:552` | `:383` (+1 h); deleted `:489`, `:561` | `deleteAll()` if no refresh token | retry ≤6 | no | no | 1 per attempt | SAFE |
+| `gatekeeper-x/src/x.ts` (`UserAccount`) | `setCallback` (+1 h) while no credentials are stored; deleted on complete/revoke | `deleteAll()` if no credentials | retry ≤6 | no (never re-arms) | no | 1 per connect attempt | SAFE (added by the 2026-10c upstream sync; kill switch added) |
 | `gatekeeper-xcity/src/xcity.ts:524` (`UserAccount`) | `:318` (+1 h), `:420` ephemeral (+2 min); deleted `:533` | `deleteAll()` if no refresh token or ephemeral | retry ≤6 | no | no | 1 per attempt | SAFE |
 | `mcp-shared/src/account.ts:1095` | `:280` (+1 h, first connect only); deleted `:878`, `:1109` | `deleteAll()` unless `connected` | retry ≤6 | no | no | 1 per attempt | SAFE |
 
@@ -209,10 +212,10 @@ Only the non-SAFE sites were changed. Every handler gained the kill switch.
 
 | Site | Change |
 |---|---|
-| All 21 `alarm()` handlers | The first statement is the `ALARMS_DISABLED` check: `haltIfAlarmsDisabled`, or `guardedAlarm`'s `disabled` option. |
+| All 24 `alarm()` handlers | The first statement is the `ALARMS_DISABLED` check: `haltIfAlarmsDisabled`, or `guardedAlarm`'s `disabled` option. |
 | Scheduler `alarm()` | Runs under `guardedAlarm` (`scheduler`, 3600/h, defer when open). Unexpected per-row failures quarantine the row as `dead` (`quarantineRun`). |
 | Overseer `alarm()` | Runs under `guardedAlarm` (`overseer`, 1200/h, defer when open). Ready external responses are abandoned after 8 failed deliveries. |
-| The 14 connect-timeout handlers, google `ChatHookDriver`, xcity media poll, mcp-shared, `PendingLogin`, `UserDurableObject` | Kill switch only. Their behaviour is otherwise unchanged. |
+| The 15 connect-timeout handlers, google `ChatHookDriver` and `GmailHookDriver`, github `GitHubHookDriver`, xcity media poll, mcp-shared, `PendingLogin`, `UserDurableObject` | Kill switch only. Their behaviour is otherwise unchanged. |
 
 The helper is `@gadgets/observability/alarm-guard`, re-exported as
 `@gadgets/gatekeeper-kit/alarm-guard`. It lives in `observability` because the workshop backend,

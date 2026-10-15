@@ -22,6 +22,7 @@ import { createTypedStorage, collection, singleton, keyString } from "@gadgets/t
 import {
   actionChangeTime,
   type ActionState, type AgentSpawnerConfig, type AiChatAuthorInfo, type AiChatMessage,
+  type AlwaysAvailableResource,
   type AiChatMetadata, type BlueprintBindingAnnotation, type BlueprintMetadata,
   type BlueprintOutput, type ChatGadgetPinRecord, type CollaboratorRole, type GadgetUpstream,
   type GatekeeperCreationSpec, type PermissionEdge, type WorkpieceId,
@@ -419,7 +420,11 @@ export type ActionRecord = {
   bindingName?: string;
 } & ({
   type: "action";
-  action: number;  // action key assigned by the gatekeeper, passed back on apply/reject/revert
+  /**
+   * Action key assigned by the gatekeeper, passed back on apply/reject/revert; or "create" for the
+   * creation queued by createExternalResource, which applies via Gatekeeper.applyCreation().
+   */
+  action: number | "create";
   description: ActionDescription;
   resolvedBy?: AiChatAuthorInfo;  // set when resolved (approved/rejected); absent while pending (or legacy)
   autoApproved?: boolean;         // set when applied by an auto-approval rule rather than a human
@@ -581,6 +586,41 @@ export type AiChatAgentContext = {
    */
   alwaysAvailableCapsuleIds?: WorkpieceId[];
 
+  /**
+   * The part of the agent's system prompt that lists the workspace's gadgets, each with its files
+   * and bindings, saved when the chat's first turn built it.
+   *
+   * Later turns reuse the saved text instead of listing the gadgets again. Otherwise the system
+   * prompt would change whenever the agent created a gadget or added a file, and so would the
+   * start of every later request: the model provider could no longer reuse its cached copy of the
+   * conversation, and would charge to process all of it again. The agent doesn't need the list
+   * updated for changes made in this chat: it knows what it changed from its own tool calls, and
+   * the user's code edits reach it as observeUserChanges results. Changes made elsewhere (a gadget
+   * created, renamed or deleted outside this chat, or a binding merged from another chat) show only
+   * after the next compaction or in a new chat; tool calls still see the current state. Output
+   * formats and vendors to connect are still listed afresh each turn: nothing the chat does
+   * changes them, so they cost a cache miss only when someone outside the chat changes them.
+   *
+   * Compaction replaces the older history anyway, so each compaction lists the gadgets afresh and
+   * saves that list in its CompactionCheckpoint, for the turns after it. The list saved here is
+   * for the turns before the first compaction, so each part of the chat's history keeps the list
+   * it was sent with.
+   */
+  workspacePrompt?: string;
+
+  /**
+   * The always-available resources (see `alwaysAvailableCapsuleIds`) as the system prompt lists
+   * them, with their catalogs, saved by the first turn that finds this unset. Turns use the active
+   * CompactionCheckpoint's list instead when it has one.
+   *
+   * Like `workspacePrompt`, this keeps the system prompt the same when a catalog changes, e.g. when
+   * someone adds a skill to the Context Library. A catalog never changes from inside the chat, so
+   * the agent is told instead: before each model request it compares the current catalogs with the
+   * ones it last saw, and records a "catalogChange" message for those that differ. A catalog that
+   * failed to load is not a change. A resource the chat can no longer reach drops out of the list.
+   */
+  alwaysAvailableResources?: AlwaysAvailableResource[];
+
   /** Xcity marketplace persona selected when this chat was created (see xcity/agent-persona.ts). */
   xcityAgent?: XcityChatAgentSnapshot;
 };
@@ -595,9 +635,10 @@ export type ChatBindingEntry =
   | { type: "value"; messageSequence: number };
 
 /**
- * Stores replay state for one compacted chat prefix. Checkpoints are immutable, and a chat keeps
- * every one it has published, so reading history or reverting can select the newest checkpoint below
- * any sequence.
+ * Stores replay state for one compacted chat prefix. A chat keeps every checkpoint it has
+ * published, so reading history or reverting can select the newest checkpoint below any sequence.
+ * The summary never changes; a revert reaching below the boundary refolds the code state (`pins`,
+ * `epoch`, `proposedChange`) from the log.
  */
 export type CompactionCheckpoint = {
   /** Chat this checkpoint belongs to. */
@@ -608,6 +649,22 @@ export type CompactionCheckpoint = {
 
   /** The summary the model wrote. We send it as one user message before the retained messages. */
   summary: string;
+
+  /**
+   * The list of the workspace's gadgets that the system prompt shows after this checkpoint, built
+   * when the chat compacted (see AiChatAgentContext.workspacePrompt). Absent on checkpoints of
+   * spawned agents, whose prompt has no such list, and on checkpoints written before this field
+   * existed; turns after those list the gadgets afresh.
+   */
+  workspacePrompt?: string;
+
+  /**
+   * The always-available resources the system prompt lists after this checkpoint (see
+   * AiChatAgentContext.alwaysAvailableResources): the list before it, updated by the
+   * "catalogChange" messages it summarizes. Absent on checkpoints written before this field
+   * existed; turns after those use the chat's own list.
+   */
+  alwaysAvailableResources?: AlwaysAvailableResource[];
 
   /**
    * The chat's named bindings. Retained messages and the summary refer to these names as
@@ -1301,9 +1358,9 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       }),
 
       // Compaction checkpoints, keyed by `chatId.compactedTo` so a chat's checkpoints sort by
-      // boundary. A chat keeps every checkpoint it has published, not just the newest: reverting
-      // across a boundary needs the one before it (see rollbackChatCompaction), and only that path
-      // and deleting the chat remove any.
+      // boundary. A chat keeps every checkpoint it has published, not just the newest: history
+      // pages back through them, and a revert across a boundary refolds from the one before it
+      // (see refoldChatCompactions). Only deleting the chat removes any.
       chatCompactions: collection<CompactionCheckpoint>()({
         primaryKey: (checkpoint) => chatKey(checkpoint.chatId, checkpoint.compactedTo),
       }),

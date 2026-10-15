@@ -291,6 +291,12 @@
             "GitHubGatekeeperImpl"
           ],
           "tag": "v0"
+        },
+        {
+          "new_sqlite_classes": [
+            "GitHubHookDriver"
+          ],
+          "tag": "v1"
         }
       ],
       "modules": [
@@ -413,7 +419,7 @@
           "redirectUriTemplate": "{PUBLIC_BASE_URL}/gatekeeper/google/oauth",
           "setupSteps": [
             "In the Google Cloud Console, create a project (or pick an existing one).",
-            "Enable the APIs gadgets should reach: Gmail, Google Docs, Google Drive, Google Sheets, Google Calendar, Google Chat, People (for Chat names and directory search), and BigQuery (APIs & Services > Library).",
+            "Enable the APIs gadgets should reach: Gmail, Google Docs, Google Drive, Google Sheets, Google Slides, Google Calendar, Google Chat, People (for Chat names and directory search), and BigQuery (APIs & Services > Library).",
             "For Chat, open the Google Chat API's Configuration tab, set an app name, avatar URL and description, turn off interactive features, and save. Without it Chat reads work but every send, edit and reaction fails.",
             "Configure the OAuth consent screen (External) and add yourself as a test user while the app is unverified.",
             "Create an OAuth client ID of type \"Web application\" and add the redirect URI below.",
@@ -473,6 +479,18 @@
             "ChatHookDriver"
           ],
           "tag": "v6"
+        },
+        {
+          "new_sqlite_classes": [
+            "GmailHookDriver"
+          ],
+          "tag": "v7"
+        },
+        {
+          "new_sqlite_classes": [
+            "GoogleSlidesGatekeeperImpl"
+          ],
+          "tag": "v8"
         }
       ],
       "modules": [
@@ -998,6 +1016,126 @@
       "shortName": "supabase",
       "vars": {
         "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/supabase"
+      }
+    },
+    "gatekeeper-websearch": {
+      "bindings": [
+        {
+          "name": "AI",
+          "type": "ai"
+        }
+      ],
+      "compatibilityDate": "2026-09-04",
+      "compatibilityFlags": [
+        "allow_irrevocable_stub_storage"
+      ],
+      "inputs": [],
+      "installable": true,
+      "kind": "gatekeeper",
+      "mainModule": "websearch.js",
+      "migrations": [
+        {
+          "new_sqlite_classes": [
+            "WebSearchGatekeeper"
+          ],
+          "tag": "v1"
+        }
+      ],
+      "modules": [
+        {
+          "name": "websearch.js",
+          "r2Key": "blobs/modules/ad0447137dd2a06fd9da6d2a6774f64fbc1f69a778aadd2f4d15dc2ac9a68705",
+          "sha256": "ad0447137dd2a06fd9da6d2a6774f64fbc1f69a778aadd2f4d15dc2ac9a68705",
+          "size": 62,
+          "type": "esm"
+        }
+      ],
+      "observability": {
+        "enabled": true,
+        "head_sampling_rate": 1,
+        "logs": {
+          "invocation_logs": false
+        }
+      },
+      "preinstall": true,
+      "shortName": "websearch",
+      "singleton": true,
+      "vars": {
+        "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/websearch"
+      }
+    },
+    "gatekeeper-x": {
+      "bindings": [
+        {
+          "name": "CLIENT_ID",
+          "text": "$SECRET(CLIENT_ID)",
+          "type": "secret_text"
+        },
+        {
+          "name": "CLIENT_SECRET",
+          "text": "$SECRET(CLIENT_SECRET)",
+          "type": "secret_text"
+        }
+      ],
+      "compatibilityDate": "2026-09-04",
+      "compatibilityFlags": [
+        "allow_irrevocable_stub_storage",
+        "nodejs_als"
+      ],
+      "inputs": [
+        {
+          "consoleUrl": "https://console.x.com",
+          "help": "X bills every API request to this app's prepaid credits, so the app's owner pays for every user's reads and posts. Posts containing a link cost more than other posts.",
+          "kind": "secret",
+          "label": "OAuth 2.0 Client ID",
+          "name": "CLIENT_ID",
+          "redirectUriTemplate": "{PUBLIC_BASE_URL}/gatekeeper/x/oauth",
+          "setupSteps": [
+            "In the X Developer Console, create a Project and an App.",
+            "Under User authentication settings, enable OAuth 2.0 with the type \"Web App, Automated App or Bot\" and the permission \"Read and write\".",
+            "Set the Callback URI to the value below, and give the app a website URL.",
+            "Buy credits and set a spending limit: X bills every request this app makes.",
+            "X requires its prior approval before an app posts AI-generated replies; replies drafted by agents are sent only once a user approves each one, but the obligation is the app owner's.",
+            "Copy the OAuth 2.0 Client ID and Client Secret here."
+          ]
+        },
+        {
+          "kind": "secret",
+          "label": "OAuth 2.0 Client Secret",
+          "name": "CLIENT_SECRET"
+        }
+      ],
+      "installable": true,
+      "kind": "gatekeeper",
+      "mainModule": "x.js",
+      "migrations": [
+        {
+          "new_sqlite_classes": [
+            "UserAccount",
+            "XGatekeeperImpl"
+          ],
+          "tag": "v0"
+        }
+      ],
+      "modules": [
+        {
+          "name": "x.js",
+          "r2Key": "blobs/modules/333bf2bc83e34163225a668eaf2545dcc98705a10aaf0b41cbc74554214a132c",
+          "sha256": "333bf2bc83e34163225a668eaf2545dcc98705a10aaf0b41cbc74554214a132c",
+          "size": 54,
+          "type": "esm"
+        }
+      ],
+      "observability": {
+        "enabled": true,
+        "head_sampling_rate": 1,
+        "logs": {
+          "invocation_logs": false
+        }
+      },
+      "shortName": "x",
+      "vars": {
+        "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/x"
       }
     },
     "gatekeeper-xcity": {

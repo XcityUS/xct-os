@@ -450,6 +450,58 @@ describe("reverting a re-root", () => {
   });
 });
 
+describe("reverting across a compaction checkpoint", () => {
+  // A revert changes what the chat proposes, not what was said: the checkpoint keeps its
+  // summary, and its code is refolded so that the agent's replay agrees with every other fold.
+  it("keeps the checkpoint's summary and refolds its code", () => withImpl(async impl => {
+    await staleChat(impl);
+    let { sequence } = await reroot(impl, MERGED);
+    let edited = { ...MERGED, "b.txt": "bee\nmain\nmore\n" };
+    await edit(impl, MERGED, edited);
+    let compactedTo = chatMessages(impl).at(-1)!.sequence + 1;
+    compact(impl, compactedTo);
+
+    await impl.revertChanges(CHAT, sequence, USER);
+    expect(impl.storage.chatMeta.get(CHAT).compactedTo).toBe(compactedTo);
+    expect(impl.getActiveChatCompaction(CHAT))
+        .toMatchObject({ compactedTo, summary: "Earlier work." });
+    await expectEveryFold(impl, CHAT_EDIT);
+  }));
+
+  // A revert seeds the refold from the newest checkpoint it leaves alone, and each checkpoint
+  // above it from the one before, as just refolded.
+  it("refolds every checkpoint above the revert", () => withImpl(async impl => {
+    await staleChat(impl);
+    let second = { ...CHAT_EDIT, "b.txt": "bee\ntwo\n" };
+    let third = { ...second, "b.txt": "bee\ntwo\nthree\n" };
+    let secondSequence = await edit(impl, CHAT_EDIT, second);
+    compact(impl, secondSequence + 1);
+    let thirdSequence = await edit(impl, second, third);
+    compact(impl, thirdSequence + 1);
+
+    await impl.revertChanges(CHAT, thirdSequence, USER);
+    await expectEveryFold(impl, second);
+    await impl.revertChanges(CHAT, secondSequence, USER);
+    await expectEveryFold(impl, CHAT_EDIT);
+  }));
+});
+
+describe("what the agent is told of a revert", () => {
+  it("names the first change a revert discarded, not one an earlier revert did",
+      () => withImpl(async impl => {
+    await staleChat(impl);
+    await impl.revertChanges(CHAT, 0, USER);
+    await edit(impl, MAINLINE_EDIT, { ...MAINLINE_EDIT, "a.txt": "two\n" });
+    await impl.revertChanges(CHAT, 0, USER);
+
+    let reverts = (await observations(impl)).filter(text => text.startsWith("The user reverted"));
+    expect(reverts).toEqual([
+      expect.stringContaining("starting from change 0 onward"),
+      expect.stringContaining("starting from change 1 onward"),
+    ]);
+  }));
+});
+
 // What the agent is shown of the user's changes at the start of its next turn: the results of
 // the observeUserChanges calls that replay inserts, in order.
 async function observations(impl: any): Promise<string[]> {

@@ -31,6 +31,7 @@ import {
   type ResourceDescription,
   type SupportedResource,
   type VendorDescription,
+  workerVersionTag,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { haltIfAlarmsDisabled } from "@gadgets/gatekeeper-kit/alarm-guard";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
@@ -257,6 +258,10 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
         "blog posts, and spaces you share. Build agents that draft documentation, organize " +
         "knowledge bases, or keep pages up to date.",
     };
+  }
+
+  async versionTag(): Promise<string | undefined> {
+    return workerVersionTag(this.env);
   }
 
   async connectAccount(

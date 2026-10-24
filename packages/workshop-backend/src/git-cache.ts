@@ -50,8 +50,9 @@ import {
   type WorkpieceId,
 } from "@gadgets/workshop-shared/api";
 import type { GitObjectMetadataRecord, GitObjectRecord } from "./storage-schema/overseer-storage";
+import type { BytesRef } from "@gadgets/workshop-shared/code-change";
 import {
-  buildPackBytes,
+  buildPackStream,
   decodeLooseObject,
   decodePackStream,
   encodeLooseObject,
@@ -87,9 +88,8 @@ const logger = createWorkshopLogger("workshop.git-cache");
 export const MAX_GIT_OBJECT_SIZE = 8_000_000;
 
 /**
- * Maximum byte size of a packfile accepted by `consumePack()` (matching the transfer-size
- * limiter gatekeepers are expected to apply to fetch bodies), and the hard per-object
- * inflation bound while decoding one.
+ * Maximum packfile size and per-object inflation bound when the DO cache decodes a pack.
+ * Native consumers bypass the cache and set their own limits.
  */
 export const MAX_GIT_PACK_BYTES = 64 << 20;
 
@@ -122,8 +122,8 @@ export interface GitCacheStorage {
  */
 export interface GitPullDelegate {
   /**
-   * Invoke `Gatekeeper.gitPull(oids, cache, hints)` on the given gatekeeper, passing it a cache
-   * stub scoped to itself. Must throw if the gatekeeper record no longer exists (provenance
+   * Invoke `Gatekeeper.gitPull(oids, hints)` and consume its pack with that source's provenance
+   * and the cache's size limits. Must throw if the gatekeeper record no longer exists (provenance
    * loss: the error should tell the user to reconnect) or if the pull fails.
    */
   pull(gatekeeperId: WorkpieceId, oids: GitOid[], hints: GitPullHints): Promise<void>;
@@ -517,6 +517,19 @@ export class WorkspaceGitCache {
    */
   async readFileAtCommitIfExists(commitOid: GitOid, path: string): Promise<string | undefined> {
     return (await this.readFileAtCommitWithOid(commitOid, path))?.text;
+  }
+
+  /** Resolve one regular file to its existing immutable Git blob reference. */
+  async fileBytesAtCommit(commitOid: GitOid, path: string): Promise<BytesRef | undefined> {
+    const {tree, entry} = await this.#resolveEntryAt(commitOid, path);
+    if (!entry) return undefined;
+    if (entry.mode === "40000") throw new Error(`${path} is a directory`);
+    if (entry.mode === "160000") throw new Error(submoduleMessage(path, entry.oid));
+    if (entry.mode === "120000") {
+      throw new Error(symlinkMessage(path, await this.#readBlob(entry.oid, tree, path)));
+    }
+    const payload = await this.#readBlob(entry.oid, tree, path);
+    return {oid: entry.oid, byteLength: payload.byteLength};
   }
 
   /**
@@ -1192,14 +1205,9 @@ export class WorkspaceGitCache {
       // rather than silently not delivering, so this terminates.
     }
 
-    let objects = this.#recordsMarkedFor(actionId).map(mark => this.readLocalObject(mark.oid)!);
-    let chunks = await buildPackBytes(objects);
-    return new ReadableStream<Uint8Array>({
-      start(controller) {
-        for (let chunk of chunks) controller.enqueue(chunk);
-        controller.close();
-      },
-    });
+    const marks = this.#recordsMarkedFor(actionId), cache = this;
+    async function* objects() { for (const mark of marks) yield await cache.ensureObject(mark.oid, {type: mark.type}); }
+    return buildPackStream(marks.length, objects());
   }
 
   // -------------------------------------------------------------------------------------
@@ -1411,9 +1419,8 @@ function tooLargeMessage(path: string): string {
   return `${path} is too large to read (over ${MAX_GIT_OBJECT_SIZE} bytes)`;
 }
 
-// Decodes a blob's payload as strict UTF-8 text, throwing the path-flavored
-// UnreadableContentError for binary content (NUL bytes or invalid UTF-8).
-function decodeBlobText(payload: Uint8Array, path: string): string {
+/** Decode a Git blob payload as strict text. */
+export function decodeBlobText(payload: Uint8Array, path: string): string {
   if (payload.includes(0)) throw new UnreadableContentError(`${path} is not a text file`);
   try {
     return TEXT_DECODER_STRICT.decode(payload);

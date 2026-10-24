@@ -57,6 +57,13 @@ export type GatekeeperRecord = {
   creationSpec?: GatekeeperCreationSpec;
 
   /**
+   * Present on agent spawners only: the bindings given to each agent the spawner starts, keyed
+   * by binding name. Seeded from the AgentSpawnerConfig.env the spawner was created with, then
+   * edited like a gadget's (see GadgetRecord.bindings), and read when an agent is spawned.
+   */
+  bindings?: Record<string, BindingRecord>;
+
+  /**
    * OBSOLETE: Before we had support for multiple gadgets per workspace, the binding name and
    * blueprint annotation information lived on the GatekeeperRecord. These properties continue
    * to be declared only to support migrating them away. The version 0 -> 1 migration copies
@@ -80,10 +87,21 @@ export type StoredBlueprintBindingAnnotation = BlueprintBindingAnnotation & {inc
  * in place, only replaced by minting a new stub (as the version 0 -> 1 migration does).
  */
 export type AgentSpawnerBindingProps = {
-  /** ID of the overseer under which this agent should run. */
-  overseerId: string,
+  /**
+   * OBSOLETE: ID of the overseer under which this agent should run. Present on stubs minted
+   * before version 6, but nothing reads it anymore: a spawn now finds its overseer through the
+   * gatekeeper session (see AgentSpawnerQueueImpl). Declared only so the name is not reused.
+   */
+  overseerId?: string,
 
-  config: AgentSpawnerConfig,
+  config: Omit<AgentSpawnerConfig, "env"> & {
+    /**
+     * OBSOLETE: The spawner's bindings as of its creation, baked into stubs minted before
+     * version 6. A spawner's bindings now live in `GatekeeperRecord.bindings`, which is what a
+     * spawn reads, so this copy is stale. Declared only so the name is not reused.
+     */
+    env?: AgentSpawnerConfig["env"],
+  },
 
   /**
    * DO ID of the user who created this binding. When agents are spawned, the model is
@@ -103,8 +121,9 @@ export type AgentSpawnerBindingProps = {
 export type LegacyAgentSpawnerConfig = Omit<AgentSpawnerConfig, "env"> & {env?: string[]};
 
 /**
- * A binding edge from one gadget to a target workpiece (today always a gatekeeper), stored in
- * GadgetRecord.bindings keyed by binding name.
+ * A binding edge from a gadget or agent spawner to a target workpiece, stored in
+ * GadgetRecord.bindings or GatekeeperRecord.bindings keyed by binding name. A gadget's targets
+ * are gatekeepers; a spawner's may also be gadgets.
  */
 export type BindingRecord = {
   target: WorkpieceId;
@@ -123,8 +142,9 @@ export type BindingRecord = {
    * edge-for-edge via the "changes" message's `addedBindings`). A pending edge is real in the
    * registry so the originating chat's own preview/test runs see it, but for *reads* everything
    * else (mainline loads, other chats, blueprints, "use"-role sharing) treats it as nonexistent.
-   * For *writes* it still occupies its name: another chat attempting to add the same name on
-   * this gadget fails with an explicit error until this chat's changes are accepted or reverted.
+   * A spawner's pending edge reaches no agent at all, since spawned agents run in chats of
+   * their own. For *writes* it still occupies its name: another chat attempting to add the same
+   * name fails with an explicit error until this chat's changes are accepted or reverted.
    */
   pending?: {chatId: number, sequence?: number};
 };
@@ -562,9 +582,10 @@ export type AiChatAgentContext = {
    * and all gatekeepers which those gadgets bind to, but the contents may be different depending
    * on how the chat thread was started (e.g. agent spawners initialize env in a specific way).
    *
-   * This map is frozen after the chat starts. "changes" messages in the chat log may introduce
-   * new bindings, but they aren't added here; instead, the chat log must be replayed to find out
-   * the current binding set.
+   * This map is fixed after the chat starts, except that a chat not spawned takes in each ambient
+   * gatekeeper the workspace gains later (see `alwaysAvailableCapsuleIds`). "changes" messages in
+   * the chat log may introduce new bindings, but they aren't added here; instead, the chat log must
+   * be replayed to find out the current binding set.
    *
    * This is absent for chats created before named chat bindings existed; such chats are seeded
    * lazily at their next turn start.
@@ -575,7 +596,8 @@ export type AiChatAgentContext = {
   bindings?: Record<string, WorkpieceId>;
 
   /**
-   * Gatekeeper IDs for ambient capsules which were instantiated into this chat when it started.
+   * Gatekeeper IDs for ambient capsules instantiated into this chat: those the workspace had when
+   * the chat started, then, for a chat not spawned, each one it gained later, in that order.
    * This array predates the creation of per-chat named bindings; back then, ambient gatekeepers
    * were delivered as numbered "capsules", occupying the lowest numbers in the capsules array, and
    * this array specified their order. But with the advent of per-chat named bindings, these are now
@@ -585,6 +607,12 @@ export type AiChatAgentContext = {
    * that).
    */
   alwaysAvailableCapsuleIds?: WorkpieceId[];
+
+  /** Chat-private Git worktree for uploads, plans, and other agent working files. */
+  scratch?: {worktreeId: WorkpieceId, bindingName: string};
+
+  /** Legacy originals have been published as blobs and projected into this chat's scratch worktree. */
+  attachmentsMigrated?: true;
 
   /**
    * The part of the agent's system prompt that lists the workspace's gadgets, each with its files
@@ -614,10 +642,12 @@ export type AiChatAgentContext = {
    * CompactionCheckpoint's list instead when it has one.
    *
    * Like `workspacePrompt`, this keeps the system prompt the same when a catalog changes, e.g. when
-   * someone adds a skill to the Context Library. A catalog never changes from inside the chat, so
-   * the agent is told instead: before each model request it compares the current catalogs with the
-   * ones it last saw, and records a "catalogChange" message for those that differ. A catalog that
-   * failed to load is not a change. A resource the chat can no longer reach drops out of the list.
+   * someone adds a skill to the Context Library, or when the chat gains a resource, e.g. when the
+   * owner turns on Web Search. Neither happens from inside the chat, so the agent is told instead:
+   * before each model request it compares the current resources with the ones it last saw, and
+   * records a "catalogChange" message for those that are new or whose catalog differs. A catalog
+   * that failed to load is not a change. A resource the chat can no longer reach drops out of the
+   * list.
    */
   alwaysAvailableResources?: AlwaysAvailableResource[];
 
@@ -649,6 +679,13 @@ export type CompactionCheckpoint = {
 
   /** The summary the model wrote. We send it as one user message before the retained messages. */
   summary: string;
+
+  /**
+   * The `compaction` block Anthropic returned when it wrote `summary`, as JSON (see
+   * anthropic-compaction.ts). Turns on a model that can read it send it unchanged in place of the
+   * summary message; other models get the summary text.
+   */
+  anthropicCompactionBlock?: string;
 
   /**
    * The list of the workspace's gadgets that the system prompt shows after this checkpoint, built
@@ -720,9 +757,9 @@ export type CompactionCheckpoint = {
 
 /**
  * Server-only record describing an in-progress agent turn, enabling resumption after a server
- * restart. Keyed by chatId. A record is present (mirroring `chatMeta.activeAgent`) for exactly as
- * long as an agent turn is, or should be, running. On startup, the set of these records identifies
- * which agents were interrupted by a restart and need to be resumed.
+ * restart. Keyed by chatId. `chatMeta.activeAgent` identifies runnable records; a paused turn
+ * retains its record (and original authority) until its logged decisions are ready. No separate
+ * wait state is stored: the chat log already contains the requests and their outcomes.
  *
  * Note we deliberately do NOT store the resolved `AiModelConfig` here, because it contains a secret
  * API token. Instead we store enough to re-fetch it from the initiator's user DO on resume.
@@ -740,6 +777,8 @@ export type ActiveAgentRecord = {
   initiator: AiChatAuthorInfo;
   /** Whether this turn was initiated by a gadget callback (vs. a chat message). */
   callbackInitiated: boolean;
+  /** Model-lookup attempts since the last successful preparation, bounded across DO resets. */
+  resumeAttempts?: number;
 };
 
 /**
@@ -829,17 +868,26 @@ export type ExternalChatRecord = {
 type ChatAttachmentContentRecord = {
   fileId: string;
   data: Uint8Array;
-  state:
-    | {
-        type: "staged";
-        uploadedAt: number;
-        mimeType: string;
-        name?: string;
-      }
-    | {
-        type: "committed";
-        chatId: number;
-      };
+  state: {
+    type: "staged";
+    uploadedAt: number;
+    mimeType: string;
+    name?: string;
+  };
+} | {
+  fileId: string;
+  /** Retained for inline image previews and legacy attachments committed before Git ingress. */
+  data?: Uint8Array;
+  state: {
+    type: "committed";
+    chatId: number;
+    /** Original upload blob; new uploads keep no separate attachment byte copy. */
+    oid?: string;
+    /** Path in the chat's scratch worktree, independent of the uploaded file's format. */
+    workspacePath?: string;
+    /** Legacy immutable Git source commit for replay and download. */
+    workspaceCommitId?: string;
+  };
 };
 
 // =======================================================================================
@@ -1157,6 +1205,8 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       //       where the chat log still told: those an agent created from a blueprint name it,
       //       and those created from scratch name none. Every gadget created from here on has
       //       an `upstream` once it is permanent.
+      //   6 = agent spawners' bindings are GatekeeperRecord.bindings edges; their creationSpec
+      //       config no longer carries `env`.
       version: 0,
 
       // The workspace title. (Each chat, gatekeeper, and gadget has its own title, elsewhere.)
@@ -1477,9 +1527,8 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
         primaryKey: "id"
       }),
 
-      // Attachment bytes. Before an attachment is committed to a chat message, this also carries
-      // the temporary metadata needed to construct its ChatAttachmentRef. Once committed, the
-      // message owns that metadata and this record retains only the bytes and owning chat ID.
+      // Chat-scoped attachment source metadata. New uploads point to immutable Git blobs;
+      // legacy records can still hold staged or committed bytes.
       chatAttachmentContent: collection<ChatAttachmentContentRecord>()({
         primaryKey: "fileId",
         nonUniqueIndexes: {

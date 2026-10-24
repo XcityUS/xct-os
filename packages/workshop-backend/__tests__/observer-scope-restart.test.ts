@@ -744,10 +744,9 @@ describe("agent spawner envs widen use scope", () => {
       id,
       resourceTitle: `Spawner ${id}`,
       class: {} as any,
-      creationSpec: {
-        type: "agentSpawner",
-        config: { displayName: "S", modelId: null, env },
-      },
+      creationSpec: { type: "agentSpawner", config: { displayName: "S", modelId: null } },
+      bindings: Object.fromEntries(
+          Object.entries(env).map(([name, target]) => [name, { target }])),
     });
   }
 
@@ -797,6 +796,63 @@ describe("agent spawner envs widen use scope", () => {
 
     expect(restarts).toEqual([]);
     expect(() => impl.assertGatekeeperUsable(1)).not.toThrow();
+  }));
+
+  it("a chat's binding into a bound spawner widens scope when accepted, not when proposed",
+      () => withImpl(async (impl, restarts) => {
+    seedSpawner(impl, 2, {});
+    seedGadget(impl, 100);
+    impl.bindWorkpiece(100, "SPAWN", 2);  // nobody connected yet: no restart, no mark
+    joinSession(impl, "use");
+    seedGatekeeper(impl, 1);
+    impl.storage.chatMeta.put(
+        { id: 1, title: "Chat", started: new Date(0), lastActive: new Date(0) });
+
+    // Proposed: no agent the spawner starts gets the binding yet.
+    impl.addGadgetBinding(2, "DB", 1, 1);
+    await impl.commitAgentStep(1, AGENT, [{ type: "message", message: "gave it the db" }], {
+      changes: [],
+      createdGadgets: [],
+      addedBindings: [{ gadgetId: 2, name: "DB", target: 1 }],
+      createdWorktrees: [],
+      worktreeCommits: [],
+    });
+    expect(restarts).toEqual([]);
+    expect(impl.proposedChangeWorkpieceIds(1, impl.storage.chatMeta.get(1))).toEqual([2]);
+
+    expect(await impl.mergeChanges(1, USER_META, "owner-user-do"))
+        .toEqual({ outcome: "merged" });
+
+    expect(impl.storage.gatekeepers.get(2).bindings.DB).toEqual({ target: 1 });
+    expect(restarts).toHaveLength(1);
+    expect(() => impl.assertGatekeeperUsable(1)).toThrow(/restarting/);
+  }));
+
+  it("removing a gadget a spawner binds removes the spawner's bindings to it, and the " +
+      "proposal of a chat that had one pending", () => withImpl(async (impl) => {
+    seedGadget(impl, 100);
+    seedSpawner(impl, 2, { DESK: 100 });
+    impl.storage.chatMeta.put(
+        { id: 1, title: "Chat", started: new Date(0), lastActive: new Date(0) });
+    let spawner = impl.storage.gatekeepers.get(2);
+    spawner.bindings.AGAIN = { target: 100, pending: { chatId: 1 } };
+    impl.storage.gatekeepers.put(spawner);
+    let delivered: unknown[] = [];
+    impl.storage.chatMeta.subscribe({
+      add: () => {},
+      update: (_old: unknown, next: unknown) => {
+        delivered.push(impl.chatMetaForClient(next).proposedChangeWorkpieces);
+      },
+      remove: () => {},
+    });
+
+    await impl.removeWorkpiece(100);
+
+    // Left behind, an edge would hold its name for good and fail every blueprint export.
+    expect(impl.storage.gatekeepers.get(2).bindings).toEqual({});
+    // The chat proposed the spawner only through its edge: it must stop offering accept/discard.
+    expect(delivered.length).toBeGreaterThan(0);
+    expect(delivered.at(-1)).toBeUndefined();
   }));
 });
 
@@ -1092,5 +1148,45 @@ describe("ambient catalogs", () => {
     expect(catalogLoads).toEqual([1, 2, 1, 1]);
     expect(other.find(seed => seed.target === 1)?.catalog).toEqual({ entries: [] });
     expect(other.find(seed => seed.target === 2)?.catalog).toBeNull();
+  }));
+});
+
+describe("ambient resources a chat gains", () => {
+  it("join a regular chat under a name free in its scope, never a spawned chat's env",
+      () => withImpl(async (impl) => {
+    impl.getGatekeeperFacet = (id: number) => ({
+      describe: async () =>
+          ({ title: `T${id}`, url: "https://example.com", suggestedBindingName: "RES" }),
+      getAgentCatalog: async () => null,
+    });
+    let addAmbient = (id: number) => {
+      seedGatekeeper(impl, id);
+      let record = impl.storage.gatekeepers.get(id);
+      record.creationSpec = { type: "ambient", vendorId: `v${id}` };
+      impl.storage.gatekeepers.put(record);
+    };
+    addAmbient(1);
+    for (let chatId of [1, 2]) {
+      impl.storage.chatMeta.put(
+          { id: chatId, title: "Chat", started: new Date(0), lastActive: new Date(chatId) });
+    }
+    impl.storage.chatContext.put({
+      chatId: 2, spawnerConfig: { displayName: "Spawner", modelId: "m", env: {} }, bindings: {},
+    });
+    await impl.prepareChatBindings(1, []);
+    await impl.prepareChatBindings(2, []);
+
+    // The owner turns on another ambient gatekeeper after the user pasted a resource that the chat
+    // named RES_2.
+    addAmbient(3);
+    let pasted = {
+      type: "message", sequence: 3, capsules: [{ gatekeeperId: 9, bindingName: "RES_2" }],
+    };
+    let seeds: SeedBindingInfo[] = await impl.prepareChatBindings(1, [pasted]);
+    await impl.prepareChatBindings(2, []);
+
+    expect(impl.getChatAgentContext(1).bindings).toEqual({ RES: 1, RES_3: 3 });
+    expect(seeds.find(seed => seed.target === 3)).toMatchObject({ name: "RES_3", catalog: null });
+    expect(impl.getChatAgentContext(2).bindings).toEqual({});
   }));
 });

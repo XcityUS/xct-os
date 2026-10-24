@@ -412,29 +412,32 @@ gadget-minted children alike:
   only after authorization (verification itself is covered by `authorizeCollaborator`'s internal
   lease): a caller who is turned away must never have counted, or a stranger racing an
   `addGatekeeper()` would cause a needless workspace reset.
-- **Known gap — the agent turn an external message starts** outlives that RPC's lease (it is
-  fire-and-forget, and its persisted `ActiveAgentRecord` even survives DO resets, resuming with
-  no re-verification), so a widening mid-turn finds no session to sever and the reply egresses
-  to the persisted external response target under stale verification. Tolerated only because
-  nothing calls `receiveExternalMessage` yet; the required fix (a per-turn `build` lease from
-  `#registerRunningAgent` to `#unregisterRunningAgent`, persisted as a marker on
-  `ActiveAgentRecord`, plus `authorizeCollaborator` re-run on resume with the turn cancelled on
-  denial) is spelled out in the comment at the endpoint and must land before it gets real
-  callers. Owner and UI-collaborator turns are not affected: the owner is never an observer, a
-  UI collaborator's replies land in the chat log behind re-verified opens, and gadget-callback
-  turns have no external egress.
+- **Resumed person-initiated turns** re-run `authorizeCollaborator` with `requireRole: "build"`
+  for the original non-owner initiator before inference, and hold a `build` lease through the
+  resumed turn. This applies after a DO reset and after a decision pause. Denial ends the turn
+  with an error; a later approver cannot lend it their authority.
+- **Known gap — a freshly started external-message turn** outlives that RPC's lease because it
+  is fire-and-forget. Before its first reset or decision pause, a widening can therefore find
+  no session to sever, and its reply can egress to the persisted external response target under
+  stale verification. The resumed path above is covered, but the initial run still needs its
+  own per-turn `build` lease before `receiveExternalMessage` gets real callers. No extra durable
+  marker is needed for that resume check: the existing `ActiveAgentRecord` retains the original
+  initiator. Owner and UI-collaborator turns are not affected by this external-egress gap: the
+  owner is never an observer, and a UI collaborator reads replies through re-verified opens.
 
   The same mechanism has a spawner variant: a `use` collaborator holding a bound spawner's
   loopback can start a spawn during the window between a widening's restart being scheduled and
   the reset landing (`spawnAgent` checks no quarantine, and the spawner itself is vendorless so
   it is never the thing quarantined). The spawn persists an `ActiveAgentRecord` that the reset's
-  storage sync commits, and the resumed turn re-runs no authorization — so it completes with its
-  creator's authority against the pre-widening scope. Bounded, unlike the external-message case:
+  storage sync commits. Its initiator is a gadget, so the person-initiated resume check above does
+  not apply: it can complete with its creator's authority against the pre-widening scope.
+  Bounded, unlike the external-message case:
   the resumed turn has no external egress, its output lands in workspace state, and every
   `use`-role reader of that state re-verifies at their next open against the now-widened scope —
   so the only unverified consumption is inside the restart's own delivery window, which the
-  design already tolerates for sessions the reset is about to sever. The per-turn-lease fix
-  above (re-run `authorizeCollaborator` on resume, cancel on denial) closes this variant too.
+  design already tolerates for sessions the reset is about to sever. Closing this variant still
+  needs lifecycle authorization for gadget-authored turns; re-checking person-initiated resumes
+  alone does not cover it.
 
 Five events trigger it:
 
@@ -846,7 +849,7 @@ its resource types.
 | **confluence** | Space | **C** | Verify space access; track observed pages and blog posts because content restrictions may be narrower. |
 | **confluence** | Page / Blog Post | **C** | Verify bound-content access; track observed child pages because they may have stricter restrictions than their parent. |
 | **zoominfo** | Account | **A** | Always throw. The whole-account binding exposes licensed, entitlement-dependent and account-specific intelligence, and ZoomInfo provides no ACL oracle proving another account can read every historical result. |
-| **context** | Context Library singleton | **C** | Track collections whose contents a read revealed (search results, a collection's listing, a document); verify each is public in the sharing domain or privately owned by the observer's Context account. Uses the kit's default observer cap to bound per-read verifier fanout. The top-level collection listing tracks nothing: its titles, descriptions and counts are discovery metadata the agent catalog already advertises unobserved. The denial never names the collection, which the refused collaborator cannot read. |
+| **context** | Context Library singleton | **C** | Track collections whose contents a read revealed (search results, a collection's listing, a document); verify each is in the observer's sharing domain and is public, is everyone-viewable, or grants the observer's Context account a viewer, editor, or owner role. Uses the kit's default observer cap to bound per-read verifier fanout. The top-level collection listing tracks nothing: its titles, descriptions and counts are discovery metadata the agent catalog already advertises unobserved. The denial never names the collection, which the refused collaborator cannot read. |
 | **x** | Account | **C** | Admit any observer with a working X connection: public posts, profiles, public Lists and follow graphs need only an X account. Reads private to the account -- bookmarks, likes, mute state, private Lists, and any page holding a protected account's post -- authorize against one synthetic `owner` collection, which admits only an observer connected as the same X user. |
 | **x** | Post / List | **C** | As Account, plus a check on every open that the observer's own X account can see the bound post or List (`canViewPost` / `canViewList`). Each check is a read billed to the observer's connection, so a passed check is trusted for an hour; a failed one never is. |
 | **x** | Profile | **C** | As Account: a public profile needs only an X account, and the `owner` collection covers a protected user's posts. Accepted over-permissiveness for every X binding: an author who has blocked the observer is still readable through the gadget, since checking each author per observer per read would cost a read each and what leaks is public. |
@@ -866,7 +869,8 @@ This is why the broad bindings split the way they do:
 
 - **Satisfy both → C:** Supabase Org (projects + `listProjects()` oracle), Linear Workspace
   (teams + membership), Notion Workspace (pages + page access), BigQuery (datasets + IAM), Context
-  Library (public/private collections + account/domain ownership checks).
+  Library (per-collection access checks scoped to the observer's account and sharing domain: public,
+  everyone-viewable, or an explicit viewer/editor/owner grant).
 - **Fail criterion 1 → B:** GitHub Repository — issues/PRs/discussions/code all inherit the single
   repo permission, and there is no binding broader than one repo, so the repo is the atomic ACL
   unit.

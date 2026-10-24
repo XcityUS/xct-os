@@ -555,12 +555,16 @@ second attempt is safe. `ActionApplyError` is terminal and asserts the provider 
 absent** — it retires the dependents waiting on references this action was to provide.
 `ActionOutcomeUnknownError` is terminal and asserts nothing: use it for a timeout, an aborted
 request, or any failure after the provider was reached. That record is never replayed and never
-pruned, strands no dependent, and holds a slot until the user rejects it, so the "check the
-provider" warning survives.
+pruned, and holds a slot until the user rejects it, so the "check the provider" warning survives.
+It strands no dependent until then; rejecting it retires those whose references it never bound.
 
 `claimBeforeApply` produces that same unknown outcome when an activation dies mid-dispatch. Neither
 substitutes for a provider idempotency key derived from the stable `ActionContext.id`, which is
 what makes a retry safe in the first place.
+
+Rejecting always withdraws the action, whatever its outcome at the provider: the gatekeeper stops
+tracking it, and an effect that already landed stays. So a `reject` hook is cleanup only and must
+not refuse because the outcome is uncertain; one that throws is logged and the record removed anyway.
 
 `submit` refuses a payload whose `dependsOn` names a reference that is neither resolved nor
 provided by a pending or claimed action: once its provider was rejected or failed, every apply
@@ -854,11 +858,11 @@ each row it returns: a filter that drops whole pages otherwise pays for up to te
 
 `git-transport`, `git-objects`, and `git-diff` implement the worktree contract in
 `plans/worktrees.md` §3 for any smart-HTTP host. The gatekeeper supplies a fetch callback that adds
-the URL, credentials, and timeouts; the kit owns the framing. Two rules of the framing are easy to
+the URL, credentials, and timeouts; the kit owns the framing. Two rules of DO cache-pull framing are easy to
 break from the outside and fail late when broken:
 
-- **Never send a `have`.** A `have` asserts full reachability of that commit, but every pull here
-  is filtered or shallow, so the workspace cache holds commits whose blobs or ancestors it lacks.
+- **Never send a `have`.** A `have` asserts full reachability of that commit, but the workspace
+  cache can hold commits from filtered or shallow pulls whose blobs or ancestors it lacks.
   Sending one makes upload-pack withhold objects a later fault will `want`. `buildGitFetchRequest`
   sends an empty have list and `done`; do not build a fetch request another way to "save bytes".
 - **At most one `filter` line.** upload-pack accepts a single filter-spec — a second `filter` line
@@ -882,6 +886,29 @@ pushes)`, the gatekeeper filtering the pushes to that branch; the same call give
 `expectedOldSha`, so the simulated head and the compare-and-swap agree. Provider patches go through
 `parseUnifiedPatch`, one file's patch at a time, which shares `diffTextLines`'s hunk shape, so a
 simulated diff and a provider diff read alike.
+
+Lazy DO reads use `Gatekeeper.gitPull(oids, options)`. This is a kernel-facing method, not part
+of a gadget's session API. The kernel routes pulls through recorded object provenance
+(advertised commits, their referents, or objects previously populated by that gatekeeper).
+The shared composer checks oid syntax and composes typed options; it does not check
+advertisement history.
+The provider composes a typed fetch with `git-pull-transfer.startGitPull()` and returns a transfer
+capability. Claim its backpressured raw PACK stream once with `stream()`, without buffering or
+base64 encoding. The DO feeds it to its bounded cache decoder. Workers RPC can replace a stream
+exception with a generic disconnect. If consuming the stream fails, query `status()` to recover
+the producer's error; if the status has not failed, preserve the consumer's own error. After
+draining the stream, require `complete` before accepting the transfer. Cancel an unfinished stream
+and dispose the capability when done.
+
+The transfer also supports a native container consumer, but container hydration is not enabled
+by this capability alone; it requires the separate kernel worktree-replica bootstrap support.
+That consumer must bind its bootstrap capability to an authorized immutable commit, request depth
+one with no tree/blob filters, stream directly to native Git using its own limits rather than
+the DO cache's, and close the bootstrap capability after hydration. No guest-supplied Git
+commands, ref discovery, arbitrary URLs, or provider credentials belong in that bootstrap
+interface. Packs are self-contained (no `have` negotiation or thin-pack dependencies). Native
+consumers must record their shallow boundary because the raw pack does not carry Git protocol
+shallow-info.
 
 ## Other module boundaries
 

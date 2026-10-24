@@ -1081,7 +1081,7 @@ describe("reviews", () => {
     expect(review.discussions.map(discussion => discussion.note)).toEqual(["Nit"]);
   });
 
-  it("counts a lost approval as the review's own: it is not made twice, and a discard takes it back, retrying a cleanup that fails", async () => {
+  it("counts a lost approval as the review's own: it is not made twice, and a discard takes it back", async () => {
     const { gitlab, props, name } = await setup("review-lost-approval");
     const review = new ReviewGitLab(gitlab);
     gitlab.install();
@@ -1095,15 +1095,30 @@ describe("reviews", () => {
     await expect(unwrap(await hooks().applyAction(name, props, action.approvalId))).rejects.toThrow(/500/);
     expect(gitlab.count("POST", /\/approve$/)).toBe(1);
 
-    // A cleanup that fails keeps the action pending, so the discard can be retried; once done,
-    // discarding again succeeds without doing anything more.
-    review.refuse("unapprove");
-    await expect(unwrap(await hooks().rejectAction(name, props, action.approvalId))).rejects.toThrow(/500/);
-    expect(review.approval).not.toBeNull();
     await unwrap(await hooks().rejectAction(name, props, action.approvalId));
     expect(review.approval).toBeNull();
+    // Discarding again succeeds without doing anything more.
     await unwrap(await hooks().rejectAction(name, props, action.approvalId));
-    expect(gitlab.count("POST", /\/unapprove$/)).toBe(2);
+    expect(gitlab.count("POST", /\/unapprove$/)).toBe(1);
+  });
+
+  it("discards a review whose cleanup GitLab refuses, leaving the approval behind", async () => {
+    const { gitlab, props, name } = await setup("review-cleanup-refused");
+    const review = new ReviewGitLab(gitlab);
+    gitlab.install();
+    const action = await unwrap(await hooks().queueAction(name, props, "preparePostReview", ["133", {
+      revision: REVISION, decision: "approve",
+      diffComments: [{ target: { path: "README", line: 1, side: "new" }, bodyMarkdown: "Nit" }],
+    }], DESC));
+    review.refuse("draft");
+    await expect(unwrap(await hooks().applyAction(name, props, action.approvalId))).rejects.toThrow(/500/);
+
+    review.refuse("unapprove");
+    await unwrap(await hooks().rejectAction(name, props, action.approvalId));
+    expect(review.approval).not.toBeNull();
+    await expect(unwrap(await hooks().applyAction(name, props, action.approvalId))).rejects.toThrow();
+    await unwrap(await hooks().rejectAction(name, props, action.approvalId));
+    expect(gitlab.count("POST", /\/unapprove$/)).toBe(1);
   });
 
   it("leaves alone an approval the account already held: not made again, and not withdrawn by a discard", async () => {
@@ -1268,7 +1283,34 @@ describe("approval cards", () => {
         { label: "Diff comment 1", kind: "text", value: comment, syntax: "markdown" },
       ],
       descriptionIsComplete: true,
+      actionKind: { tag: "gitlab.postReview", label: "Submit reviews that comment or request changes" },
+      autoApprovable: false,
     } }]);
+  });
+
+  it("offers comment and request-changes reviews for auto-approval, never an approval or a merge, which still apply once approved by hand", async () => {
+    const { gitlab, props, name } = await setup("card-auto-approval");
+    const review = new ReviewGitLab(gitlab);
+    gitlab.install();
+    const queued = [];
+    for (const decision of ["comment", "requestChanges", "approve"] as const) {
+      queued.push(await unwrap(await hooks().queueAction(name, props, "preparePostReview",
+        ["133", { revision: REVISION, decision, bodyMarkdown: "Summary" }], DESC)));
+    }
+    queued.push(await unwrap(await hooks().queueAction(name, props, "prepareMergeMergeRequest",
+      ["133", { expectedHeadSha: MR.sha }], DESC)));
+
+    const { submitted } = await hooks().queueLog(name);
+    expect(submitted.map(({ description }) => [description.actionKind?.tag, description.autoApprovable])).toEqual([
+      ["gitlab.postReview", true],
+      ["gitlab.postReview", true],
+      ["gitlab.postReview", false],
+      ["gitlab.mergeMergeRequest", false],
+    ]);
+
+    // Ineligible for auto-approval is not refused: the approval applies when a person approves it.
+    await unwrap(await hooks().applyAction(name, props, queued[2].approvalId));
+    expect(review.approval).not.toBeNull();
   });
 });
 

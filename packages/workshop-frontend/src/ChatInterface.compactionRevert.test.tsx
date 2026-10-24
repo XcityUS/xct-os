@@ -125,6 +125,7 @@ async function openChat(
       subscriber = next
       return { [Symbol.dispose]: () => {} }
     },
+    viewChat: () => ({ [Symbol.dispose]: () => {} }),
   })
   await testRoot.render(
     <ChatInterface

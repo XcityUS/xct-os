@@ -16,6 +16,7 @@ import {
   SupportedResource,
   ResourceConfiguratorFrame,
   stripTrailingSlashes,
+  workerVersionTag,
   type ConnectHandoff,
 } from '@gadgets/workshop-shared/gatekeeper';
 import { haltIfAlarmsDisabled } from "@gadgets/gatekeeper-kit/alarm-guard";
@@ -261,6 +262,10 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
           "Give Xcity OS an email address it can receive messages from. Useful for triage " +
           "agents, ticket-from-email workflows, or anything driven by mail.",
     };
+  }
+
+  async versionTag(): Promise<string | undefined> {
+    return workerVersionTag(this.env);
   }
 
   async connectAccount(callback: Fetcher<GatekeeperConnectCallback>): Promise<{url: string}> {

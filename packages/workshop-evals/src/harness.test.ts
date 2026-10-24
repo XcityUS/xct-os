@@ -26,7 +26,7 @@ const fakes = vi.hoisted(() => {
     author: { type: "agent", id: "agent", name: "agent" },
     type: "changes",
   }];
-  const result: AgentTurnResult = { outcome, history, workpieces, usage: {} };
+  const result: AgentTurnResult = { outcome, history, compactions: [], workpieces, usage: {} };
   const session: WorkshopAgentSession = {
     username: "agent",
     connectionDrops: 0,
@@ -34,6 +34,10 @@ const fakes = vi.hoisted(() => {
     approveActionsAndWait: async () => result,
     listActions: async () => ({ entries: [] }),
     connectedAccount: () => { throw new Error("connectedAccount is not used by this test"); },
+    enableAmbientGatekeeper: async () => {
+      throw new Error("enableAmbientGatekeeper is not used by this test");
+    },
+    openGatekeeperApp: async () => { throw new Error("openGatekeeperApp is not used by this test"); },
     openGadget: async () => { throw new Error("openGadget is not used by this test"); },
     acceptChanges: vi.fn(async () => {
       await new Promise(resolve => setTimeout(resolve, phaseDelayMs));

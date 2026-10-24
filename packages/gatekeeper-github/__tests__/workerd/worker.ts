@@ -10,8 +10,8 @@
 
 import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint, restore } from "cloudflare:workers";
 import type {
-  AccountDescription, ActionDescription, ConnectHandoff, GatekeeperUser, GitCache, HookController,
-  HookDescription,
+  AccountDescription, ActionDescription, ActionKind, ConnectHandoff, GatekeeperUser, GitCache, HookController,
+  HookDescription, GitPullHints, GitPullTransfer,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { GitHubGatekeeperImpl, GitHubHookDriver as GitHubHookDriverImpl, type GitHubVerifierApi } from "../../src/github.js";
 import type { GitHubHookParams } from "../../src/github-hooks.js";
@@ -136,6 +136,9 @@ export type MergePullRequestActionData = Extract<
 export type IssueEditActionData = Extract<
   Parameters<GitHubGatekeeperImpl["submitActionForApproval"]>[1], { type: "setTitle" | "changeState" }>;
 
+/** Any of github.ts's (unexported) action records, read off the real submit signature. */
+export type GitHubActionData = Parameters<GitHubGatekeeperImpl["submitActionForApproval"]>[1];
+
 /** The listing methods `TestHooks.listingPages` drives. */
 export type ListingMethod = "listIssues" | "searchIssues" | "listPullRequests" | "searchPullRequests";
 
@@ -163,18 +166,15 @@ type SeedFacet = { seed(entries: Record<string, unknown>): Promise<void> };
 // The facet methods TestHooks forwards to, spelled structurally: workers-types' `Fetcher<T>`
 // return-type inference collapses several of these returns to `never` (its `Serializable`
 // heuristic gives up on them), while the runtime objects are exactly the production ones.
-type GatekeeperFacet = {
+type GatekeeperFacet = Pick<GitHubGatekeeperImpl, "gitPull"> & {
   preparePush(branch: string, commitId: string, force: boolean, cache: RpcStub<GitCache>)
     : Promise<PushActionData | null>;
   prepareCreatePullRequest(options: GitHubCreatePullRequestOptions)
     : Promise<CreatePullRequestActionData>;
   prepareMergePullRequest(pullId: string, options?: GitHubPullRequestMergeOptions)
     : Promise<MergePullRequestActionData>;
-  submitActionForApproval(
-    queue: unknown,
-    action: PushActionData | CreatePullRequestActionData | PostReviewActionData | MergePullRequestActionData
-      | IssueEditActionData,
-    description: ActionDescription): Promise<void>;
+  submitActionForApproval(queue: unknown, action: GitHubActionData, description: ActionDescription): Promise<void>;
+  getAutoApprovableActions(): Promise<ActionKind[]>;
   applyAction(actionId: number, cache: RpcStub<GitCache>): Promise<void>;
   rejectAction(actionId: number): Promise<undefined | { restart?: boolean }>;
   revertAction(actionId: number): Promise<undefined | { message?: string; canRetry?: boolean }>;
@@ -319,6 +319,19 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
       this.#gatekeeper(facetName, props).submitActionForApproval(queue, action, description));
   }
 
+  /** Submits a hand-built `action` record, as a session does once it has prepared one. */
+  async submitAction(
+    facetName: string, props: GatekeeperProps,
+    queue: unknown, action: GitHubActionData, description: ActionDescription,
+  ): Promise<Outcome<void>> {
+    return await outcome(() =>
+      this.#gatekeeper(facetName, props).submitActionForApproval(queue, action, description));
+  }
+
+  async autoApprovableActions(facetName: string, props: GatekeeperProps): Promise<Outcome<ActionKind[]>> {
+    return await outcome(() => this.#gatekeeper(facetName, props).getAutoApprovableActions());
+  }
+
   async rejectAction(
     facetName: string, props: GatekeeperProps, actionId: number,
   ): Promise<Outcome<undefined | { restart?: boolean }>> {
@@ -421,6 +434,11 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
     facetName: string, props: GatekeeperProps, commitId: string,
   ): Promise<Outcome<boolean>> {
     return await outcome(() => this.#gatekeeper(facetName, props).isSimulatedCommitId(commitId));
+  }
+
+  async gitPull(facetName: string, props: GatekeeperProps, oids: string[], options: GitPullHints):
+      Promise<Outcome<GitPullTransfer>> {
+    return await outcome(() => this.#gatekeeper(facetName, props).gitPull(oids, options));
   }
 
   async getCommit(

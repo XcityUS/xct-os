@@ -24,8 +24,9 @@
 // Gadget a stub pointing to the Gadget's server-side Durable Object interface.
 
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
-import { AccountDescription, ActionKind, ActionDescription, AgentCatalog, AvatarImage, GatekeeperUiFrame, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription, HookDescription } from "./gatekeeper.js";
+import { AccountDescription, ActionKind, ActionDescription, AgentCatalog, AvatarImage, GatekeeperUiFrame, GatekeeperUserSelection, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription, HookDescription } from "./gatekeeper.js";
 import type { CodeChange } from "./code-change.js";
+import type { GitOid } from "./gatekeeper.js";
 import type { UiFeatureFlags } from "./feature-flags.js";
 
 export const SERVICE_SALT = new Uint8Array([
@@ -196,12 +197,23 @@ export type UserNotification = {
   chatTitle: string;
 };
 
+/** A browser's Web Push subscription: the endpoint its push service issued, and the keys that encrypt pushes to it. */
+export type WebPushSubscription = {
+  /** Push service URL the browser issued for this subscription. */
+  endpoint: string;
+  /** The browser's encryption keys, base64url-encoded as `PushSubscription.toJSON()` returns them. */
+  keys: { p256dh: string; auth: string };
+};
+
+/** How long a workspace's notifications stay muted: until a time, or until the user unmutes it. */
+export type NotificationMute = { until: Date, indefinite?: never } | { indefinite: true, until?: never };
+
 /** Callback used by `AuthenticatedApi.subscribeToNotifications()`. */
 export interface NotificationSubscriber extends RpcTarget {
   /**
    * Present a notification to the active user. Resolve only once the user has seen it, or is
-   * already viewing its chat; if no subscriber resolves promptly, the backend falls back to mobile
-   * push delivery.
+   * already viewing its chat; if no subscriber resolves promptly, the backend falls back to push to
+   * the user's registered devices and browsers.
    */
   notify(notification: UserNotification): Promise<void>;
 }
@@ -507,18 +519,27 @@ export interface AuthenticatedApi extends RpcTarget {
   hasPasswordLogin(): Promise<boolean>;
 
   /**
-   * Connect the native app's one-time central device registration to this authenticated user. Each
-   * registered device gets push; a device that registers again replaces its own subscription. The
-   * deployment never receives an APNs device token or Cloudflare account token.
+   * Register one of the user's devices for push: the native app's one-time central device
+   * registration, or this browser's Web Push subscription. Each registered device gets push; a
+   * device that registers again replaces its own subscription. The deployment never receives an
+   * APNs device token or Cloudflare account token. A browser's subscription passes through it to
+   * the central notification service, which delivers to an endpoint only for its most recent
+   * registration.
    */
-  registerNotificationDevice(deviceRegistrationId: string): Promise<void>;
+  registerNotificationDevice(registration: string | WebPushSubscription): Promise<void>;
 
   /**
    * Subscribe while this client can visibly present notifications. Dispose the returned handle
-   * when the page becomes hidden so the backend can promptly fall back to mobile push.
+   * when the page becomes hidden so the backend can promptly fall back to push.
    */
   subscribeToNotifications(
       subscriber: RpcStub<NotificationSubscriber>): Promise<RpcStub<{}>>;
+
+  /**
+   * Mute a workspace in the user's list, so its finished tasks notify no tab or device, or unmute
+   * it with null. Permission requests still come through.
+   */
+  setWorkspaceNotificationMute(workspaceId: string, mute: NotificationMute | null): Promise<void>;
 
   /**
    * List the user's configured AI models of one kind, by default the language models, which can
@@ -775,6 +796,8 @@ export interface AuthenticatedApi extends RpcTarget {
    * on a connected account, expanding if needed. Returns a flow to open as a disowned popup (as for
    * connectAccount()) to authorize them, or null if nothing was needed. Completion is redeemed via
    * completeConnectHandoff(); the updated grant is then observable via subscribeConnectedAccounts().
+   * Returning null also re-reads the account's description, so a list of granted resource types
+   * that was out of date is corrected and observable the same way.
    */
   ensureAccountResources(accountId: number, resourceUrlPatterns: string[]): Promise<ConnectFlowStart | null>;
 
@@ -935,6 +958,16 @@ export interface AuthenticatedApi extends RpcTarget {
    */
   getGatekeeperApp(id: string): Promise<GatekeeperUiFrame | null>;
 
+  /**
+   * Mint a single-use ticket for a user selected on behalf of a gatekeeper app,
+   * redeemable through that gatekeeper app's exchange capability (see
+   * GatekeeperUserSelectionExchangeImpl). Returns null if the selected user is
+   * this user or does not exist.
+   */
+  createGatekeeperUserSelection(
+      vendorId: string, selectedUserId: string,
+  ): Promise<GatekeeperUserSelection | null>;
+
   // --- Deployment admin ---
 
   /**
@@ -1093,6 +1126,46 @@ export const MAX_SITE_LOGO_BYTES = 256 * 1024;
 /** Maximum width or height of an admin-uploaded site logo in pixels. */
 export const MAX_SITE_LOGO_DIMENSION = 512;
 
+/**
+ * The default of the deployment's check interval (see AdminApi.setUpdateCheckIntervalMinutes): how
+ * many minutes a successful update check is relied on before the deployment asks again.
+ */
+export const DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES = 60;
+
+/** The largest check interval, in minutes, an admin may set: 30 days. */
+export const MAX_UPDATE_CHECK_INTERVAL_MINUTES = 43_200;
+
+/**
+ * The default of the deployment's minimum age (see AdminApi.setUpdateMinimumAgeHours): how many
+ * hours a newer release must have been available before admins are notified of it.
+ */
+export const DEFAULT_UPDATE_MINIMUM_AGE_HOURS = 24;
+
+/**
+ * The default of the deployment's notice snooze (see AdminApi.setUpdateNoticeSnoozeHours): how
+ * many hours a dismissed update notice stays hidden in the browser that dismissed it.
+ */
+export const DEFAULT_UPDATE_NOTICE_SNOOZE_HOURS = 24;
+
+/** The largest minimum age and notice snooze, in hours, an admin may set: 30 days. */
+export const MAX_UPDATE_HOURS = 720;
+
+/**
+ * The path a Workshop browser POSTs to, through the router, before it reads the update status, so
+ * that the backend records the router's current version tag first. The Workshop's other calls
+ * travel over one WebSocket, which carries the router's tag only when it opens. Answered with an
+ * empty 204.
+ */
+export const ROUTER_TAG_PROBE_PATH = "/api/router-tag";
+
+/**
+ * The path a Workshop browser GETs, through the router, to learn the version id of the backend that
+ * new requests reach: `{ version: string | null }`, never cached, `null` where the backend has no
+ * version id. A deploy does not move the WebSocket a tab already holds, so a tab whose
+ * `ServerConfig.backendVersion` differs is still talking to an older backend, and reconnects.
+ */
+export const VERSION_PATH = "/api/version";
+
 /** All admin-managed deployment settings, returned by AdminApi.getSettings() for the admin UI. */
 export type AdminSettingsView = {
   /** Whether new account signups are allowed. */
@@ -1179,6 +1252,76 @@ export type AdminFormat = {
    * removed, nor resets their overrides.
    */
   bundled: boolean;
+};
+
+/**
+ * Whether a newer release is available for a deployment the deploy flow installed, returned by
+ * AdminApi.getUpdateStatus(). The check fields describe the last successful update check made for
+ * the release this backend runs: until one succeeds, `latestReleaseId`, `availableSince` and
+ * `checkedAt` are absent and `updateAvailable` is false.
+ */
+export type DeploymentUpdateStatus = {
+  /** The release this backend runs. */
+  currentReleaseId: string;
+  /** The newest release the last successful check for `currentReleaseId` reported. */
+  latestReleaseId?: string;
+  /** Whether that check said a release newer than `currentReleaseId` exists. */
+  updateAvailable: boolean;
+  /**
+   * When the first release newer than `currentReleaseId` was published. Absent unless
+   * `updateAvailable`.
+   */
+  availableSince?: Date;
+  /**
+   * Whether the home page should show admins the update notice now, before the browser applies
+   * its own dismissal (see `noticeSnoozeHours`). True exactly when `checksEnabled`, the check says
+   * `updateAvailable`, the deployment is not `modified`, and `availableSince` is at least
+   * `minimumAgeHours` ago.
+   */
+  notify: boolean;
+  /**
+   * Whether the deployment checks for updates by itself (see AdminApi.setUpdateChecksEnabled).
+   * When false, `notify` is false and only AdminApi.checkForUpdates() asks for the newest release.
+   */
+  checksEnabled: boolean;
+  /**
+   * The deployment's check interval: how many minutes a successful check is relied on before the
+   * deployment asks again (see AdminApi.setUpdateCheckIntervalMinutes).
+   */
+  checkIntervalMinutes: number;
+  /**
+   * The deployment's minimum age: how many hours a newer release must have been available before
+   * `notify` is true (see AdminApi.setUpdateMinimumAgeHours).
+   */
+  minimumAgeHours: number;
+  /**
+   * The deployment's notice snooze: how many hours a browser hides the notice after an admin
+   * dismisses it there (see AdminApi.setUpdateNoticeSnoozeHours).
+   */
+  noticeSnoozeHours: number;
+  /**
+   * Whether this deployment's running code differs from what the deploy flow installed: true
+   * exactly when `modifiedWorkers` is non-empty. The deploy flow refuses to upgrade a modified
+   * deployment.
+   */
+  modified: boolean;
+  /**
+   * The Workers whose running version is neither this installation's current one nor another
+   * release of it: they have no version tag, or one the deploy flow did not write for this
+   * installation. Each is "backend", "router", or a gatekeeper's install slug. A Worker that did
+   * not report its version is in neither this list nor `unfinishedWorkers`.
+   */
+  modifiedWorkers: string[];
+  /**
+   * The Workers still running another release of this installation: an update that did not
+   * finish, which the deploy flow can finish once no Worker is modified. Named as in
+   * `modifiedWorkers`. Unlike those, they do not affect `notify`.
+   */
+  unfinishedWorkers: string[];
+  /** The opaque link that opens the deploy flow for this installation. */
+  updateUrl: string;
+  /** When the last successful check for `currentReleaseId` was made. */
+  checkedAt?: Date;
 };
 
 /**
@@ -1427,6 +1570,51 @@ export interface AdminApi {
    * eight requests, each of which may use the whole response cap.
    */
   testNewGatewayModel(model: GatewayModel): Promise<GatewayModelLevelTest[]>;
+
+  /**
+   * Whether a newer release is available. Null unless the deploy flow installed this deployment.
+   * While automatic update checks are off (see setUpdateChecksEnabled) it asks no one and reports
+   * the last check made for the running release, if any.
+   */
+  getUpdateStatus(): Promise<DeploymentUpdateStatus | null>;
+
+  /**
+   * Ask now for the newest release, whether or not automatic update checks are on, and return
+   * the status that check produces. Null unless the deploy flow installed this deployment. Throws
+   * when the check fails.
+   */
+  checkForUpdates(): Promise<DeploymentUpdateStatus | null>;
+
+  /**
+   * Set whether the deployment checks for updates by itself. On by default. When off,
+   * getUpdateStatus() makes no outbound call and admins are never notified; checkForUpdates()
+   * still asks.
+   */
+  setUpdateChecksEnabled(enabled: boolean): Promise<void>;
+
+  /**
+   * Set how many minutes a successful update check is relied on before the deployment asks again,
+   * DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES by default. A failed check is retried after the interval
+   * or 15 minutes, whichever is shorter. The deployment asks only while an admin is using it
+   * (getUpdateStatus() makes the check when one is due), never on a schedule of its own. Throws
+   * unless `minutes` is a whole number from 1 to MAX_UPDATE_CHECK_INTERVAL_MINUTES.
+   */
+  setUpdateCheckIntervalMinutes(minutes: number): Promise<void>;
+
+  /**
+   * Set how many hours a newer release must have been available before admins are notified of
+   * it, DEFAULT_UPDATE_MINIMUM_AGE_HOURS by default. It delays the notice only: an update always
+   * installs the newest release. 0 notifies as soon as a check reports an update. Throws unless
+   * `hours` is a whole number from 0 to MAX_UPDATE_HOURS.
+   */
+  setUpdateMinimumAgeHours(hours: number): Promise<void>;
+
+  /**
+   * Set how many hours a dismissed update notice stays hidden in the browser that dismissed it,
+   * DEFAULT_UPDATE_NOTICE_SNOOZE_HOURS by default. 0 means a closed notice comes back on the next
+   * visit to Home. Throws unless `hours` is a whole number from 0 to MAX_UPDATE_HOURS.
+   */
+  setUpdateNoticeSnoozeHours(hours: number): Promise<void>;
 }
 
 /** A partial edit to one promoted format. Absent fields are left alone. */
@@ -1521,6 +1709,19 @@ export type ServerConfig = {
    * overrides the brand CSS variables with this (and derived shades) at runtime.
    */
   accentColor: string;
+
+  /**
+   * The central notification service's VAPID public key (base64url), which browsers subscribe to
+   * Web Push with. Absent when this deployment can't send browser push, which hides the browser
+   * notification setting.
+   */
+  webPushPublicKey?: string;
+
+  /**
+   * The version id of the backend answering this connection, or undefined where it has none.
+   * Compared with what VERSION_PATH answers to notice a connection that outlived a deploy.
+   */
+  backendVersion?: string;
 };
 
 /**
@@ -2260,6 +2461,9 @@ export type GadgetMetadata = {
   /** Whether the user has pinned this gadget to the top of their list. */
   pinned?: boolean;
 
+  /** Set while the user has muted this workspace's notifications. */
+  notificationMute?: NotificationMute;
+
   /**
    * Set when the gadget is not owned by the current user. Presence of this field indicates the
    * user is a collaborator, not the owner.
@@ -2656,20 +2860,29 @@ export type AgentSpawnerConfig = {
 
   /**
    * The bindings available to agents spawned by this spawner: binding name (as it appears as
-   * `env.NAME` in the spawned agent's executeCode environment) -> target workpiece. When an agent
-   * is spawned, this map is snapshotted into the spawned chat's seed binding layer (entries whose
-   * targets no longer exist are dropped); the spawned agent sees only these bindings, never the
-   * workspace's default binding list.
+   * `env.NAME` in the spawned agent's executeCode environment) -> target workpiece. This is the
+   * spawner's initial set: afterwards the chat agent may add more with `setGadgetBinding`, each
+   * a proposal that takes effect once the user accepts the chat's changes. When an agent is
+   * spawned, the spawner's bindings are snapshotted into the spawned chat's seed binding layer
+   * (entries whose targets no longer exist are dropped); the spawned agent sees only these
+   * bindings, never the workspace's default binding list.
    *
    * The entries are deliberately not limited to bindings held by the gadget that owns the
    * spawner: a spawner may define bindings of its own, with its own names and targets.
    *
-   * Once a gadget binds the spawner, every env target joins each "use" collaborator's
+   * Once a gadget binds the spawner, every binding target joins each "use" collaborator's
    * verification scope transitively: spawning is reachable from the gadget UI, and the spawned
    * agent reads these bindings with the spawner creator's authority.
    */
   env: Record<string, WorkpieceId>,
 };
+
+/**
+ * The `vendorId` with which the agent's requestConnection asks the user to add an agent spawner
+ * (see AgentSpawnerConfig) rather than connect a gatekeeper vendor's resource. No vendor can have
+ * it: vendor ids come from binding names, which have no hyphen.
+ */
+export const AGENT_SPAWNER_CONNECTION_ID = "agent-spawner";
 
 /**
  * Interface to a workspace's Overseer, used to display the Gadget Workshop shell UI around that
@@ -3046,6 +3259,16 @@ export interface Overseer extends RpcTarget {
   subscribeToChat(subscriber: RpcStub<AiChatSubscriber>, startAfter?: Date): Promise<RpcStub<{}>>;
 
   /**
+   * Records that this client shows chat `chatId` until the returned handle is disposed. When a
+   * turn finishes in a chat someone is viewing, the workspace resends that turn's last model
+   * request just before the provider's cached copy of it would expire, so the user's next message
+   * costs less and starts sooner. The resends are billed like the turn. They stop when the last
+   * viewer leaves, at the chat's next turn, an hour after the turn, or before they would cost
+   * more than the cache miss they avoid. Throws if the chat doesn't exist.
+   */
+  viewChat(chatId: number): Promise<RpcStub<{}>>;
+
+  /**
    * Lists slash commands available from Gatekeepers currently attached to this Gadget, including
    * ambient ones.
    */
@@ -3070,6 +3293,10 @@ export interface Overseer extends RpcTarget {
   /**
    * Send a message to the chat from this client. Sending a message causes the LLM to start
    * running if it isn't already.
+   * While it runs, plain text with no capsules, attachments or formats steers it, on the running
+   * turn's model whatever `modelId` is, even null: it waits in `AiChatMetadata.queuedSteers` until
+   * the agent reads it. Anything else, or anything sent after `stopAgent()`, throws until the
+   * agent finishes.
    * If a slash command produces no message, only its visible invocation event is committed and the
    * agent does not run.
    * Slash-command requests cannot include capsules or attachments.
@@ -3083,13 +3310,13 @@ export interface Overseer extends RpcTarget {
                   formats?: MessageFormatRef[]): Promise<void>;
 
   /**
-   * Upload an attachment for use in a future chat message. This way by the time the user wants to
-   * send the message, likely uploading is complete. `modelId` determines whether the
-   * selected provider can receive a raw file attachment.
-   *
-   * Pass the returned handle to newChat() or sendChatMessage() to commit the attachment into chat history.
+   * Store raw bytes as an immutable Git blob and return its OID after durable storage.
+   * Retrying identical bytes returns the same OID. This does not change any worktree or message.
+   * Use the OID in a chat attachment, or in a worktree's whole-file `setBytes` change together
+   * with the payload's byte length. The blob must be present in this workspace's Git store.
+   * Limited to 8,000,000 bytes; larger-file support is deferred.
    */
-  uploadChatAttachment(attachment: ChatAttachmentUpload, modelId: string | null): Promise<ChatAttachmentHandle>;
+  uploadBlob(content: Uint8Array): Promise<GitOid>;
 
   /**
    * Fetch the bytes of a committed chat attachment over RPC. The canonical metadata is already
@@ -3097,9 +3324,6 @@ export interface Overseer extends RpcTarget {
    * only to download non-image attachments on demand.
    */
   getChatAttachmentContent(chatId: number, id: string): Promise<Uint8Array>;
-
-  /** Delete an uploaded attachment that the user explicitly removed before sending the message. */
-  deleteChatAttachment(id: string): Promise<void>;
 
   /**
    * Update the title of a chat. Usually not needed as a title is generated automatically from
@@ -3222,6 +3446,9 @@ export interface Overseer extends RpcTarget {
    * reflecting this before `stop()` returns.
    *
    * If no LLM is running, `stop()` does nothing and returns immediately.
+   *
+   * Stopping drops the chat's queued steers (see `AiChatMetadata.queuedSteers`), whoever sent them.
+   * The client that stops is expected to put them in its draft, so its user can still send them.
    */
   stopAgent(chatId: number): Promise<void>;
 
@@ -3402,6 +3629,15 @@ export type AiChatMetadata = {
    * linger in stored metadata but are never delivered as truth.)
    */
   proposedChangeWorkpieces?: WorkpieceId[];
+
+  /**
+   * Messages sent while the agent works that it has not read yet, oldest first (see
+   * `Overseer.sendChatMessage`). Each then appears in the chat as a message marked `steered`,
+   * unless a turn ends without reading it and without failing or waiting on the user's decision:
+   * it then prompts the next turn as an ordinary message. Stopping the agent drops them all (see
+   * `Overseer.stopAgent`). Absent when none.
+   */
+  queuedSteers?: {text: string, author: AiChatAuthorInfo}[];
 
   /** If this was started from an agent spawner, the spawner's display name. */
   spawnerName?: string;
@@ -3810,6 +4046,13 @@ export type AiChatMessageBody = {
    * Clients use this to group the two records for display.
    */
   generatedBySlashCommandSequence?: number;
+
+  /**
+   * Sent while the agent was working, so it steers that turn rather than prompting one. The agent
+   * reads it before its next model request, or, if the turn ended before it could and started no
+   * other (it failed, or stopped to wait on the user's decision), when the agent next runs.
+   */
+  steered?: true;
 } | {
   /**
    * A slash command exactly as requested by the client, retained for display and never included in
@@ -3950,7 +4193,8 @@ export type AiChatMessageBody = {
    * case `change` is omitted). Like `createdGadgets`, the additions are
    * provisional: the edge is visible only from this chat until a merge through this message
    * makes it permanent, and a revert covering it deletes the edge. `name` is the binding's name
-   * within the gadget identified by `gadgetId`; `target` is the bound workpiece.
+   * within the gadget (or agent spawner) identified by `gadgetId`; `target` is the bound
+   * workpiece.
    */
   addedBindings?: {gadgetId: WorkpieceId, name: string, target: WorkpieceId}[];
 
@@ -4054,14 +4298,15 @@ export type AiChatMessageBody = {
   type: "useGadget";
 } | {
   /**
-   * The catalogs of always-available resources changed after the agent's system prompt listed
-   * them, e.g. a skill was added to the Context Library. The agent writes this before the model
-   * request that first sees the change, and tells the model what changed, so the system prompt can
-   * stay the same for the whole chat. Clients show nothing for it.
+   * The always-available resources changed after the agent's system prompt listed them: a
+   * catalog changed, e.g. a skill was added to the Context Library, or the chat gained a resource,
+   * e.g. the owner turned on Web Search. The agent writes this before the model request that first
+   * sees the change, and tells the model what changed, so the system prompt can stay the same for
+   * the whole chat. Clients show nothing for it.
    */
   type: "catalogChange";
 
-  /** Each changed resource, as it is now. */
+  /** Each changed or new resource, as it is now. */
   resources: AlwaysAvailableResource[];
 } | {
   /**
@@ -4098,9 +4343,10 @@ export type AiChatMessageBody = {
   bindingName?: string;
 } | {
   /**
-   * **Obsolete.** A system-generated nudge message that was sent to the agent when it tried to
-   * end its turn while agent callbacks were still unresolved. No longer emitted since callable
-   * agents stopped returning values; retained so older chat logs remain readable.
+   * A model-visible control note for an approved-decision handoff, explicit Retry, or Stop.
+   * It also ends the preceding decision segment for recovery. Not rendered in the chat UI:
+   * the decision cards and turn controls already show these transitions to the user.
+   * Older logs used this variant to nudge an agent whose callbacks were still unresolved.
    */
   type: "agentNudge";
   text: string;
@@ -4117,7 +4363,10 @@ export type AiChatMessageBody = {
   /** Unique id used by acceptConnectionRequest()/denyConnectionRequest(). */
   requestId: string;
 
-  /** The gatekeeper vendor the agent is requesting (id + denormalized display name). */
+  /**
+   * The gatekeeper vendor the agent is requesting (id + denormalized display name), or
+   * AGENT_SPAWNER_CONNECTION_ID for an agent spawner.
+   */
   vendorId: string;
   vendorName: string;
 
@@ -4139,9 +4388,10 @@ export type AiChatMessageBody = {
   /**
    * The urlPattern of the supported resource this request resolved to at request time (one of the
    * vendor's SupportedResource.urlPattern values, e.g. "https://github.com/:owner/:repo" or the
-   * whole-instance "https://*"). The backend guarantees every connection request resolves to a
-   * concrete resource (see resolveRequestedResource), and the accept modal pre-selects exactly this
-   * resource — so accepting never opens a blank "create new connection" picker.
+   * whole-instance "https://*"). The backend guarantees every connection request for a vendor
+   * resolves to a concrete resource (see resolveRequestedResource), and the accept modal
+   * pre-selects exactly this resource — so accepting never opens a blank "create new connection"
+   * picker. Absent for an agent spawner, which has no resources: accepting opens its form.
    */
   resourceUrlPattern?: string;
 
@@ -4186,37 +4436,43 @@ export type AlwaysAvailableResource = {
 };
 
 /**
- * Bytes to upload as a chat attachment.
- *
- * The server stores the bytes and returns the handle to pass when sending the message.
- */
-export type ChatAttachmentUpload = {
-  mimeType: string;
-  content: Uint8Array;
-  name?: string;
-};
-
-/**
- * Handle for an attachment that has been uploaded but not yet sent as part of a message.
- *
- * Pass this back unchanged when sending the chat message.
+ * A previously uploaded blob to attach to a chat message, with display/model-input metadata.
+ * The blob must be present in this workspace's Git store. Attachment limits and MIME signatures
+ * are checked when sending. The ID-only variant accepts legacy staged uploads.
  */
 export type ChatAttachmentHandle = {
-  /** Clients must not infer storage paths from this ID or construct handles by hand. */
+  /** Immutable Git blob returned by `uploadBlob()`. */
+  oid: GitOid;
+  /** MIME type of this use of the blob; it does not change the stored bytes. */
+  mimeType: string;
+  /** Original display filename, sanitized when sending. */
+  name?: string;
+} | {
+  /** Legacy staged-upload ID; new clients use a blob OID instead. */
   id: string;
 };
 
 /**
  * Attachment metadata returned to clients.
  *
- * For image attachments, `content` carries the full image bytes inline so the client can render
- * them in the chat without an extra round trip. For other attachments, fetch the bytes on demand
- * via `Overseer.getChatAttachmentContent()`.
+ * For supported inline image formats, `content` carries the image bytes so the client can render
+ * them without an extra round trip. For other attachments, fetch the bytes on demand via
+ * `Overseer.getChatAttachmentContent()`.
  */
-export type ChatAttachmentRef = ChatAttachmentHandle & {
+export type ChatAttachmentRef = {
+  /** Chat-owned attachment identity used for downloads and message rendering. */
+  id: string;
+  /** Original immutable upload blob. Absent on legacy attachments. */
+  oid?: GitOid;
   mimeType: string;
   name?: string;
   size: number;
+
+  /**
+   * Path in the chat's scratch worktree, preserving uploaded bytes for every file format.
+   * Absent only on legacy attachments committed before workspace ingress was introduced.
+   */
+  workspacePath?: string;
 
   /** Inlined bytes for small image attachments. Present only for images. */
   content?: Uint8Array;
@@ -4347,12 +4603,12 @@ export type AiToolCall = {
   };
 } | {
   /**
-   * Wire one of the chat's bindings into a gadget's own binding list. The addition is provisional
-   * to the chat, recorded by a "changes" message (see `addedBindings`).
+   * Wire one of the chat's bindings into a gadget's own binding list, or an agent spawner's. The
+   * addition is provisional to the chat, recorded by a "changes" message (see `addedBindings`).
    */
   toolName: "setGadgetBinding";
   input: {
-    /** Chat binding name of the target gadget. */
+    /** Chat binding name of the target gadget or agent spawner. */
     gadget: string;
     /** Chat binding name of the resource to wire into the gadget. */
     source: string;
@@ -5053,7 +5309,8 @@ export type BlueprintMerge = {
   /**
    * The bindings the release declares that the gadget had none named for, by binding name.
    * Absent if there were none. A binding that exists only to feed an agent spawner
-   * (`spawnerOnly`) is never listed, having no name in the gadget to look for.
+   * (`spawnerOnly`) has no name in the gadget to look for, so it is listed only when a missing
+   * agent-spawner binding's agents get it.
    */
   missingBindings?: Record<string, BlueprintBinding>;
 };
@@ -5231,7 +5488,11 @@ export type GatekeeperCreationSpec = {
   modelName: string;       // model name on the provider's API (e.g. "claude-sonnet-4-6")
 } | {
   type: "agentSpawner";
-  config: AgentSpawnerConfig;
+  /**
+   * The spawner's config, less `env`: its bindings change after creation, so they are binding
+   * edges of the spawner instead, added with the agent's setGadgetBinding tool.
+   */
+  config: Omit<AgentSpawnerConfig, "env">;
 
   /**
    * Denormalized from the creating user's model config at binding creation time.
@@ -5537,6 +5798,9 @@ export type GadgetExportFormat = {
 
   /** File extension, including the leading dot. */
   fileExtension: string;
+
+  /** Suggested download filename, including its extension. Defaults to the Gadget title plus fileExtension when unset. */
+  fileName?: string;
 };
 
 /**

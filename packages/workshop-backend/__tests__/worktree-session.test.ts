@@ -2,14 +2,14 @@ import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import type { AiChatAuthorInfo } from "@gadgets/workshop-shared/api";
-import { applyCodeChange, type CodeChange, type CodeContent }
+import { applyCodeChange, requireTextContent, type CodeChange, type CodeContent, type FileContent }
   from "@gadgets/workshop-shared/code-change";
 import type { GitOid, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
 import type { OverseerDurableObject } from "../src/overseer.js";
 import { WorktreeSessionImpl, type WorktreeSessionHost } from "../src/worktree-session";
 import type { WorktreeTurnAccess } from "../src/agent";
 import { formatUnifiedDiff } from "../src/agent";
-import { WorkspaceGitCache } from "../src/git-cache";
+import { MAX_GIT_OBJECT_SIZE, WorkspaceGitCache } from "../src/git-cache";
 import { GitStore } from "../src/git-store";
 import { makeOverseerStorage } from "../src/storage-schema/overseer-storage";
 import { concatBytes } from "../src/git-codec";
@@ -20,7 +20,7 @@ import { COMMIT_1, FIXTURE_OBJECTS, PACKED_OIDS, b64Bytes } from "./git-cache-fi
 // @ts-expect-error -- ?raw imports have no type declaration
 import WORKTREE_DTS_SOURCE from "../src/worktree-binding.d.ts?raw";
 // The text module workshop-backend ships -- a symlink to the .d.ts above (see
-// worktreeAgentApiText in overseer.ts).
+// agentApiText in overseer.ts).
 import WORKTREE_BINDING_TYPES from "../src/worktree-binding.txt";
 
 declare module "cloudflare:workers" {
@@ -69,7 +69,7 @@ async function loadFixtureRepo(impl: any): Promise<void> {
 // barrier will in the chat), and buffered commit advancements, all drained through the real
 // barrier (impl.commitAgentStep).
 function makeTurn(impl: any, chatId: number) {
-  let content = new Map<number, Map<string, string>>();
+  let content = new Map<number, Map<string, FileContent>>();
   let removed = new Map<number, Set<string>>();
   let pins = new Map<number, string>();
   let changes: { change: CodeChange }[] = [];
@@ -87,7 +87,7 @@ function makeTurn(impl: any, chatId: number) {
     getRemovedPaths: id => removed.get(id) ?? new Set(),
     readFile: async (id, path) => {
       let existing = content.get(id)?.get(path);
-      if (existing !== undefined) return existing;
+      if (existing !== undefined) return requireTextContent(existing);
       if (removed.get(id)?.has(path)) return undefined;
       let base = baseCommit(id);
       if (base === undefined) return undefined;
@@ -188,6 +188,75 @@ function makeLocalHarness(
 }
 
 describe("listFiles", () => {
+  it("keeps raw reads observational and preserves text reads, edits and commits", () => withImpl(async impl => {
+    addChat(impl, 1);
+    const text = "\ufeffhello😀\n";
+    const base = await commitFiles(impl, {"a.txt": text});
+    const {session, turn, id} = await createWorktreeSession(impl, 1, base);
+    expect(await new Response(await session.readBytes("a.txt")).bytes()).toEqual(new TextEncoder().encode(text));
+    expect(turn.access.getOverlayFiles(id).has("a.txt")).toBe(false);
+    expect(await session.readFile("a.txt")).toBe(text);
+    expect(await impl.gitStore.readCommitFiles(base)).toEqual(new Map([["a.txt", text]]));
+    await session.writeFile("a.txt", text + "edited\n");
+    const commit = await session.commit("text after raw read");
+    await turn.barrier();
+    expect(await impl.gitStore.readCommitFiles(commit)).toEqual(new Map([["a.txt", text + "edited\n"]]));
+  }));
+
+  it("resolves byte identities without copying the Git object or adding permission records", () => withImpl(async impl => {
+    const commit = await commitFiles(impl, {"a.txt": "same text\n"});
+    const before = [...impl.storage.gitObjects.list()];
+    const [a, b] = await Promise.all([
+      impl.gitCache.fileBytesAtCommit(commit, "a.txt"),
+      impl.gitCache.fileBytesAtCommit(commit, "a.txt"),
+    ]);
+    expect(a).toEqual(b);
+    addChat(impl, 1);
+    const {session} = await createWorktreeSession(impl, 1, commit);
+    expect(await new Response(await session.readBytes("a.txt")).text()).toBe("same text\n");
+    expect([...impl.storage.gitObjects.list()]).toEqual(before);
+    expect(await impl.gitStore.readCommitFiles(commit)).toEqual(new Map([["a.txt", "same text\n"]]));
+  }));
+
+  it("bounds byte writes and ranges without changing the file on failure", () => withImpl(async impl => {
+    addChat(impl, 1);
+    const base = await commitFiles(impl, {});
+    const {session} = await createWorktreeSession(impl, 1, base);
+    await session.writeBytes("data.bin", Uint8Array.of(0, 255, 7));
+    expect(await new Response(await session.readBytes("data.bin", {offset: 1, length: 2})).bytes())
+      .toEqual(Uint8Array.of(255, 7));
+    expect(await new Response(await session.readBytes("data.bin", {offset: 3, length: 0})).bytes())
+      .toEqual(new Uint8Array());
+    for (const range of [{offset: -1, length: 1}, {offset: 0, length: -1}, {offset: 1, length: 3},
+      {offset: 4, length: 0}, {offset: 0.5, length: 1}, {offset: Number.MAX_SAFE_INTEGER, length: 1}]) {
+      await expect(session.readBytes("data.bin", range)).rejects.toThrow("Invalid byte range");
+    }
+    await expect(session.writeBytes("data.bin", new Uint8Array(MAX_GIT_OBJECT_SIZE + 1)))
+      .rejects.toThrow("too large");
+    expect(await new Response(await session.readBytes("data.bin")).bytes()).toEqual(Uint8Array.of(0, 255, 7));
+    await session.writeBytes("empty.bin", new Uint8Array());
+    expect(await new Response(await session.readBytes("empty.bin")).bytes()).toEqual(new Uint8Array());
+    await expect(session.readBytes("missing.bin")).rejects.toThrow("no such file");
+  }));
+
+  it("writes, replaces, commits and deletes bytes through the DO worktree API", () => withImpl(async impl => {
+    addChat(impl, 1);
+    const base = await commitFiles(impl, {});
+    const {session, turn, id} = await createWorktreeSession(impl, 1, base);
+    await session.writeBytes("image.bin", Uint8Array.of(0, 255, 3, 4));
+    await session.writeBytes("image.bin", Uint8Array.of(0, 5, 0, 3, 4));
+    expect(new Uint8Array(await new Response(await session.readBytes("image.bin")).arrayBuffer())).toEqual(Uint8Array.of(0, 5, 0, 3, 4));
+    const commit = await session.commit("binary replacement");
+    await turn.barrier();
+    expect(impl.getWorktreeRecord(id).headCommit).toBe(commit);
+    const value = await impl.gitCache.fileBytesAtCommit(commit, "image.bin");
+    expect(impl.gitStore.readBlob(value.oid, value.byteLength)).toEqual(Uint8Array.of(0, 5, 0, 3, 4));
+    await expect(session.readFile("image.bin")).rejects.toThrow(/Binary/);
+    await session.deleteFile("image.bin");
+    const deleted = await session.commit("delete binary");
+    await turn.barrier();
+    expect(await impl.gitCache.fileBytesAtCommit(deleted, "image.bin")).toBeUndefined();
+  }));
   it("surfaces all five entry kinds, non-recursively and recursively",
       () => withImpl(async impl => {
     addChat(impl, 1);

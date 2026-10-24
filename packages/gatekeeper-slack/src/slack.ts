@@ -5,7 +5,7 @@ import {
   ApprovalQueue, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions,
   AccountDescription, SupportedResource, ResourceConfiguratorFrame, ActionKind, Cursor,
   GatekeeperUserVerifier, ObservationDescription,
-  stripTrailingSlashes, type ConnectHandoff,
+  stripTrailingSlashes, workerVersionTag, type ConnectHandoff,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { haltIfAlarmsDisabled } from "@gadgets/gatekeeper-kit/alarm-guard";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
@@ -301,6 +301,10 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
           "channels, direct messages, and threads you can see. Build agents that summarize " +
           "conversations, monitor channels, or search across your Slack history.",
     };
+  }
+
+  async versionTag(): Promise<string | undefined> {
+    return workerVersionTag(this.env);
   }
 
   async connectAccount(callback: Fetcher<GatekeeperConnectCallback>,

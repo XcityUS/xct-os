@@ -116,6 +116,14 @@ export interface Worktree {
    */
   writeFile(path: string, text: string): Promise<void>;
 
+  /** Stream current file bytes, preserving binary contents; absence is an error. */
+  readBytes(path: string, range?: {offset: number; length: number}): Promise<ReadableStream<Uint8Array>>;
+  /**
+   * Create/replace a file with raw bytes using whole-file replacement semantics.
+   * Limited to 8,000,000 bytes; larger files are not supported.
+   */
+  writeBytes(path: string, content: Uint8Array): Promise<void>;
+
   /** Delete a file. */
   deleteFile(path: string): Promise<void>;
 

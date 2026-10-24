@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { RpcStub, RpcTarget } from "capnweb";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
-import type { NotificationSubscriber, UserNotification } from "@gadgets/workshop-shared/api";
+import type { NotificationSubscriber, UserNotification, WebPushSubscription } from "@gadgets/workshop-shared/api";
 import { deliver, registerDevice } from "../src/notification-service.js";
 import type { UserDurableObject } from "../src/user.js";
 
@@ -41,15 +41,16 @@ const base64urlBytes = (value: string) => Uint8Array.from(
 type Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
 // Stands in for the central service. Each registration mints the next subscription id for the
-// device whose key repeats the registration's first character; deliveries are accepted, except
-// that `refuse` answers those to one subscription with the service's error.
+// device whose key repeats the registration id's first character, or a browser endpoint's last;
+// deliveries are accepted, except that `refuse` answers those to one subscription with the
+// service's error.
 function stubService(refuse?: { subscriptionId: string; status: string; code: number }) {
   let minted = 0;
   let fetcher = vi.fn<Fetch>(async (input, init) => {
     let body = JSON.parse(String(init?.body));
     if (new URL(String(input)).pathname === "/v1/subscriptions") {
       return Response.json({
-        deviceKey: body.deviceRegistrationId[0].repeat(64),
+        deviceKey: (body.deviceRegistrationId ?? body.webPush.endpoint.at(-1))[0].repeat(64),
         subscriptionId: String(++minted).repeat(64),
       }, { status: 201 });
     }
@@ -124,6 +125,17 @@ describe("notification service", () => {
     expect(bodies(fetcher, "/v1/subscriptions")).toEqual([{ deviceRegistrationId: "d".repeat(64) }]);
   });
 
+  it("registers a browser's Web Push subscription with only the fields the service accepts", async () => {
+    let fetcher = stubService();
+    let endpoint = "https://fcm.googleapis.com/wp/abc/f";
+    // PushSubscription.toJSON() also carries expirationTime, which RPC validation lets through.
+    let subscription = { endpoint, keys: { p256dh: "BP", auth: "AA" }, expirationTime: null };
+    await expect(registerDevice(installEnv, subscription as WebPushSubscription))
+        .resolves.toEqual({ deviceKey: "f".repeat(64), subscriptionId: ONE });
+    expect(bodies(fetcher, "/v1/subscriptions"))
+        .toEqual([{ webPush: { endpoint, keys: { p256dh: "BP", auth: "AA" } } }]);
+  });
+
   it("sends nothing to a plaintext service URL", async () => {
     let fetcher = stubService();
     let plaintext = { ...installEnv, NOTIFICATION_SERVICE_URL: "http://notifications.example.test" };
@@ -134,12 +146,12 @@ describe("notification service", () => {
 
 // RPC exposes prototype methods only, as the browser's NotificationSubscriberImpl defines them.
 class Subscriber extends RpcTarget {
-  constructor(private readonly answer: () => Promise<void>) {
+  constructor(private readonly answer: (notification: UserNotification) => Promise<void>) {
     super();
   }
 
-  notify(): Promise<void> {
-    return this.answer();
+  notify(notification: UserNotification): Promise<void> {
+    return this.answer(notification);
   }
 }
 
@@ -189,6 +201,33 @@ describe("UserDurableObject notifications", () => {
   it("pushes to the registered phone when the tab does not answer within 3s", async () => {
     vi.useFakeTimers();
     expect(await publish(() => new Promise<void>(() => {}))).toEqual([ONE]);
+  });
+
+  // A muted workspace stays quiet about finished tasks, but a task stuck on the user still asks.
+  it("sends a muted workspace's permission requests to tabs and devices, and its finished tasks once the mute ends",
+      async () => {
+    let fetcher = stubService();
+    let offered: string[] = [];
+    let { workspaceId } = NOTIFICATION;
+    await inUser(async user => {
+      await user.newGadget(workspaceId, NOTIFICATION.chatTitle);
+      await user.registerNotificationDevice("a".repeat(64));
+      // A hidden tab: offered everything, shows nothing, so each offer also falls back to push.
+      await user.subscribeToNotifications(new RpcStub(new Subscriber(async notification => {
+        offered.push(notification.kind);
+        throw new Error("hidden");
+      })) as unknown as RpcStub<NotificationSubscriber>);
+      await user.setWorkspaceNotificationMute(workspaceId, { indefinite: true });
+      await user.publishNotification(NOTIFICATION);
+      await user.publishNotification({ ...NOTIFICATION, kind: "permissionRequested" });
+      await user.setWorkspaceNotificationMute(workspaceId, { until: new Date(Date.now() + 60_000) });
+      await user.publishNotification(NOTIFICATION);
+      await user.setWorkspaceNotificationMute(workspaceId, { until: new Date(Date.now() - 1) });
+      await user.publishNotification(NOTIFICATION);
+    });
+    expect(offered).toEqual(["permissionRequested", "taskCompleted"]);
+    expect(bodies(fetcher, "/v1/deliveries").map(({ type }) => type))
+        .toEqual(["permission_requested", "task_completed"]);
   });
 
   it("pushes to each device's latest subscription", async () => {

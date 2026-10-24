@@ -283,7 +283,10 @@ export type ChatMessageRaw = {
   createTime?: string;
   lastUpdateTime?: string;
   deleteTime?: string;
+  /** Plain text: a link reads as its label and a mention as `@Name`. */
   text?: string;
+  /** `text` in Chat's markup: `<url|label>` links, `<users/{id}>` mentions, `*bold*` and so on. */
+  formattedText?: string;
   thread?: { name?: string };
   space?: { name?: string };
   attachment?: ChatAttachmentRaw[];
@@ -415,6 +418,7 @@ export function chatMessageInfoFromRaw(raw: ChatMessageRaw): ChatMessageInfo {
     ...(raw.thread?.name ? { threadId: raw.thread.name } : {}),
     ...(sender ? { sender } : {}),
     text: raw.text ?? "",
+    formattedText: raw.formattedText ?? raw.text ?? "",
     mentions: chatMentionsFromRaw(raw),
     createdAt: createTime ?? new Date(0),
     ...(lastUpdateTime ? { editedAt: lastUpdateTime } : {}),
@@ -927,14 +931,15 @@ export class ChatApi {
       { method: "POST", body: JSON.stringify(body), idempotent: options.requestId !== undefined }));
   }
 
-  /** Returns the text as Chat stored it. */
+  /** Returns the text as Chat stored it, in the `formattedText` form a later read compares against. */
   async updateMessageText(messageName: string, text: string): Promise<string> {
     const { spaceId, messageId } = chatMessageParts(messageName);
     const updated = await this.#request<ChatMessageRaw>(
       "messages.patch",
       `/spaces/${spaceId}/messages/${messageId}?updateMask=text`,
       { method: "PATCH", body: JSON.stringify({ text }), idempotent: true });
-    return updated.text ?? text;
+    // The plain `text` is no substitute: undo and queued edits compare this with `formattedText`.
+    return updated.formattedText ?? (await this.getMessage(messageName)).formattedText;
   }
 
   async deleteMessage(messageName: string): Promise<void> {

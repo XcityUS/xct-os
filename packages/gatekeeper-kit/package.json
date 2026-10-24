@@ -21,6 +21,7 @@
     "./endpoint": "./src/endpoint.ts",
     "./git-diff": "./src/git-diff.ts",
     "./git-objects": "./src/git-objects.ts",
+    "./git-pull-transfer": "./src/git-pull-transfer.ts",
     "./git-transport": "./src/git-transport.ts",
     "./hook-delivery-queue": "./src/hook-delivery-queue.ts",
     "./http-errors": "./src/http-errors.ts",
@@ -44,7 +45,7 @@
     "jose": "^6.2.12"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "catalog:",
+    "@cloudflare/vitest-plugin": "catalog:",
     "@cloudflare/workers-types": "catalog:",
     "@gadgets/scripts": "workspace:*",
     "typescript": "catalog:",

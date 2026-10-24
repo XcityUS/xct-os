@@ -51,7 +51,7 @@ import type {
 } from "./chat-types";
 import type { ChatMessageRaw } from "./chat-api";
 import type { ChatHookDelivery, ChatHookParams, ChatMessageHookTarget } from "./chat-hooks";
-import { pushHooksConfigured, type PushHooksEnv } from "./pubsub-push";
+import { chatHooksConfigured, type PushHooksEnv } from "./pubsub-push";
 import { getGoogleAccountProfile } from "./google-api";
 import { AccessTokenCache } from "./auth-retry";
 import { CursorPager, CursorPagerOptions } from "./cursor";
@@ -186,8 +186,9 @@ class ChatStore {
   }
 
   /**
-   * Run one write to Google, first marking the action uncertain so rejectAction refuses it until
-   * an apply finishes. A definitive refusal of the first write proves nothing landed, so it clears.
+   * Run one write to Google, first marking the action uncertain so a retry looks for what an
+   * earlier attempt may have written. A definitive refusal of the first write proves nothing
+   * landed, so it clears.
    */
   async attemptWrite<T>(id: number, write: () => Promise<T>): Promise<T> {
     const first = !this.wasAttempted(id);
@@ -207,6 +208,22 @@ class ChatStore {
 
   wasAttempted(id: number): boolean {
     return this.#kv.get(`chat:attempted:${id}`) !== undefined;
+  }
+
+  /** Remember a send denied after an attempt, which Google may still have posted. */
+  markWithdrawnAttempt(id: number): void {
+    this.#kv.put(`chat:withdrawnAttempt:${id}`, true);
+    // Action ids count up, so the lowest are the oldest.
+    const ids = [...this.#kv.list({ prefix: "chat:withdrawnAttempt:" })]
+      .map(([key]) => Number(key.slice("chat:withdrawnAttempt:".length)))
+      .toSorted((a, b) => a - b);
+    for (const old of ids.slice(0, Math.max(0, ids.length - MAX_WITHDRAWN_ATTEMPTS))) {
+      this.#kv.delete(`chat:withdrawnAttempt:${old}`);
+    }
+  }
+
+  wasWithdrawnAttempt(id: number): boolean {
+    return this.#kv.get(`chat:withdrawnAttempt:${id}`) !== undefined;
   }
 
   /** Later edits queued against `from` now expect `to`, the form Chat stored it in. */
@@ -440,7 +457,11 @@ function resolveMessage(
   const sent = ctx.store.sentMessage(queued);
   if (sent !== undefined) return { committed: sent };
   const action = ctx.store.get(queued);
-  if (action?.type !== "sendMessage") throw new Error("This message was never created.");
+  if (action?.type !== "sendMessage") {
+    throw new Error(ctx.store.wasWithdrawnAttempt(queued)
+      ? `This message was denied, ${WITHDRAWN_ATTEMPT}`
+      : "This message was never created.");
+  }
   if (action.threadName) resolveThread(ctx, action.threadName);
   return { queued, action };
 }
@@ -461,8 +482,9 @@ function resolveThread(ctx: ChatScope, name: string) {
   if (id !== undefined) {
     const action = ctx.store.get(id);
     if (action?.type !== "sendMessage" || !action.startsThread) {
-      throw new Error(
-        "This thread's first message was rejected, so the thread doesn't exist. Reject anything queued in it.");
+      throw new Error(ctx.store.wasWithdrawnAttempt(id)
+        ? `This thread's first message was denied, ${WITHDRAWN_ATTEMPT} Reject anything queued in it.`
+        : "This thread's first message was rejected, so the thread doesn't exist. Reject anything queued in it.");
     }
     return { name, spaceName: requireInScope(ctx, action.spaceName), pending: true };
   }
@@ -594,9 +616,9 @@ async function undo(api: ChatApi, self: ChatUser, info: ChatRevertInfo): Promise
       }
       return;
     case "updatedMessage": {
-      const { text } = await api.getMessage(info.messageName);
-      if (text === info.text) await api.updateMessageText(info.messageName, info.previousText);
-      else if (text !== info.previousText) {
+      const { formattedText } = await api.getMessage(info.messageName);
+      if (formattedText === info.text) await api.updateMessageText(info.messageName, info.previousText);
+      else if (formattedText !== info.previousText) {
         return {
           message: "This message was edited again after this change, so it can't be undone " +
             "automatically. Edit it in Google Chat.",
@@ -679,17 +701,25 @@ async function queueChatMessage(
 
 /** Most people besides the caller that a direct message or group chat can be set up with. */
 const MAX_CONVERSATION_PEOPLE = 49;
+/** Sends denied after an attempt that are remembered; the oldest go first. */
+const MAX_WITHDRAWN_ATTEMPTS = 100;
+const WITHDRAWN_ATTEMPT = "but an earlier attempt may already have posted it in Google Chat. " +
+  "Read the conversation before posting it again.";
 
 const LEAVE_YOURSELF_OUT = "Leave yourself out: you are in every conversation you send to.";
 
-const peopleNames = (people: readonly ChatPerson[]) =>
-  participantNames(people.map(person => person.name ?? person.email));
+const peopleNames = (people: ChatNewConversation["members"]) =>
+  participantNames(people.map(person => person.name ?? person.email ?? person.id));
+
+const personLabel = (person: ChatNewConversation["members"][number]) => person.name
+  ? person.email ? `${person.name} <${person.email}>` : `${person.name} (${person.id})`
+  : person.email ?? person.id;
 
 /**
  * Queue a message to exactly these people, in their existing direct message or group chat, or
- * else in one created when the message is approved. Only people in the connected account's
- * directory can be put in a new conversation: an agent that reads the owner's mail must not be
- * able to open a channel to an outsider of its choosing.
+ * else in one created when the message is approved. An email address must resolve in the connected
+ * account's directory; Google accepts an opaque user id for a new conversation only when that user
+ * belongs to the same Workspace organization.
  */
 async function queueDirectMessage(
   ctx: ChatContext, people: readonly string[], text: string,
@@ -718,13 +748,10 @@ async function queueDirectMessage(
     : `No ${kind} exists with exactly ${users.join(", ")}.`);
   if (existing) return queueChatMessage(ctx, existing.spaceName, body, { recipients: existing.ids });
 
-  const emails = users.map(user => user.slice("users/".length));
-  const unnamed = emails.find(email => !email.includes("@"));
-  if (unnamed !== undefined) {
-    throw new Error(`To start a new conversation, name each person by email address, which ${unnamed} ` +
-      "is not. searchPeople() finds them.");
-  }
-  const members: ChatPerson[] = [];
+  const members: ChatNewConversation["members"] = users
+    .filter(user => !user.includes("@"))
+    .map(id => ({ id }));
+  const emails = users.filter(user => user.includes("@")).map(user => user.slice("users/".length));
   const outside: string[] = [];
   // One at a time: up to 49 concurrent lookups would burst the People API's per-user quota.
   for (const email of emails) {
@@ -732,12 +759,17 @@ async function queueDirectMessage(
     if (!person) outside.push(email);
     else if (!members.some(member => member.id === person.id)) members.push(person);
   }
-  await observe(ctx, "Look up people in the Google Workspace directory",
-    `Checked whether ${emails.length} email address(es) belong to people in the organization's ` +
-    `directory; ${outside.length} did not.`);
+  if (emails.length > 0) {
+    await observe(ctx, "Look up people in the Google Workspace directory",
+      `Checked whether ${emails.length} email address(es) belong to people in the organization's ` +
+      `directory; ${outside.length} did not.`);
+  }
   if (outside.length > 0) {
     throw new Error(`${outside.join(", ")} ${outside.length === 1 ? "is" : "are"} not in your organization's ` +
       "directory, and new Google Chat conversations can only include people who are.");
+  }
+  if (members.length !== users.length) {
+    throw new Error("Name each person once, using either their email address or users/{id}, not both.");
   }
   if (members.some(member => member.id === ctx.self.id)) throw new Error(LEAVE_YOURSELF_OUT);
 
@@ -758,7 +790,7 @@ async function queueDirectMessage(
     ...buildDescription(
       `Create a ${one ? "direct message" : "group chat"} between ${userLabel(ctx.self)} and ` +
       `${one ? "this person" : `these ${members.length} people`}, and post this message in it.`)
-      .list("People", members.map(member => member.name ? `${member.name} <${member.email}>` : member.email))
+      .list("People", members.map(personLabel))
       .verbatim("Message", body)
       .finish(),
     implementsRevert: true,
@@ -792,7 +824,7 @@ async function openConversation(
   if (found) return found.spaceName;
   const spaceName = await store.attemptWrite(actionId,
     () => api.setupConversation(ids, store.setupRequestWith(people, requestId)));
-  // An empty conversation shows nobody anything, so the send stays rejectable until it posts.
+  // An empty conversation shows nobody anything, so a retry has nothing to look for until it posts.
   store.clearAttempt(actionId);
   // Google leaves out of a group chat anyone who blocks the caller, and a replayed setup returns the
   // group as it is now, so posting could reach other people than were approved.
@@ -816,7 +848,7 @@ async function hasExactly(api: ChatApi, spaceName: string, ids: readonly string[
 /** The name a send to exactly some people gives its message, so that a retry can find it. */
 const clientMessageId = (action: ChatSendMessageAction) => `client-${action.requestId}`;
 
-/** Once its target is deleted, nothing an earlier attempt wrote remains, so the action may be rejected. */
+/** Once its target is deleted, nothing an earlier attempt wrote remains for a retry to find. */
 function deletedTarget(store: ChatStore, actionId: number, cause: unknown): Error {
   store.clearAttempt(actionId);
   return new Error("This message was deleted in Google Chat, so this change can no longer be applied. " +
@@ -1191,12 +1223,12 @@ class ChatMessageImpl extends ChatRpcTarget implements ChatMessage {
     }
     await submitChatAction(this.ctx, {
       type: "updateMessage", messageName: current.id, spaceName: current.spaceId,
-      previousText: current.text, text: body, submittedAt: Date.now(),
+      previousText: current.formattedText, text: body, submittedAt: Date.now(),
     }, {
       title: `Edit a Google Chat message in ${current.spaceId}`,
       ...buildDescription(
         `Replace the text of message ${current.id}, sent by ${userLabel(current.sender)}.`)
-        .verbatim("Current", current.text)
+        .verbatim("Current", current.formattedText)
         .verbatim("New", body)
         .finish(),
       implementsRevert: true,
@@ -1536,7 +1568,7 @@ export class GoogleChatGatekeeperImpl
     queue: SharedApprovalQueue, self: ChatUser, spaceName: string, threadName: string | undefined,
     hook: RpcStub<ChatMessageHookTarget>,
   ): Promise<void> {
-    if (!pushHooksConfigured(this.env)) {
+    if (!chatHooksConfigured(this.env)) {
       throw new Error("Google Chat hooks are not configured on this deployment.");
     }
     const params: ChatHookParams = { spaceName, ...(threadName !== undefined ? { threadName } : {}) };
@@ -1611,7 +1643,8 @@ export class GoogleChatGatekeeperImpl
     // A retry may follow a post that landed, so it leaves the attempt mark as it is.
     if (!await hasExactly(api, spaceName, recipients)) {
       throw new Error("This Google Chat conversation no longer holds exactly the people this message is for, " +
-        `so this attempt posted nothing.${retried ? "" : " Reject this message."}`);
+        `so this attempt posted nothing.${retried ? " An earlier attempt may already have posted it." : ""} ` +
+        "Deny this message to clear it.");
     }
     return { spaceName };
   }
@@ -1683,7 +1716,7 @@ export class GoogleChatGatekeeperImpl
           throw error;
         }
         store.setSentMessage(actionId, created);
-        store.rebaseEdits(spaceName, created.id, action.text, created.text);
+        store.rebaseEdits(spaceName, created.id, action.text, created.formattedText);
         return { type: "sentMessage", messageName: created.id };
       }
       case "updateMessage": {
@@ -1693,7 +1726,7 @@ export class GoogleChatGatekeeperImpl
           other.type === "updateMessage" && other.messageName === target.committed);
         const current = await readTarget(target.committed);
         requireMessageInScope(scope, current);
-        let text = current.text;
+        let text = current.formattedText;
         if (text === action.text && !retried) return { type: "none" };
         if (text !== action.text) {
           // A retry can't tell Chat's rendering of its own lost write from an outside edit.
@@ -1740,14 +1773,10 @@ export class GoogleChatGatekeeperImpl
     if (this.#inFlight.has(actionId)) {
       throw new Error("This Google Chat action is being applied and can no longer be rejected.");
     }
-    if (store.wasAttempted(actionId)) {
-      throw new Error(
-        "This Google Chat action may already have reached Google. Apply it again to finish it, " +
-        "then undo it if it isn't wanted.");
-    }
     // Later actions in the same conversation were written against a simulation that included
     // this one, so the gadget has to start again.
     const restart = store.listForSpace(chatActionSpaceName(action)).some(entry => entry.id > actionId);
+    if (action.type === "sendMessage" && store.wasAttempted(actionId)) store.markWithdrawnAttempt(actionId);
     store.remove(actionId);
     return restart ? { restart } : undefined;
   }

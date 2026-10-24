@@ -11,6 +11,7 @@
 import { DurableObject, RpcStub } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import {
+  type ActionKind,
   type ApprovalQueue,
   type Cursor,
   type Gatekeeper,
@@ -18,10 +19,12 @@ import {
   type GitCache,
   type GitOid,
   type GitPullHints,
+  type GitPullTransfer,
   type ResourceDescription,
   stripTrailingSlashes,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { ArrayCursor } from "@gadgets/gatekeeper-kit/cursors";
+import { startGitPull } from "@gadgets/gatekeeper-kit/git-pull-transfer";
 import {
   MAX_DIFF_BLOB_BYTES,
   changedPathsBetweenTrees,
@@ -36,7 +39,6 @@ import {
   GitRefUpdateRejectedError,
   ZERO_OID,
   emptyPackBytes,
-  pullGitObjectsIntoCache,
   pushGitRefUpdate,
   simulateBranchHead,
 } from "@gadgets/gatekeeper-kit/git-transport";
@@ -56,6 +58,8 @@ import {
 } from "./gitlab-api";
 import {
   apiKind,
+  autoApprovableKinds,
+  autoApprovalOf,
   escapeQuickActions,
   referenceBearingTexts,
   replaceProvisionalReferences,
@@ -1258,8 +1262,8 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
     return TYPES_CODE;
   }
 
-  async getAutoApprovableActions() {
-    return [];
+  async getAutoApprovableActions(): Promise<ActionKind[]> {
+    return autoApprovableKinds(this.#props().resourceKind);
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<GitLabProject | GitLabIssue | GitLabMergeRequest> {
@@ -1723,7 +1727,8 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
 
   /**
    * Cascade for a rejected push: retire the queued actions stranded on a head that will now never
-   * be reached, then those the missing-branch check dooms (`#rejectMergeRequestsForMissingBranches`).
+   * be reached, then those the missing-branch check dooms (`#rejectMergeRequestsForMissingBranches`,
+   * skipped when GitLab cannot be read, so a dead connection never blocks the rejection).
    * A head is stranded when the push that would leave it is retired, no other queued push to the
    * branch would leave it too, and the branch is not there already (pushed by other means, the
    * head needs no push, and what is bound to it can still apply; a branch that cannot be read
@@ -1757,7 +1762,13 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
         }
       }
     }
-    return await this.#rejectMergeRequestsForMissingBranches() || cascaded;
+    const doomed = await this.#rejectMergeRequestsForMissingBranches().catch(error => {
+      logger.warn("failed to read the branches a rejected push's merge requests name", {
+        event: "push.reject.branches.read.failed", error,
+      });
+      return false;
+    });
+    return doomed || cascaded;
   }
 
   /**
@@ -1834,8 +1845,11 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
   ): Promise<void> {
     this.#stageAction(action);
     try {
-      // The text comes from the staged payload, not the caller, so it always shows what applies.
-      await approvalQueue.submitAction(action.approvalId, { ...presentation, ...describeGitLabAction(action) });
+      // The text and the auto-approval verdict come from the staged payload, not the caller, so
+      // they always describe what applies.
+      await approvalQueue.submitAction(action.approvalId, {
+        ...presentation, ...describeGitLabAction(action), ...autoApprovalOf(action),
+      });
     } catch (error) {
       this.ctx.storage.kv.delete(this.#actionRecordKey(action.approvalId));
       this.#pendingActionsCache = undefined;
@@ -2526,9 +2540,11 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
     }
 
     if (action.type === "postReview") {
-      // Before the record is retired: a cleanup that fails leaves the action pending, so the
-      // discard can be retried rather than stranding an approval or parked drafts.
-      await this.#discardReviewLeftovers(record, action);
+      // Before the record is retired, whose progress the cleanup still saves. A cleanup GitLab
+      // refuses leaves the approval or parked drafts behind rather than the action pending.
+      await this.#discardReviewLeftovers(record, action).catch(error => {
+        logger.warn("failed to discard a rejected review's leftovers", { event: "review.reject.cleanup.failed", error });
+      });
     }
 
     this.#markActionRejected(action);
@@ -2651,21 +2667,13 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
   // -- git: pull, push, and the simulation of queued pushes -------------------------------
 
   /**
-   * `Gatekeeper.gitPull()`: fetch the requested objects from this project over git smart-HTTP
-   * (protocol v2) and deposit them in the workspace git cache. The gatekeeper contributes only
-   * protocol framing -- the kit's transport composes the fetch command from the hints and strips
-   * the response down to the raw pack body, which streams into `cache.consumePack()` for
-   * overseer-side decoding, hash verification, and storage -- and retains nothing locally.
-   *
-   * No observation is recorded: a pull is overseer-initiated population of the workspace cache
-   * with objects whose commit ids were already returned (and advertised) by observed session
-   * reads, not a new agent-visible read; observer access to the git data rides the same
-   * project-level ACL as everything else here (strategy B).
+   * Stream a self-contained raw pack through this resource's authenticated transport.
+   * No new observation: the kernel only requests objects from previously observed commits.
+   * Cache ingestion and native checkout share this path; credentials never enter the guest.
    */
-  async gitPull(oids: GitOid[], cache: RpcStub<GitCache>, hints: GitPullHints): Promise<void> {
-    const projectPath = this.#projectPath();
-    await this.#withApi(api => pullGitObjectsIntoCache(
-      body => api.fetchGitUploadPack(projectPath, body), oids, hints, cache));
+  async gitPull(oids: GitOid[], options: GitPullHints): Promise<GitPullTransfer> {
+    return this.#withApi(api => startGitPull(
+      body => api.fetchGitUploadPack(this.#projectPath(), body), oids, options));
   }
 
   /**

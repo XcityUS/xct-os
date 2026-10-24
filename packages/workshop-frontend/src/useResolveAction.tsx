@@ -5,6 +5,7 @@ import type {
   ActionLogEntry, ActionState, CreationApproval, Overseer,
 } from '@gadgets/workshop-shared/api'
 import { CreationAccountModal } from './components/CreationAccountModal'
+import { rpcFailureDescription } from './rpcErrors'
 
 type ActionDecision = 'approve' | 'deny'
 
@@ -47,7 +48,9 @@ export function useResolveAction(
       onResolvedRef.current?.(actionId, decision === 'approve' ? 'approved' : 'rejected')
     } catch (error) {
       console.error(`Failed to ${decision} action:`, error)
-      const detail = errorDetail(error)
+      // Upstream's rpcFailureDescription drops transient connection errors; errorDetail then
+      // keeps only a readable first line of what remains.
+      const detail = errorDetail(rpcFailureDescription(error))
       toasts.add({
         title: `Failed to ${decision} action`,
         ...(detail ? { description: detail } : {}),

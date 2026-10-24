@@ -21,6 +21,7 @@ function clamp(value: number, min: number, max: number): number {
 
 class ResourceConfiguratorHostImpl extends RpcTarget implements ResourceConfiguratorHost {
   readonly #gatekeeper: RpcStub<RpcTarget>
+  #ensuringResources = false
 
   constructor(
     configurator: any,
@@ -28,6 +29,8 @@ class ResourceConfiguratorHostImpl extends RpcTarget implements ResourceConfigur
     private readonly onSelectionReady: (ready: boolean) => void,
     private readonly onScroll: (deltaX: number, deltaY: number) => void,
     private readonly getInitialResourceImpl: () => { resourceUrl: string; resourceUrlPattern: string } | null,
+    private readonly getEnsureResources: () => ((resourceUrlPatterns: string[]) => Promise<boolean>) | undefined,
+    private readonly getAcceptedResourceUrlPatternsImpl: () => readonly string[],
   ) {
     super()
     // The configurator form is short-lived, so a burst past the per-minute cap is always a bug:
@@ -49,6 +52,10 @@ class ResourceConfiguratorHostImpl extends RpcTarget implements ResourceConfigur
     return this.getInitialResourceImpl()
   }
 
+  async getAcceptedResourceUrlPatterns(): Promise<string[]> {
+    return [...this.getAcceptedResourceUrlPatternsImpl()]
+  }
+
   resize(height: number, layoutHeight: number): void {
     this.onResize(height, layoutHeight)
   }
@@ -60,6 +67,19 @@ class ResourceConfiguratorHostImpl extends RpcTarget implements ResourceConfigur
   forwardScroll(deltaX: number, deltaY: number): void {
     this.onScroll(deltaX, deltaY)
   }
+
+  // One request at a time: each may open a consent pop-up, and a second would replace the first's.
+  async ensureResources(resourceUrlPatterns: string[]): Promise<boolean> {
+    const ensureResources = this.getEnsureResources()
+    if (!ensureResources) throw new Error('This configurator cannot request access here.')
+    if (this.#ensuringResources) throw new Error('An access request is already in progress.')
+    this.#ensuringResources = true
+    try {
+      return await ensureResources(resourceUrlPatterns)
+    } finally {
+      this.#ensuringResources = false
+    }
+  }
 }
 
 export default function SandboxedResourceConfigurator({
@@ -67,13 +87,20 @@ export default function SandboxedResourceConfigurator({
   topOffset = 0,
   onCollectResourceUrlChange,
   onSelectionReadyChange,
+  onEnsureResources,
   initialResourceUrl,
   resourceUrlPattern,
+  acceptedResourceUrlPatterns,
 }: {
   frame: ResourceConfiguratorFrame,
   topOffset?: number,
   onCollectResourceUrlChange?: (collect: (() => Promise<string>) | null) => void,
   onSelectionReadyChange?: (ready: boolean | null) => void,
+  /**
+   * Serves the configurator's `ensureResources` requests for the account it was started on. Absent,
+   * those requests are refused.
+   */
+  onEnsureResources?: (resourceUrlPatterns: string[]) => Promise<boolean>,
   /**
    * When set, the configurator opens pre-filled to this concrete resource URL (e.g. supplied by an
    * AI agent's connection request). `resourceUrlPattern` is this resource's pattern, used by the
@@ -81,6 +108,8 @@ export default function SandboxedResourceConfigurator({
    */
   initialResourceUrl?: string,
   resourceUrlPattern?: string,
+  /** The resource types the caller will accept a URL of (see `getAcceptedResourceUrlPatterns`). */
+  acceptedResourceUrlPatterns: readonly string[],
 }) {
   const { resolvedThemeMode } = useTheme()
   const placeholderRef = useRef<HTMLDivElement>(null)
@@ -106,11 +135,15 @@ export default function SandboxedResourceConfigurator({
   const topOffsetRef = useRef(topOffset)
   topOffsetRef.current = topOffset
   configuratorRef.current = frame.ui
+  const onEnsureResourcesRef = useRef(onEnsureResources)
+  onEnsureResourcesRef.current = onEnsureResources
   // Resource to pre-fill the configurator with, read lazily when the iframe connects.
   const initialResourceRef = useRef<{ resourceUrl: string; resourceUrlPattern: string } | null>(null)
   initialResourceRef.current = (initialResourceUrl && resourceUrlPattern)
     ? { resourceUrl: initialResourceUrl, resourceUrlPattern }
     : null
+  const acceptedResourceUrlPatternsRef = useRef(acceptedResourceUrlPatterns)
+  acceptedResourceUrlPatternsRef.current = acceptedResourceUrlPatterns
 
   // Cached scroll ancestor of the placeholder. We rediscover it lazily because the modal DOM is
   // stable for the lifetime of the configurator, so walking up via getComputedStyle on every event is
@@ -226,6 +259,8 @@ export default function SandboxedResourceConfigurator({
         clamp(Number(deltaY) || 0, -SCROLL_FORWARD_MAX_DELTA, SCROLL_FORWARD_MAX_DELTA),
       ),
       () => initialResourceRef.current,
+      () => onEnsureResourcesRef.current,
+      () => acceptedResourceUrlPatternsRef.current,
     ))
     rpcSessionRef.current = iframe
     iframeRpcRef.current?.[Symbol.dispose]?.()

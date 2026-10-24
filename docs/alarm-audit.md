@@ -19,7 +19,7 @@ How Cloudflare handles a failed alarm:
 
 Audited at `origin/main` 2026-10-08 with
 `git grep -n "setAlarm\|getAlarm\|deleteAlarm\|async alarm(\|alarm()" -- packages`. The search
-found 21 `alarm()` handlers in 19 files (19 / 17 at first audit; the 2026-10 upstream syncs added `gatekeeper-gitlab` and google `ChatHookDriver`). The 2026-10c sync added three more (24 in all): `gatekeeper-x`'s connect timeout, github `GitHubHookDriver` and google `GmailHookDriver`, listed below without line numbers. Generated `worker-configuration.d.ts` typings, tests and
+found 21 `alarm()` handlers in 19 files (19 / 17 at first audit; the 2026-10 upstream syncs added `gatekeeper-gitlab` and google `ChatHookDriver`). The 2026-10c sync added three more (24 in all): `gatekeeper-x`'s connect timeout, github `GitHubHookDriver` and google `GmailHookDriver`, listed below without line numbers. The 2026-10d sync added one (25 in all): gatekeeper-context `ContextCollectionDurableObject` (git-token revocation and memberless-deletion retries, C1 below), and changed the overseer's (durable decision resume, platform `retryCount`). Generated `worker-configuration.d.ts` typings, tests and
 comments were excluded. Line numbers are from that commit.
 
 Verdicts:
@@ -35,8 +35,8 @@ Verdicts:
 |---|---|---|
 | BUG | 2 | S1 scheduler poison row, O1 overseer undeliverable external response |
 | NEEDS-BACKOFF | 2 | S2 scheduler admission re-lease, O2 overseer pending-call drain (low; documented, not changed) |
-| NEEDS-CIRCUIT-BREAKER | 1 | S3 scheduler handler failing permanently |
-| SAFE | 22 handlers | the 14 vendor connect timeouts (incl. gitlab, x), google ChatHookDriver and GmailHookDriver, github GitHubHookDriver, xcity ×2 (connect timeout, media poll), mcp-shared, PendingLogin, UserDurableObject handoff sweep |
+| NEEDS-CIRCUIT-BREAKER | 2 | S3 scheduler handler failing permanently, C1 context collection retries (fixed in the 2026-10d sync) |
+| SAFE | 23 handlers | the 14 vendor connect timeouts (incl. gitlab, x), google ChatHookDriver and GmailHookDriver, github GitHubHookDriver, xcity ×2 (connect timeout, media poll), mcp-shared, PendingLogin, UserDurableObject handoff sweep |
 
 ## Table
 
@@ -104,8 +104,44 @@ all schedule rows: `nextFire`, `nextAttempt` or `leaseExpiresAt`.
 
 | Site | Armed by / does | If it throws | Re-arm unconditional? | Depends on self-advanced state? | Worst-case rate / ops per run | Verdict |
 |---|---|---|---|---|---|---|
-| `:9957` `alarm()` → `runAlarmTasks` `:1875` | waits for running agents, drains pending agent calls, delivers ready external-message responses; the `finally` calls `#updateAlarm` | the delivery failure is rethrown **after** `finally` has already re-armed | see O1 | see O1/O2 | see O1/O2 | **O1 BUG / O2 NEEDS-BACKOFF** |
+| `:9957` `alarm()` → `runAlarmTasks` `:1875` | resumes interrupted / decision-paused agent turns (`#resumeInterruptedAgents`, 2026-10d), waits for running agents, drains pending agent calls, delivers ready external-message responses; the `finally` calls `#updateAlarm` (since 2026-10d only on success or once `retryCount` reaches `ALARM_MAX_RETRIES`) | the delivery failure is rethrown **after** `finally` has already re-armed | see O1 | see O1/O2 | see O1/O2 | **O1 BUG / O2 NEEDS-BACKOFF** |
 | `:1830` `#updateAlarm` (`:1859`, `:1861`) | only writer; earliest of keep-alive (+60 s), **`Date.now()` if any `ready` external response exists**, delivered-record sweep (+24 h); called from 9 sites (RPC paths, `waitUntil`) | n/a | **yes: `Date.now()` while any ready record exists** | **yes**: the ready record should become `delivered`, which never happens if the target keeps failing | see O1 | BUG (O1) |
+
+### Context collection (`gatekeeper-context/src/context-collection.ts`, `ContextCollectionDurableObject`)
+
+Added by the 2026-10d upstream sync (#744, collection sharing). One alarm per collection, armed for
+two kinds of durable cleanup: revoking git write tokens whose issuer lost write access, and
+finishing a memberless or explicit deletion whose external calls (registry, libraries, Artifacts
+repo delete) failed.
+
+| Site | Armed by / does | If it throws | Re-arm unconditional? | Depends on self-advanced state? | Worst-case rate / ops per run | Verdict |
+|---|---|---|---|---|---|---|
+| `:608` `alarm()` | under the access-change lock: `#deleteSelf` if `deletionPending`, else revoke unauthorized tokens, delete if memberless, `deleteAlarm` when nothing is left | upstream: rethrown (a failed deletion) | see C1 | see C1 | see C1 | **C1 NEEDS-CIRCUIT-BREAKER** (fixed) |
+| `:512` `#armAccessCleanup` | `now + 5 min` watchdog if no alarm is set, before an access change or revocation touches Artifacts | n/a | no | no | 1 per access change | SAFE |
+| `:587` revocation retry | `now + min(5 min · 2^attempts, 24 h)` after a failed revocation; `gitTokenRevokeAttempts` counts, reset on success | caught | yes, but backed off | yes: the token stays until Artifacts accepts the revoke | ≤1/day per collection once backed off, upstream **forever** | C1 |
+| `:1315` `#deleteSelf` | `now + 5 min` (unless an earlier alarm is set) before any external call | rethrown | yes, fixed 5 min | yes: deletion is retried until the external calls succeed | upstream: 12/h **forever** plus platform retries | C1 |
+
+### C1: context collection retries forever (NEEDS-CIRCUIT-BREAKER, fixed)
+
+Scenario: the Artifacts binding (or a library/registry DO) fails permanently for one collection.
+A pending deletion re-arms itself every 5 minutes for ever (each run also gets the platform's ≤6
+retries, since upstream rethrows), and a failed revocation re-arms on a backoff that caps at one
+day but never ends. The cost is small per collection (a few reads and one outbound call per run),
+but it has no end and no kill switch.
+
+**Fix (Xcity):**
+
+- `alarm()` runs under `guardedAlarm` (key `context-collection`, `maxPerHour: 60`,
+  `deferWhenOpen: true`, backoff 5 min → 24 h, `maxConsecutiveFailures: 12`). That adds the
+  kill switch and an hourly cap, and turns a failed deletion into a bounded retry: about four days
+  of backoff, then `alarm.gave_up`. Any later access change re-arms it.
+- Revocation failures are caught (they do not reach the guard), so they get their own bound:
+  after `GIT_TOKEN_REVOKE_MAX_ATTEMPTS` (16, about nine days of backoff) the alarm stops
+  re-arming for them and logs `artifacts.issuer.token.revoke.gave_up`. The issuer records are kept,
+  so the next access change to the collection tries once more, and a success resets the count.
+- Tests (`collection-sharing.test.ts`): "stops retrying a failed revocation from the alarm after its
+  attempts run out" is new; "retains cleanup state through an Artifacts outage" now expects the
+  guarded alarm to resolve, keep its tokens and stay armed, instead of rethrowing.
 
 ## Findings (non-SAFE)
 
@@ -212,9 +248,10 @@ Only the non-SAFE sites were changed. Every handler gained the kill switch.
 
 | Site | Change |
 |---|---|
-| All 24 `alarm()` handlers | The first statement is the `ALARMS_DISABLED` check: `haltIfAlarmsDisabled`, or `guardedAlarm`'s `disabled` option. |
+| All 25 `alarm()` handlers | The first statement is the `ALARMS_DISABLED` check: `haltIfAlarmsDisabled`, or `guardedAlarm`'s `disabled` option. |
 | Scheduler `alarm()` | Runs under `guardedAlarm` (`scheduler`, 3600/h, defer when open). Unexpected per-row failures quarantine the row as `dead` (`quarantineRun`). |
-| Overseer `alarm()` | Runs under `guardedAlarm` (`overseer`, 1200/h, defer when open). Ready external responses are abandoned after 8 failed deliveries. |
+| Overseer `alarm()` | Runs under `guardedAlarm` (`overseer`, 1200/h, defer when open). Ready external responses are abandoned after 8 failed deliveries. 2026-10d: upstream's `alarm(info)` passes `info.retryCount` through the guard; since the guard catches a failure, `retryCount` is only non-zero after the runtime kills a run. Agent resumption is bounded by the persisted `resumeAttempts` (`AGENT_RESUME_MAX_ATTEMPTS` = 4). |
+| Context collection `alarm()` | Runs under `guardedAlarm` (`context-collection`, 60/h, defer when open, 5 min → 24 h backoff, gives up after 12). Revocation retries stop after 16 attempts (2026-10d). |
 | The 15 connect-timeout handlers, google `ChatHookDriver` and `GmailHookDriver`, github `GitHubHookDriver`, xcity media poll, mcp-shared, `PendingLogin`, `UserDurableObject` | Kill switch only. Their behaviour is otherwise unchanged. |
 
 The helper is `@gadgets/observability/alarm-guard`, re-exported as
@@ -270,7 +307,7 @@ Behaviour changes, all on failure paths only:
   `alarm.disabled`. Remove the var and redeploy to resume. Alarms then come back as RPCs re-arm
   them: an `enable`, a new connect flow, or agent activity.
 - **Logs:** in Workers Logs, search for `event` = `alarm.circuit.open` (a runaway was capped),
-  `alarm.gave_up` (8 consecutive failures), `alarm.failed`, `schedule.quarantined` and
+  `alarm.gave_up` (8 consecutive failures; 12 for `context-collection`), `alarm.failed`, `schedule.quarantined`, `artifacts.issuer.token.revoke.gave_up` and
   `external.message.response.delivery.abandoned`. Each line carries `alarmKey` and the counts.
 - **Usage:** open Workers & Pages → the Worker → Durable Objects → Metrics. The SQLite storage
   graphs show rows read and rows written per namespace. A loop looks like a flat, high plateau

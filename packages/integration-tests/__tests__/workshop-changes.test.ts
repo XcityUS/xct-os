@@ -489,9 +489,12 @@ it.concurrent("deleting a chat drops its provisional gadget, binding claim and a
     if (data === null) throw new Error("The test connection was not created");
     const dataId = await data.getId();
     using app = await ws.createGadget("App", undefined, "APP");
-    const upload = await ws.uploadChatAttachment(
-        { mimeType: "text/plain", content: new TextEncoder().encode("chat A notes"), name: "notes.txt" }, null);
+    const upload = {oid: await ws.uploadBlob(new TextEncoder().encode("chat A notes")),
+      mimeType: "text/plain", name: "notes.txt"};
     const chatA = await ws.newChat("A", null, undefined, [upload]);
+    const message = (await ws.getChatHistory(chatA)).messages.find(m => m.type === "message");
+    if (message?.type !== "message" || !message.attachments?.length) throw new Error("Missing attachment");
+    const attachmentId = message.attachments[0].id;
     const chatB = await ws.newChat("B", null);
     using draft = await ws.createGadget("Draft", chatA, "DRAFT");
     const draftId = await draft.getId();
@@ -501,13 +504,13 @@ it.concurrent("deleting a chat drops its provisional gadget, binding claim and a
         .rejects.toThrow('The gadget name "DRAFT" is claimed by a gadget still pending in another chat');
     await expect(app.bind("DATA", dataId, chatB))
         .rejects.toThrow('The binding name "DATA" is already proposed by another chat.');
-    expect(new TextDecoder().decode(await ws.getChatAttachmentContent(chatA, upload.id))).toBe("chat A notes");
+    expect(new TextDecoder().decode(await ws.getChatAttachmentContent(chatA, attachmentId))).toBe("chat A notes");
 
     await ws.deleteChat(chatA);
 
     await waitFor("the provisional gadget's removal", async () =>
       workpieces.summaries.has(draftId) ? null : true);
-    await expect(ws.getChatAttachmentContent(chatA, upload.id)).rejects.toThrow("Chat attachment not found.");
+    await expect(ws.getChatAttachmentContent(chatA, attachmentId)).rejects.toThrow("Chat attachment not found.");
     using _replacement = await ws.createGadget("Draft", chatB, "DRAFT");
     await app.bind("DATA", dataId, chatB);
     expect(await app.listBindings(chatB))
@@ -745,7 +748,7 @@ it.concurrent("agent code runs the gadget edits made in earlier steps of its tur
   } });
   const run = (id: string): ChatCompletionStep => ({ toolCall: {
     id, name: "executeCode",
-    arguments: { code: "export default async function(self, env) { return await env.APP.version(); }" },
+    arguments: { code: "export default async function(self, env) { return await env.APP.rpc.version(); }" },
   } });
   const model = models.script([
     toolCall("createGadget", { title: "App", bindingName: "APP" }),
@@ -760,4 +763,36 @@ it.concurrent("agent code runs the gadget edits made in earlier steps of its tur
   expect(history.flatMap(message => message.type === "message" ? message.toolCalls ?? [] : [])
       .flatMap(call => call.toolName === "executeCode" ? [call.output] : []))
       .toEqual([expect.stringContaining("v1"), expect.stringContaining("v2")]);
+});
+
+it.concurrent("agent code exports a gadget it is building through its binding's exports", async () => {
+  // The export reads the gadget's server, so its content proves which code ran: the draft this
+  // turn wrote, not mainline (where the gadget doesn't exist yet).
+  const exportingServer = `import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";\n` +
+      `export class Gadget extends DurableObject {\n  rows() { return "a,b\\n1,2\\n"; }\n}\n` +
+      `export class ExportHandler extends WorkerEntrypoint {\n` +
+      `  async getExportFormats(_gadget) {\n` +
+      `    return [{ id: "csv", label: "CSV", mode: "server", contentType: "text/csv", fileExtension: ".csv" }];\n` +
+      `  }\n` +
+      `  async export(gadget, _id) { return new Response(await gadget.rows()).body; }\n` +
+      `}\n`;
+  const model = models.script([
+    toolCall("createGadget", { title: "App", bindingName: "APP" }),
+    toolCall("writeFile", { workpiece: "APP", filename: "server.js", content: exportingServer }),
+    toolCall("executeCode", { code: `export default async function(self, env) {
+  let formats = await env.APP.exports.getFormats();
+  console.log("formats:", formats.map(format => format.id).join(","));
+  console.log("csv:", JSON.stringify(await new Response(await env.APP.exports.export("csv")).text()));
+}` }),
+    { text: "Done." },
+  ]);
+  await using session = await openAgentSession(harness.url, {
+    modelId: SCRIPTED_MODEL_ID, userModel: model.userModel,
+  });
+  const { outcome, history } = await session.runTurn("Build an app and export it as CSV.");
+  expect(outcome).toEqual({ status: "completed" });
+  const [output] = history.flatMap(message => message.type === "message" ? message.toolCalls ?? [] : [])
+      .flatMap(call => call.toolName === "executeCode" ? [call.output] : []);
+  expect(output).toContain("formats: csv");
+  expect(output).toContain(`csv: "a,b\\n1,2\\n"`);
 });

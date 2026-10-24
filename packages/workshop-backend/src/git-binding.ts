@@ -16,7 +16,7 @@ import { RpcTarget } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import type { CommitMetadata, CommitSignature, Git, Worktree } from "./worktree-binding";
 import type { AiChatAuthorInfo } from "@gadgets/workshop-shared/api";
-import { applyCodeChange, type FileChange } from "@gadgets/workshop-shared/code-change";
+import { applyCodeChange, type FileChange, type FileContent } from "@gadgets/workshop-shared/code-change";
 import type { CommitObject } from "isomorphic-git";
 
 import type { WorkspaceGitCache } from "./git-cache";
@@ -46,7 +46,7 @@ const IN_MEMORY_WORKTREE_ID = 0;
  */
 class InMemoryWorktree implements WorktreeTurnAccess, WorktreeSessionHost {
   #head: string;
-  #files = new Map<string, string>();  // replaced, never mutated
+  #files = new Map<string, FileContent>();  // replaced, never mutated
   #removed = new Set<string>();  // likewise
 
   constructor(readonly gitCache: WorkspaceGitCache, readonly gitStore: GitStore,
@@ -71,7 +71,7 @@ class InMemoryWorktree implements WorktreeTurnAccess, WorktreeSessionHost {
     return undefined;
   }
 
-  getOverlayFiles(): ReadonlyMap<string, string> {
+  getOverlayFiles(): ReadonlyMap<string, FileContent> {
     return this.#files;
   }
 
@@ -80,13 +80,15 @@ class InMemoryWorktree implements WorktreeTurnAccess, WorktreeSessionHost {
   }
 
   async readFile(_worktreeId: unknown, path: string): Promise<string | undefined> {
+    const textOf = (value: FileContent) => typeof value === "string" ? value
+      : this.gitCache.readTextBlob(value.oid, undefined, path);
     let existing = this.#files.get(path);
-    if (existing !== undefined) return existing;
+    if (existing !== undefined) return textOf(existing);
     if (this.#removed.has(path)) return undefined;
     let text = await this.gitCache.readFileAtCommitIfExists(this.base, path);
     // A concurrent call may have written or deleted the file while the read was in flight;
     // its change wins over the base text.
-    if (this.#files.has(path)) return this.#files.get(path);
+    if (this.#files.has(path)) return textOf(this.#files.get(path)!);
     if (this.#removed.has(path) || text === undefined) return undefined;
     // Fault the base text into the overlay, so a following edit applies against it.
     this.#files = new Map(this.#files).set(path, text);

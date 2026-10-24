@@ -262,6 +262,16 @@ export function getXcityModelDescriptorMetadata(model: Model<Api>): XcityModelMe
   return (model as XcityModelLike).xcity;
 }
 
+/**
+ * Whether `model` is a TokenHub model without vision. Upstream inlines every image attachment and
+ * relies on pi to drop images for models whose `input` lacks "image", but a PDF-only TokenHub model
+ * declares "image" (PDFs ride image parts), so its real images must stay workspace-only.
+ */
+export function xcityModelRejectsImages(model: Model<Api>): boolean {
+  let metadata = getXcityModelDescriptorMetadata(model);
+  return metadata !== undefined && metadata.capabilities?.vision !== true;
+}
+
 export function attachXcityModelDescriptorMetadata<T extends Model<Api>>(
     model: T, config: AiModelConfig): T {
   let metadata = getXcityModelMetadata(config);

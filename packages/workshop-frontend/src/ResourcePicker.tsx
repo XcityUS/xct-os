@@ -1,14 +1,14 @@
 import { logRpcFailure } from './rpcErrors'
 import { useState, useEffect, useMemo, useCallback, type MutableRefObject } from 'react'
-import { Tooltip, useKumoToastManager } from '@cloudflare/kumo'
+import { useKumoToastManager } from '@cloudflare/kumo'
 import { Plus, CaretRight, Warning } from '@phosphor-icons/react'
 import { RpcStub } from 'capnweb'
 import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
 import { AccountDescription, SupportedResource, VendorDescription } from '@gadgets/workshop-shared/gatekeeper'
-import { extractHostname, extractBaseUrl, matchesResource, matchesResourceText, classifyMatch, getPlaceholderRanges } from './resourceMatching'
+import { extractHostname, extractBaseUrl, matchesResourceText, classifyMatch, completeUrl, getPlaceholderRanges } from './resourceMatching'
 import { GatekeeperIcon } from './components/GatekeeperIcon'
 import {
-  PICKER_CAPTION, PICKER_EMPTY, PICKER_ROW, PICKER_ROW_ACTIVE, TabHint,
+  PICKER_CAPTION, PICKER_EMPTY, PICKER_ROW, PICKER_ROW_ACTIVE, KeyHint,
 } from './components/pickerRows'
 import { AccountsSubscriberAdapter } from './accountsSubscriber'
 import { openConnectWindow } from './connectHandoff'
@@ -100,10 +100,12 @@ export default function ResourcePicker({
 }: ResourcePickerProps) {
   const toasts = useKumoToastManager()
 
-  const buildRefineUrl = useCallback((suffix: string, replaceSearch?: boolean) => {
-    const newUrl = replaceSearch ? suffix : searchText.trim() + suffix
-    return newUrl.replace(/\*$/, '')
-  }, [searchText])
+  // Fills in the suggested completion and selects its first placeholder, or else the end of the URL.
+  const refine = (suffix: string, replaceSearch?: boolean) => {
+    const newUrl = completeUrl(replaceSearch ? '' : searchText, suffix)
+    const [placeholder = { start: newUrl.length, end: newUrl.length }] = getPlaceholderRanges(newUrl)
+    onRefine?.(newUrl, placeholder.start, placeholder.end)
+  }
 
   const snapshot = sessionSnapshots.get(authenticatedApi)
   const [allAccounts, setAllAccounts] = useState<Map<number, AccountEntry>>(
@@ -187,14 +189,16 @@ export default function ResourcePicker({
 
   // --- Filtering and classification logic ---
 
-  const lowerSearch = searchText.toLowerCase().trim()
+  const trimmedSearch = searchText.trim()
+  const lowerSearch = trimmedSearch.toLowerCase()
 
   const allResourceItems = allVendors.flatMap(v =>
     v.supportedResources.map(r => ({ resource: r, vendor: v }))
   )
 
-  // Check if the search URL still contains placeholder tokens (:name or *).
-  const searchHasPlaceholders = lowerSearch ? getPlaceholderRanges(searchText.trim()).length > 0 : false
+  // The first placeholder (:name or *) still in the search URL, which blocks choosing an account.
+  const [firstPlaceholder] = getPlaceholderRanges(trimmedSearch)
+  const unfilledPlaceholder = firstPlaceholder && trimmedSearch.slice(firstPlaceholder.start, firstPlaceholder.end)
 
   type MatchedResource = {
     resource: SupportedResource
@@ -211,15 +215,13 @@ export default function ResourcePicker({
 
   if (lowerSearch) {
     for (const { resource, vendor } of allResourceItems) {
-      if (!matchesResource(searchText, resource)) continue
-      const cls = classifyMatch(searchText.trim(), resource.urlPattern)
+      const cls = classifyMatch(searchText, resource.urlPattern)
       if (cls.type === 'none') {
+        if (!matchesResourceText(searchText, resource)) continue
         // Text-only match (name/description matched but URL didn't). In URL-input
         // mode (onRefine), show as a prefix suggestion so selecting it fills in the
         // resource's base URL. Without onRefine, show normally.
         if (onRefine) {
-          // Only treat as prefix if it was actually a text match (not a false positive).
-          if (!matchesResourceText(searchText, resource)) continue
           const baseUrl = extractBaseUrl(resource.urlPattern)
           const suffix = baseUrl
             ? baseUrl.replace(/^https?:\/\//, '')
@@ -251,13 +253,14 @@ export default function ResourcePicker({
     }))
   }
 
-  // Sort: full matches first, prefix second, text-only (none) third.
-  // Within each group, sort by URL pattern so less-specific patterns (shorter paths)
-  // appear before more-specific ones, grouping related patterns logically.
+  // Sort: full matches first, prefix second, text-only (none) third. Full matches keep the order
+  // the gatekeeper declared, which lists its most specific pattern first (a GitLab MR before its
+  // project), as resolving a URL takes the first match. Other groups sort by URL pattern so
+  // less-specific patterns (shorter paths) appear before more-specific ones.
   const classOrder = { full: 0, prefix: 1, none: 2 }
   matchedResources.sort((a, b) =>
     classOrder[a.classification] - classOrder[b.classification]
-    || a.resource.urlPattern.localeCompare(b.resource.urlPattern)
+    || (a.classification === 'full' ? 0 : a.resource.urlPattern.localeCompare(b.resource.urlPattern))
   )
 
   // HTTP wildcard (`https://*`) shouldn't match when specific resources also match.
@@ -362,18 +365,10 @@ export default function ResourcePicker({
         const item = selectableItems[index]
         if (!item) return
         if (item.type === 'refine') {
-          if (onRefine) {
-            const newUrl = buildRefineUrl(item.suffix, item.replaceSearch)
-            const placeholders = getPlaceholderRanges(newUrl)
-            if (placeholders.length > 0) {
-              onRefine(newUrl, placeholders[0].start, placeholders[0].end)
-            } else {
-              onRefine(newUrl, newUrl.length, newUrl.length)
-            }
-          }
+          refine(item.suffix, item.replaceSearch)
         } else if (item.type === 'account') {
           // Don't allow account activation if the URL still has placeholders.
-          if (searchHasPlaceholders) return
+          if (unfilledPlaceholder) return
           const accountData = allAccounts.get(item.accountId)
           if (accountData && !accountData.credentialsValid) {
             handleReconnect(item.accountId)
@@ -471,15 +466,7 @@ export default function ResourcePicker({
               return (
                 <div
                   key={`${vendor.id}-${resource.urlPattern}`}
-                  onClick={() => {
-                    const newUrl = buildRefineUrl(suffix, replaceSearch)
-                    const placeholders = getPlaceholderRanges(newUrl)
-                    if (placeholders.length > 0) {
-                      onRefine(newUrl, placeholders[0].start, placeholders[0].end)
-                    } else {
-                      onRefine(newUrl, newUrl.length, newUrl.length)
-                    }
-                  }}
+                  onClick={() => refine(suffix, replaceSearch)}
                   className={`${PICKER_ROW} ${i > 0 ? 'border-t border-kumo-line' : ''} ${isActive ? PICKER_ROW_ACTIVE : ''}`}
                 >
                   {/* The name is what the row is for, so it gets the space it needs first, up to
@@ -498,7 +485,7 @@ export default function ResourcePicker({
                   >
                     {resource.urlPattern.replace(/^https?:\/\//, '')}
                   </span>
-                  {isActive && <TabHint />}
+                  {isActive && <KeyHint keyName="Tab" />}
                 </div>
               )
             }
@@ -540,10 +527,11 @@ export default function ResourcePicker({
                   const missingGrants = missingResourceGrants(account.description, resource)
                   const needsAccess = !isExpired && missingGrants.length > 0
                   const isGranting = grantingAccount === account.id
-                  const accountRow = (
+                  return (
                     <div
+                      key={account.id}
                       onClick={() => {
-                        if (searchHasPlaceholders) return
+                        if (unfilledPlaceholder) return
                         if (needsAccess) {
                           if (!isGranting) void handleGrantResourceAccess(account.id, missingGrants)
                         } else if (isExpired || isReconnecting) {
@@ -553,10 +541,10 @@ export default function ResourcePicker({
                         }
                       }}
                       className={`${PICKER_ROW} ${isActive ? PICKER_ROW_ACTIVE : ''} ${
-                        ((isExpired && !isReconnecting) || needsAccess || searchHasPlaceholders) ? 'opacity-70' : ''
+                        ((isExpired && !isReconnecting) || needsAccess || unfilledPlaceholder) ? 'opacity-70' : ''
                       }`}
                       style={{
-                        cursor: searchHasPlaceholders ? 'default' : (isReconnecting || isGranting) ? 'wait' : 'pointer',
+                        cursor: unfilledPlaceholder ? 'default' : (isReconnecting || isGranting) ? 'wait' : 'pointer',
                       }}
                     >
                       <GatekeeperIcon
@@ -576,7 +564,11 @@ export default function ResourcePicker({
                           </span>
                         )}
                       </span>
-                      {isReconnecting || isGranting ? (
+                      {unfilledPlaceholder ? (
+                        <span className="flex-shrink-0 text-[11.5px] leading-4 text-kumo-subtle">
+                          Fill in <span className="font-mono">{unfilledPlaceholder}</span> first
+                        </span>
+                      ) : isReconnecting || isGranting ? (
                         <div className="h-3 w-3 flex-shrink-0 animate-spin rounded-full border-2 border-kumo-brand border-t-transparent" />
                       ) : isExpired ? (
                         <span className="flex flex-shrink-0 items-center gap-1">
@@ -588,22 +580,13 @@ export default function ResourcePicker({
                           <Warning size={12} className="text-kumo-warning" />
                           <span className="text-[11.5px] leading-4 text-kumo-warning">Grant access</span>
                         </span>
-                      ) : isActive && !searchHasPlaceholders ? (
-                        <TabHint />
+                      ) : isActive ? (
+                        <KeyHint keyName="Tab" />
                       ) : (
                         <CaretRight size={12} className="flex-shrink-0 text-kumo-inactive" />
                       )}
                     </div>
                   )
-
-                  if (searchHasPlaceholders) {
-                    return (
-                      <Tooltip key={account.id} content="Replace all placeholders in the URL before selecting an account" asChild>
-                        {accountRow}
-                      </Tooltip>
-                    )
-                  }
-                  return <div key={account.id}>{accountRow}</div>
                 })}
 
                 {/* Connect new account */}
@@ -629,7 +612,7 @@ export default function ResourcePicker({
                     <span className="flex-1 text-[13px] leading-[18px] tracking-[-0.25px] text-kumo-subtle">
                       {connectingVendor === vendor.id ? 'Opening…' : 'Connect new account'}
                     </span>
-                    {isActive && <TabHint />}
+                    {isActive && <KeyHint keyName="Tab" />}
                   </div>
                   )
                 })()}

@@ -1077,8 +1077,9 @@ these actions — the kit does, so it is the only one that both strands dependen
 The one terminal failure that does **not** cascade is an orphaned claim: its stored answer says the
 effect is unknown, so "was not applied" cannot be asserted over its dependents — the argument that
 keeps `claimed` out of `listUndecided` below, which converting the claim makes no more decidable.
-They stay pending, fail at the provider if the effect never landed, and clear by rejection —
-exactly a corpus dependent whose creator never resolved.
+They stay pending while it is, failing their applies on the unresolved reference. Rejecting the
+claim withdraws it, and nothing can bind its reference after that, so the rejection strands the
+dependents whose references it never bound, as rejecting a pending action does.
 
 **A dependent is refused at submit once nothing can provide its reference.** The cascade scans
 submitted records, so a dependent submitted *after* its provider was rejected escaped it, and every
@@ -2277,8 +2278,9 @@ endpoint answers for a revoked grant. A 4xx without one, such as a WAF challenge
 
 ```ts
 export function buildGitFetchRequest(oids: GitOid[], hints: GitPullHints): Uint8Array;
-export function pullGitObjectsIntoCache(fetchUploadPack: (requestBody: Uint8Array) => Promise<Response>,
-  oids: GitOid[], hints: GitPullHints, cache: GitPackSink): Promise<void>;
+export function pullGitPack(fetchUploadPack: (requestBody: Uint8Array) => Promise<Response>,
+  oids: GitOid[], hints: GitPullHints,
+  onTerminal?: (status: GitPullStatus) => void): Promise<ReadableStream<Uint8Array>>;
 export function validateBranchName(branch: string): string;
 export function pushGitRefUpdate(
   fetchReceivePack: (requestBody: ReadableStream<Uint8Array>) => Promise<Response>,
@@ -2300,6 +2302,23 @@ partial-clone limits; other servers may accept more. `simulateBranchHead` overla
 queued ref updates on its real head by the same compare-and-swap rule, chain-following in any list
 order, so a simulated read and the next push's expected old sha agree; a push to `ZERO_OID`
 deletes, reading as `null`. Consumed by github and gitlab.
+
+The Workers-only `./git-pull-transfer` leaf wraps `pullGitPack` for the kernel-facing
+`Gatekeeper.gitPull(oids, options)` API:
+
+```ts
+export function startGitPull(fetchUploadPack: (requestBody: Uint8Array) => Promise<Response>,
+  oids: GitOid[], hints: GitPullHints): Promise<GitPullTransfer>;
+```
+
+`GitPullTransfer` exposes one-shot `stream()` and independent terminal `status()` so provider
+errors remain available if Workers RPC replaces a stream exception. Consumers must require
+`complete` after EOF, cancel unfinished streams, and dispose the capability. The provider does
+not parse packs, ingest cache objects, or impose the DO cache's size limit. The overseer routes
+pulls using recorded provenance, decodes the stream with its pack/object limits, and checks
+requested-object presence. The transport checks oid syntax, not advertisement history; the
+gatekeeper method is not gadget-facing. A separate kernel container-bootstrap consumer can use
+the stream directly with native Git and its own limits, but is not enabled by this helper alone.
 
 ### 4.21 `./git-diff`
 
@@ -3085,8 +3104,8 @@ Each step leaves the tree building; tests land with the module they cover. Nothi
    refused at the type level; `claimBeforeApply` plus a plain throw restores `pending` and a second apply
    reaches the provider; an `ActionApplyError` records the failure, answers every replay from the
    record with no provider call, and is cleared only by `reject`; a claim a second bind finds
-   over the same journal is converted to `APPLY_OUTCOME_UNKNOWN_MESSAGE` by both verbs without
-   running a handler; and a journal write that fails *after* the handler succeeded leaves the
+   over the same journal is converted to `APPLY_OUTCOME_UNKNOWN_MESSAGE` by apply and removed as
+   `rejected` by the first reject, neither verb running a handler; and a journal write that fails *after* the handler succeeded leaves the
    record `claimed`, fires no hook, and is reported unknown on the next attempt rather than being
    rolled back to `pending`. `SerialTaskQueue`
    ordering and rejection isolation live in the **workerd** project

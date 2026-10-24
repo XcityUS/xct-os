@@ -3,7 +3,10 @@ import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
   ApprovalQueue,
   stripTrailingSlashes,
+  workerVersionTag,
   type AccountDescription,
+  type ActionDescription,
+  type ActionKind,
   type ConnectHandoff,
   type Cursor,
   type Gatekeeper,
@@ -15,6 +18,7 @@ import {
   type GitCache,
   type GitOid,
   type GitPullHints,
+  type GitPullTransfer,
   type ObservationDescription,
   type ResourceConfiguratorFrame,
   type ResourceDescription,
@@ -72,11 +76,11 @@ import {
   isCommitOid,
   parseGitCommitPayload,
 } from "@gadgets/gatekeeper-kit/git-objects";
+import { startGitPull } from "@gadgets/gatekeeper-kit/git-pull-transfer";
 import {
   GitRefUpdateRejectedError,
   ZERO_OID,
   emptyPackBytes,
-  pullGitObjectsIntoCache,
   pushGitRefUpdate,
   simulateBranchHead,
   validateBranchName,
@@ -491,6 +495,53 @@ function describeGitHubAction(action: GitHubAction): RenderedDescription {
       return { description };
     }
   }
+}
+
+/**
+ * The kind of each action, which users' auto-approval rules key on, so a tag must never change. A
+ * force push has a kind of its own: enabling ordinary pushes does not let history be rewritten.
+ */
+const ACTION_KINDS = {
+  createIssue: { tag: "github.createIssue", label: "Create issues" },
+  createPullRequest: { tag: "github.createPullRequest", label: "Create pull requests" },
+  setTitle: { tag: "github.setTitle", label: "Rename issues and pull requests" },
+  setBody: { tag: "github.setBody", label: "Edit issue and pull request bodies" },
+  addLabels: { tag: "github.addLabels", label: "Add labels" },
+  removeLabels: { tag: "github.removeLabels", label: "Remove labels" },
+  changeState: { tag: "github.changeState", label: "Close and reopen issues and pull requests" },
+  postComment: { tag: "github.postComment", label: "Post comments" },
+  postReview: { tag: "github.postReview", label: "Submit reviews that comment or request changes" },
+  replyToDiffComment: { tag: "github.replyToDiffComment", label: "Reply to diff threads" },
+  mergePullRequest: { tag: "github.mergePullRequest", label: "Merge pull requests" },
+  push: { tag: "github.push", label: "Push commits" },
+  forcePush: { tag: "github.forcePush", label: "Force-push commits" },
+} satisfies Record<GitHubAction["type"] | "forcePush", ActionKind>;
+
+type AutoApprovalKind = keyof typeof ACTION_KINDS;
+
+// The auto-approvable kinds each binding's session can submit, so a pre-approval UI lists only
+// those its actions can carry. Merges never appear: they are never auto-approvable.
+const ISSUE_ACTIONS: AutoApprovalKind[] =
+  ["setTitle", "setBody", "addLabels", "removeLabels", "changeState", "postComment"];
+const PULL_ACTIONS: AutoApprovalKind[] = [...ISSUE_ACTIONS, "postReview", "replyToDiffComment"];
+const BINDING_ACTIONS: Record<ResourceKind, AutoApprovalKind[]> = {
+  repo: ["createIssue", "createPullRequest", ...PULL_ACTIONS, "push", "forcePush"],
+  issue: ISSUE_ACTIONS,
+  pull: PULL_ACTIONS,
+};
+
+/**
+ * The action's kind, and whether it may be applied without a person once the user has enabled
+ * that kind. Every action may be except a merge and an approving review, which always wait for a
+ * person: an approval shares its kind with the other reviews, so enabling those never covers it.
+ */
+function autoApprovalOf(action: GitHubAction): Pick<ActionDescription, "actionKind" | "autoApprovable"> {
+  const kind: AutoApprovalKind = action.type === "push" && action.force ? "forcePush" : action.type;
+  return {
+    actionKind: ACTION_KINDS[kind],
+    autoApprovable: action.type !== "mergePullRequest" &&
+      !(action.type === "postReview" && action.review.decision === "approve"),
+  };
 }
 
 type StoredActionRecord = {
@@ -1298,6 +1349,10 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
           "and reviews on the repositories you choose.",
       providesAuth: true,
     };
+  }
+
+  async versionTag(): Promise<string | undefined> {
+    return workerVersionTag(this.env);
   }
 
   async connectAccount(callback: Fetcher<GatekeeperConnectCallback>,
@@ -2403,19 +2458,24 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
    * branch, if that branch no longer exists without it -- on the remote or as the outcome of the
    * remaining queued pushes -- and everything queued against the doomed pull request. A push no
    * create depends on is discarded without reading GitHub, so a dead connection cannot block it.
-   * Otherwise the branch is read before anything is marked, so a failed read leaves the push
-   * pending and a retried discard still cascades; everything after the read runs without
-   * yielding, so a pull request queued during it is cascaded too, and a push applied during it
-   * is refused rather than overwritten as discarded. Returns whether anything was cascaded.
+   * Otherwise the branch is read before anything is marked, and everything after the read runs
+   * without yielding, so a pull request queued during it is cascaded too, and a push applied during
+   * it is refused rather than overwritten as discarded. A failed read still discards the push but
+   * cascades nothing, leaving its creates for the user to discard. Returns whether anything was
+   * cascaded.
    */
   async #rejectPush(push: PushAction): Promise<boolean> {
     const dependsOnBranch = (action: GitHubAction): action is CreatePullRequestAction =>
       action.type === "createPullRequest" &&
       (action.options.head === push.branch || action.options.base === push.branch);
     // `undefined`: not read, since nothing depended on the branch (and without an await, nothing
-    // can be queued before the mark); `null`: the branch does not exist on GitHub.
+    // can be queued before the mark), or the read failed; `null`: the branch does not exist on GitHub.
     const realHead = this.#listPendingActions().some(dependsOnBranch)
       ? await this.#withApi(api => api.getBranchHead(this.ctx.props.owner, this.ctx.props.repo, push.branch))
+        .catch(error => {
+          logger.warn("failed to read the branch a rejected push targeted", { event: "push.reject.branch.read.failed", error });
+          return undefined;
+        })
       : undefined;
     // The read yields, so a concurrent apply or discard may have settled the push meanwhile.
     const { state } = this.#requireActionRecord(push.approvalId);
@@ -3656,8 +3716,8 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     return TYPES_CODE;
   }
 
-  async getAutoApprovableActions() {
-    return [];
+  async getAutoApprovableActions(): Promise<ActionKind[]> {
+    return BINDING_ACTIONS[this.ctx.props.resourceKind].map(kind => ACTION_KINDS[kind]);
   }
 
   async submitActionForApproval(
@@ -3667,10 +3727,12 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   ): Promise<void> {
     this.#stageAction(action);
     try {
-      // The text comes from the staged payload, not the caller, so it always shows what applies.
+      // The text and the auto-approval verdict come from the staged payload, not the caller, so
+      // they always describe what applies.
       await approvalQueue.submitAction(action.approvalId, {
         ...presentation,
         ...describeGitHubAction(action),
+        ...autoApprovalOf(action),
       });
     } catch (error) {
       this.ctx.storage.kv.delete(this.#actionRecordKey(action.approvalId));
@@ -3930,21 +3992,13 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   }
 
   /**
-   * `Gatekeeper.gitPull()`: fetch the requested objects from this repo over git smart-HTTP
-   * (protocol v2) and deposit them in the workspace git cache. The gatekeeper contributes only
-   * protocol framing -- the kit's git-transport composes the fetch command from the hints and strips
-   * the response down to the raw pack body, which streams into `cache.consumePack()` for
-   * overseer-side decoding, hash verification, and storage -- and retains nothing locally.
-   *
-   * No observation is recorded: a pull is overseer-initiated population of the workspace cache
-   * with objects whose commit ids were already returned (and advertised) by observed session
-   * reads, not a new agent-visible read; observer access to the git data rides the same
-   * repo-level ACL as everything else here (strategy B).
+   * Stream a self-contained raw pack through this resource's authenticated transport.
+   * No new observation: the kernel only requests objects from previously observed commits.
+   * Cache ingestion and native checkout share this path; credentials never enter the guest.
    */
-  async gitPull(oids: GitOid[], cache: RpcStub<GitCache>, hints: GitPullHints): Promise<void> {
-    await this.#withApi(api => pullGitObjectsIntoCache(
-      body => api.fetchGitUploadPack(this.ctx.props.owner, this.ctx.props.repo, body),
-      oids, hints, cache));
+  async gitPull(oids: GitOid[], options: GitPullHints): Promise<GitPullTransfer> {
+    return this.#withApi(api => startGitPull(
+      body => api.fetchGitUploadPack(this.ctx.props.owner, this.ctx.props.repo, body), oids, options));
   }
 
   async applyAction(actionId: number, cache: RpcStub<GitCache>): Promise<void> {

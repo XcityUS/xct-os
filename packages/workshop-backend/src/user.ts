@@ -562,7 +562,27 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async #getXcityModelPlane(): Promise<XcityModelPlane | null> {
     let config = getXcityConfig(this.env);
     let identity = this.storage.xcityIdentity.get();
-    if (!config || !identity) return null;
+    if (!config) return null;
+
+    // Accounts that completed OAuth before Xcity identity persistence was introduced still have
+    // an authoritative gatekeeper capability. Recover the stable GoTrue subject from that
+    // capability on first model access instead of making the user disconnect and sign in again.
+    // The access token and TokenHub key stay server-side throughout this repair path.
+    if (!identity) {
+      try {
+        let account = await this.getXcityGatekeeperAccount();
+        let userId = account ? await account.getXcityUserId() : null;
+        if (userId) {
+          identity = { userId, email: this.storage.profile.get().id };
+          this.storage.xcityIdentity.put(identity);
+        }
+      } catch (err) {
+        logger.warn("failed to recover xcity identity from connected account", {
+          event: "xcity.identity.recover.failed", error: err,
+        });
+      }
+    }
+    if (!identity) return null;
 
     try {
       return await XcityModelPlane.forUser(

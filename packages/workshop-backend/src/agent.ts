@@ -18,7 +18,7 @@ import {
   runAgentLoopContinue, type AgentContext, type AgentEvent, type AgentTool,
 } from "@earendil-works/pi-agent-core";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
-import { createTwoFilesPatch, FILE_HEADERS_ONLY } from "diff";
+import { createTwoFilesPatch, OMIT_HEADERS } from "diff";
 import { webFetch as webFetchImpl, WebFetchEnv, formatWebFetchResult } from "./web-fetch";
 import {
   findCatalogChanges, formatAlwaysAvailableResourcesPrompt, formatCatalogChange,
@@ -567,10 +567,11 @@ export interface AgentHooks {
 
   /**
    * Returns the resources needed by `webFetch` to delegate document-to-Markdown conversion
-   * to Workers AI. Exposed as a narrow interface (rather than handing over the whole `env`)
-   * so the dependency surface stays explicit.
+   * to Workers AI, and the hosts it may reach in a workspace that has observed restricted data.
+   * Throws if that workspace may reach none. Exposed as a narrow interface (rather than handing
+   * over the whole `env`) so the dependency surface stays explicit.
    */
-  getWebFetchEnv(): WebFetchEnv;
+  getWebFetchEnv(): Promise<WebFetchEnv>;
 
   /**
    * Deployment-wide, admin-authored instructions to append to the agent's system prompt. Returns
@@ -1306,7 +1307,7 @@ ${EXECUTE_CODE_SELF_PARAM}
 `.trim();
 
 let LIST_CONNECTABLE_RESOURCES_TOOL_DESCRIPTION = `
-List the resource types a gatekeeper vendor offers, so you can construct a resourceUrl for requestConnection. The system prompt lists which vendors exist; call this to learn a specific vendor's resource URL patterns before requesting a connection.
+List a gatekeeper vendor's separate Existing resources and New resources. Use an Existing resource's URL pattern with requestConnection to connect something already present; use a New resource's resourceUrlPattern with createExternalResource to create something. A vendor may offer either or both. The system prompt lists which vendors exist; call this to discover their resource types.
 `.trim();
 
 let REQUEST_CONNECTION_TOOL_DESCRIPTION = `
@@ -1316,7 +1317,7 @@ For a Gadget that needs AI agents of its own, rather than calling back into this
 `.trim();
 
 let CREATE_EXTERNAL_RESOURCE_TOOL_DESCRIPTION = `
-Create a new external resource (e.g. a new document), for resource types listConnectableResources marks creatable; requestConnection is for resources that already exist. The resource is immediately available as \`env.<bindingName>\` and your turn continues. It is created at the provider, in an account the user chooses, only once they approve the creation; until then it is simulated, and changes you make to it apply after the creation.
+Create a new external resource (e.g. a new document), from the New resources section of listConnectableResources; requestConnection is only for the separately listed Existing resources. The resource is immediately available as \`env.<bindingName>\` and your turn continues. It is created at the provider, in an account the user chooses, only once they approve the creation; until then it is simulated, and changes you make to it apply after the creation.
 `.trim();
 
 // =======================================================================================
@@ -3493,7 +3494,7 @@ async function runAgentPass(
       }),
       execute: async (toolCallId, {url, raw}) => {
         try {
-          let result = await webFetchImpl(hooks.getWebFetchEnv(), {url, raw});
+          let result = await webFetchImpl(await hooks.getWebFetchEnv(), {url, raw});
           // Cut the body, not the formatted result, so the frontmatter's `truncated` stays true
           // to the text and the recorded output is what the model saw. The header counts against
           // the cap too, so the formatted whole fits. Don't end on half of a surrogate pair: a
@@ -4409,6 +4410,10 @@ async function runAgentPass(
  * Renders one file's before/after as a git-style unified diff (headers only, `a/`\/`b/`
  * prefixes, `/dev/null` for a missing side). Shared by the replay path's user-change
  * observations and the Worktree binding's diff().
+ *
+ * The `---`/`+++` headers are written here, not by jsdiff, to keep the path verbatim: jsdiff
+ * (like git) C-quotes a path containing non-ASCII, `"` or `\`, which an agent reading the diff
+ * would then have to unescape before reusing the path.
  */
 export function formatUnifiedDiff(
     filename: string,
@@ -4416,17 +4421,13 @@ export function formatUnifiedDiff(
     newContent: string,
     oldExists: boolean,
     newExists: boolean): string | undefined {
-  return createTwoFilesPatch(
-      oldExists ? `a/${filename}` : "/dev/null",
-      newExists ? `b/${filename}` : "/dev/null",
-      oldContent,
-      newContent,
-      undefined,
-      undefined,
-      {
-        context: 3,
-        headerOptions: FILE_HEADERS_ONLY,
-      }).trimEnd();
+  let hunks = createTwoFilesPatch("", "", oldContent, newContent, undefined, undefined,
+                                  { context: 3, headerOptions: OMIT_HEADERS });
+  return [
+    `--- ${oldExists ? `a/${filename}` : "/dev/null"}`,
+    `+++ ${newExists ? `b/${filename}` : "/dev/null"}`,
+    hunks,
+  ].join("\n").trimEnd();
 }
 
 // =======================================================================================

@@ -101,7 +101,7 @@ async function withWorkspace(fn: (workspace: Workspace) => Promise<void>): Promi
       listGatekeeperVendors: async () => [],  // asked at the start of every agent turn
       updateBlueprint: async () => false,  // not featured
       deleteBlueprint: async () => {},
-      setGadgetLastActive: async () => {},
+      setWorkspaceLastActive: async () => {},
     };
     impl.users = { idFromString: (id: string) => id, get: () => owner };
     // Disposed with the session: the session holds a duplicate of the stub until then.
@@ -273,7 +273,7 @@ async function uploadArchive(blueprintId: string, archive: ReadableStream<Uint8A
 }
 
 /**
- * Instantiates a blueprint in the workspace as AuthenticatedApi.newGadgetFromBlueprint() has the
+ * Instantiates a blueprint in the workspace as AuthenticatedApi.newWorkspaceFromBlueprint() has the
  * Overseer do it: from the metadata that it read, which is what is published unless given.
  */
 async function instantiate(

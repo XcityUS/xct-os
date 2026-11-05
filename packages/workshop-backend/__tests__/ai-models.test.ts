@@ -259,6 +259,111 @@ describe("getModel AI Gateway routing", () => {
         { provider: "ollama", model: "llama3", apiToken: "" }, INITIATOR))
         .toThrow(new Error('Provider "ollama" is not supported through AI Gateway.'));
   });
+
+  describe("the Auto Router model", () => {
+    const AUTO: AiModelConfig =
+        { provider: "cloudflare-auto-router", model: "cloudflare/auto", apiToken: "" };
+    const COMPAT =
+        "https://gateway.ai.cloudflare.com/v1/gateway-account-id/platform-gateway/compat";
+
+    it("speaks Chat Completions on the gateway's unified route, steered by its headers",
+        async () => {
+      const handle = getModel(env(), {
+        ...AUTO, autoRouterPool: { providers: ["anthropic", "google", "cloudflare", "ollama"] },
+      }, INITIATOR, { sessionAffinity: "session-a" });
+      // The model behind a request is the router's to pick, so the descriptor claims only what
+      // every candidate has, and the catalog's limits are the smallest a candidate may have.
+      expect(handle.model).toMatchObject({
+        api: "openai-completions", id: "cloudflare/auto", baseUrl: COMPAT, reasoning: false,
+        input: ["text", "image"], contextWindow: 128000, maxTokens: 32768,
+      });
+      expect(gatewayReasoningLevels("cloudflare-auto-router", "cloudflare/auto")).toEqual([]);
+
+      const request = await captureRequest(handle);
+      expect(request.url).toBe(`${COMPAT}/chat/completions`);
+      expect(JSON.parse(request.body).model).toBe("cloudflare/auto");
+      expect(request.headers.get("cf-aig-authorization")).toBe("Bearer gateway-token");
+      // The pool, in the gateway's names for the providers it serves; the chat as the router's
+      // session, so a turn's requests stay with one model and its prompt cache.
+      expect(request.headers.get("cf-aig-allowed-providers"))
+          .toBe("anthropic,workers-ai");
+      expect(request.headers.get("cf-aig-allowed-models")).toBeNull();
+      expect(request.headers.get("cf-aig-session-id")).toBe("session-a");
+    }, 15000);
+
+    it("sends the models its admin listed in place of the providers", async () => {
+      const handle = getModel(env(),
+          { ...AUTO, autoRouterPool: { models: ["anthropic/*", "openai/gpt-6-luna"] } }, INITIATOR);
+      const request = await captureRequest(handle);
+      expect(request.headers.get("cf-aig-allowed-models")).toBe("anthropic/*,openai/gpt-6-luna");
+      expect(request.headers.get("cf-aig-allowed-providers")).toBeNull();
+      expect(request.headers.get("cf-aig-session-id")).toBeNull();
+    }, 15000);
+
+    // A provider test's config carries no pool: the gateway's own default pool answers.
+    it("leaves the pool to the gateway for a config that carries none", async () => {
+      const request = await captureRequest(getModel(env(), AUTO, INITIATOR));
+      expect(request.headers.get("cf-aig-allowed-models")).toBeNull();
+      expect(request.headers.get("cf-aig-allowed-providers")).toBeNull();
+    }, 15000);
+
+    it("refuses a pool of providers the gateway serves none of, and one of no models", () => {
+      expect(() => getModel(env(), { ...AUTO, autoRouterPool: { providers: ["ollama"] } },
+          INITIATOR)).toThrow("Auto Router has no models to pick from");
+      expect(() => getModel(env(), { ...AUTO, autoRouterPool: { providers: [] } }, INITIATOR))
+          .toThrow("Auto Router has no models to pick from");
+      expect(() => getModel(env(), { ...AUTO, autoRouterPool: { models: [] } }, INITIATOR))
+          .toThrow("Auto Router has no models to pick from");
+    });
+
+    // The binding's gateway passthrough forwards any `{gateway}/{segment}/...` path, so the
+    // unified /compat route rides it like the per-provider ones, with no token.
+    it("rides the binding like any provider, and a connected user's gateway over HTTPS",
+        async () => {
+      const binding = { fetch: vi.fn() } as unknown as Ai;
+      const BOUND = "https://workers-binding.ai/ai-gateway/gateways/platform-gateway/compat";
+      expect(getModel(env({ WORKERS_AI: binding }), AUTO, INITIATOR).model.baseUrl).toBe(BOUND);
+      expect(getModel(env({
+        WORKERS_AI: binding, CF_AI_GATEWAY_API_TOKEN: undefined,
+        CF_AI_GATEWAY_PROVIDERS: "anthropic",
+      }), AUTO, INITIATOR).model.baseUrl).toBe(BOUND);
+
+      const user = getModel(env(), { ...AUTO, autoRouterPool: { providers: ["openai"] } },
+          INITIATOR, { userGateway: { accountId: "user-account-id", apiKey: "user-token" } });
+      expect(user.model.baseUrl)
+          .toBe("https://gateway.ai.cloudflare.com/v1/user-account-id/default/compat");
+      const request = await captureRequest(user);
+      expect(request.headers.get("cf-aig-authorization")).toBe("Bearer user-token");
+      expect(request.headers.get("cf-aig-allowed-providers")).toBe("openai");
+    }, 15000);
+
+    it("remembers which model the router answered with", async () => {
+      const handle = getModel(env(), AUTO, INITIATOR);
+      const stream = await handle.stream(handle.model,
+          { messages: [{ role: "user", content: "hello", timestamp: 0 }] }, {
+        maxRetries: 0,
+        fetch: (async () => new Response(`data: ${JSON.stringify({
+          id: "completion", object: "chat.completion.chunk", created: 0,
+          model: "claude-sonnet-5-5",
+          choices: [
+            { index: 0, delta: { role: "assistant", content: "OK" }, finish_reason: "stop" },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        })}\n\ndata: [DONE]\n\n`, { headers: {
+          "content-type": "text/event-stream", "cf-aig-log-id": "log-1",
+          "cf-aig-routed-model": "anthropic/claude-sonnet-5.5",
+        } })) as typeof fetch,
+      });
+      expect((await stream.result()).stopReason).toBe("stop");
+      expect(handle.lastResponse).toEqual(
+          { status: 200, aiGatewayLogId: "log-1", routedModel: "anthropic/claude-sonnet-5.5" });
+    }, 15000);
+
+    it("runs through no direct connection", () => {
+      expect(() => getModel(env({ CF_AI_GATEWAY: undefined }), AUTO, INITIATOR))
+          .toThrow("The Auto Router model runs only through an AI Gateway.");
+    });
+  });
 });
 
 describe("getModel AI Gateway binding transport", () => {
@@ -1014,6 +1119,7 @@ describe("gateway model reasoning levels", () => {
   it.each([
     ["anthropic", "claude-opus-5-5", LOW_TO_MAX],
     ["anthropic", "claude-sonnet-5-5", LOW_TO_MAX],
+    ["anthropic", "claude-haiku-5-5", LOW_TO_MAX],
     ["anthropic", "claude-fable-5-1", ["minimal", ...LOW_TO_MAX]],
     ["anthropic", "claude-opus-5", ["minimal", ...LOW_TO_MAX]],
     ["anthropic", "claude-sonnet-5", ["off", "minimal", ...LOW_TO_MAX]],
@@ -1046,6 +1152,7 @@ describe("gateway model reasoning levels", () => {
   const BUILT_IN: [AiModelConfig["provider"], string, BuiltInReasoning][] = [
     ["anthropic", "claude-opus-5-5", "adaptive"],
     ["anthropic", "claude-sonnet-5-5", "adaptive"],
+    ["anthropic", "claude-haiku-5-5", "adaptive"],
     ["anthropic", "claude-fable-5-1", "adaptive"],
     ["anthropic", "claude-opus-5", "adaptive"],
     ["anthropic", "claude-sonnet-5", "adaptive"],
@@ -1064,6 +1171,7 @@ describe("gateway model reasoning levels", () => {
     ["cloudflare", "@cf/deepseek-ai/deepseek-v4-pro-0813", null],
     ["cloudflare", "@cf/cloudflare/clef", null],
     ["cloudflare", "@cf/cloudflare/clef-flash", null],
+    ["cloudflare-auto-router", "cloudflare/auto", null],
   ];
   it.each(BUILT_IN)("says what %s model %s is asked for while no level is set",
       (provider, model, builtIn) => {
@@ -1515,6 +1623,30 @@ describe("LanguageModelGatekeeper.startSession", () => {
     }
   });
 
+  // The pool is the admin's spend policy, so a binding follows the current one, not its own.
+  it("gives the Auto Router model the deployment's current pool", async () => {
+    const minted: AiModelConfig = {
+      provider: "cloudflare-auto-router", model: "cloudflare/auto", apiToken: "",
+      autoRouterPool: { providers: ["anthropic", "openai"] },
+    };
+    const narrowed: Partial<AdminConfig> =
+        { modelSettings: { "cloudflare/auto": { allowedModels: ["anthropic/*"] } } };
+    vi.stubGlobal("fetch", fetchStub);
+    try {
+      capturedRequests.length = 0;
+      const binding = await startSession(minted, narrowed,
+          { CF_AI_GATEWAY_PROVIDERS: "anthropic,cloudflare-auto-router" }).session;
+      await expect(binding.run({ prompt: "hello" })).rejects.toThrow();
+      expect(capturedRequests[0].headers.get("cf-aig-allowed-models")).toBe("anthropic/*");
+      expect(capturedRequests[0].headers.get("cf-aig-allowed-providers")).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    // Once the deployment stops offering it, the binding stops rather than run without a pool.
+    await expect(startSession(minted, {}, { CF_AI_GATEWAY_PROVIDERS: "anthropic" }).session)
+        .rejects.toThrow("The Auto Router model is no longer offered on this deployment.");
+  });
+
   it("does not read the admin config outside AI Gateway mode", async () => {
     const { session, getConfig } = startSession(
         { provider: "anthropic", model: MODEL_ID, apiToken: "direct-api-token" },
@@ -1585,7 +1717,7 @@ describe("LanguageModelGatekeeper.startSession", () => {
   });
 });
 
-// A decision model binding is revoked as a language model binding is (see refuseRevokedModel()).
+// A decision model binding is revoked as a language model binding is (see bindingConfig()).
 describe("DecisionModelGatekeeper.startSession", () => {
   it("refuses a decision model the admin disabled", async () => {
     const admin = { ...DEFAULT_ADMIN_CONFIG, modelModes: { "@cf/cloudflare/clef": "disabled" } };
@@ -2057,14 +2189,17 @@ describe("getDecisionModel routing", () => {
     user: "owner-456", source: "model-binding", gadgetId: "gadget-789", automated: true,
   };
 
-  // pi's classify() takes no fetch from getDecisionModel on HTTP routes, so it uses the global one.
-  beforeEach(() => {
-    capturedRequests.length = 0;
+  // The direct route and the HTTPS gateway route both reach the network through the global fetch.
+  function stubGatewayFetch(respond: () => Response) {
     vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       capturedRequests.push({ url: request.url, headers: request.headers, body: await request.text() });
-      return Response.json({ success: true, result: CLEF_RESULT });
+      return respond();
     });
+  }
+  beforeEach(() => {
+    capturedRequests.length = 0;
+    stubGatewayFetch(() => Response.json({ success: true, result: CLEF_RESULT }));
   });
   afterEach(() => vi.unstubAllGlobals());
 
@@ -2087,16 +2222,31 @@ describe("getDecisionModel routing", () => {
   });
 
   it("decides through the platform gateway over HTTPS with the gateway token", async () => {
+    // The gateway passes Workers AI's bare result through, as the binding's run() returns it.
+    stubGatewayFetch(() => Response.json(CLEF_RESULT));
     const decide = getDecisionModel(env(), CLEF_CONFIG, GADGET_INITIATOR, METADATA_CONTEXT);
 
     expect((await decide(CONTEXT)).answers).toEqual(ANSWERS);
     const [request] = capturedRequests;
-    expect(request.url).toBe(
-        "https://gateway.ai.cloudflare.com/v1/gateway-account-id/platform-gateway/workers-ai/run");
-    // Workers AI's /run checks `authorization` itself; the gateway checks its own header.
-    expect(request.headers.get("authorization")).toBe("Bearer gateway-token");
+    expect(request.url).toBe("https://gateway.ai.cloudflare.com/v1/gateway-account-id/" +
+        "platform-gateway/workers-ai/run/@cf/cloudflare/clef");
+    // An `authorization` header would be forwarded to Workers AI as the credential, in place of
+    // the one the gateway supplies.
+    expect(request.headers.has("authorization")).toBe(false);
     expect(request.headers.get("cf-aig-authorization")).toBe("Bearer gateway-token");
     expect(JSON.parse(request.headers.get("cf-aig-metadata")!)).toEqual(GATEWAY_METADATA);
+    expect(JSON.parse(request.body)).toEqual(WIRE_INPUT);
+  });
+
+  it("reports a gateway refusal as an error result", async () => {
+    stubGatewayFetch(() => Response.json(
+        { success: false, errors: [{ message: "Authentication error" }] }, { status: 401 }));
+    const decide = getDecisionModel(env(), CLEF_CONFIG, GADGET_INITIATOR, METADATA_CONTEXT);
+
+    expect(await decide(CONTEXT)).toMatchObject({
+      stopReason: "error",
+      errorMessage: expect.stringContaining("Authentication error"),
+    });
   });
 
   describe("over the Workers AI binding", () => {

@@ -8,7 +8,8 @@ const logger = obsContext.createLogger({ component: "gatekeeper.google.drive", v
 
 const DRIVE_API_BASE = "https://www.googleapis.com/drive/v3";
 const DRIVE_BATCH_URL = "https://www.googleapis.com/batch/drive/v3";
-const MAX_BATCH_FILES = 100;
+/** The most files one Drive batch request asks about. */
+export const MAX_BATCH_FILES = 100;
 const MAX_BATCH_RESPONSE_BYTES = 1_000_000;
 const MAX_JSON_RESPONSE_BYTES = 5_000_000;
 /** Per-attempt budget for a file download, which carries far more than a metadata read. */
@@ -168,6 +169,8 @@ export type DriveFileQuery = {
   directParentIds?: readonly string[];
   /** Only files shared with this account by others, as Drive's "Shared with me" lists them. */
   sharedWithMe?: boolean;
+  /** Leaves out folders, though not shortcuts to them, whose target the query cannot see. */
+  excludeFolders?: boolean;
 };
 
 /**
@@ -567,6 +570,7 @@ export function buildDriveQuery(query: DriveFileQuery, internal: InternalDriveQu
     clauses.push(parents.length === 1 ? inParents(parents[0]) : `(${parents.map(inParents).join(" or ")})`);
   }
   if (query.sharedWithMe) clauses.push("sharedWithMe = true");
+  if (query.excludeFolders) clauses.push(literalClause("mimeType", "!=", FOLDER_MIME_TYPE));
   if (internal.convertedFrom !== undefined) {
     clauses.push(`appProperties has { key='${CONVERTED_FROM_PROPERTY}' and value='${
       escapeDriveQueryLiteral(internal.convertedFrom)}' }`);

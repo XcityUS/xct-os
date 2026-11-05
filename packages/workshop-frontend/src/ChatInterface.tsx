@@ -41,6 +41,7 @@ import {
   Copy,
   Clipboard as ClipboardIcon,
   WarningCircle,
+  StopCircle,
   Code,
   File as FileIcon,
   PencilSimple,
@@ -2488,7 +2489,7 @@ function fallbackToStoredModelSelection(
 interface ChatInterfaceProps {
   workspaceId: string | undefined;
   overseer: RpcStub<Overseer>;
-  // True once the workspace has read restricted data (GadgetMetadata.containsRestrictedData).
+  // True once the workspace has read restricted data (WorkspaceMetadata.containsRestrictedData).
   // Latched actions are never auto-approved, so the always-approve affordance is hidden.
   restricted?: boolean;
   selectedChatId: number | null;
@@ -5407,11 +5408,11 @@ function ChatInterface({
                   onClick={() => setChatListScope(scope.value)}
                   className="!h-auto rounded-md !px-2.5 !py-1.5 text-[12px] leading-4 tracking-[-0.2px] text-kumo-default transition-colors data-highlighted:bg-kumo-tint"
                 >
-                  <span className="mr-2 inline-flex h-3 w-3 items-center justify-center text-kumo-default">
+                  <span className="inline-flex h-3 w-3 items-center justify-center text-kumo-default">
                     {active ? <Check size={11} weight="bold" /> : null}
                   </span>
                   <span className="flex-1">{CHAT_LIST_SCOPE_LABELS[scope.value]}</span>
-                  <span className="ml-3 font-mono text-[11px] text-kumo-inactive">
+                  <span className="ml-1 font-mono text-[11px] text-kumo-inactive">
                     {scope.count}
                   </span>
                 </DropdownMenu.Item>
@@ -5496,9 +5497,18 @@ function ChatInterface({
                             className="min-w-0 flex-1 bg-transparent text-[13px] leading-[18px] font-medium tracking-[-0.25px] text-kumo-default outline-none placeholder:text-kumo-inactive"
                           />
                         ) : (
-                          <span className="truncate text-[13px] leading-[18px] font-medium tracking-[-0.25px] text-kumo-default">
+                          // The row's click handler serves pointer users; this button is the keyboard entry point.
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onNavigateToChat(chat.id);
+                            }}
+                            aria-current={sidebarMode && chat.id === selectedChatId ? "true" : undefined}
+                            className="-my-1 min-w-0 cursor-pointer truncate rounded-sm py-1 text-left text-[13px] leading-[18px] font-medium tracking-[-0.25px] text-kumo-default focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kumo-contrast"
+                          >
                             {chat.title}
-                          </span>
+                          </button>
                         )}
                         {!isRenaming && chat.activeAgent ? (
                           <span className="inline-flex flex-shrink-0 cursor-pointer items-center gap-1 text-[11px] leading-4 font-medium text-kumo-brand">
@@ -5552,14 +5562,14 @@ function ChatInterface({
                           className="themed-floating-shadow !z-[1100] !min-w-[144px] rounded-lg border border-kumo-line bg-kumo-base p-1"
                         >
                           <DropdownMenu.Item
-                            icon={<Pencil size={12} className="mr-2" />}
+                            icon={<Pencil className="size-3" />}
                             onClick={() => startListRename(chat.id, chat.title)}
                             className="!h-auto rounded-md !px-2.5 !py-1.5 text-[12px] leading-4 tracking-[-0.2px] text-kumo-default transition-colors data-highlighted:bg-kumo-tint"
                           >
                             Rename
                           </DropdownMenu.Item>
                           <DropdownMenu.Item
-                            icon={<Trash size={12} className="mr-2" />}
+                            icon={<Trash className="size-3" />}
                             variant="danger"
                             onClick={() => handleDeleteChat(chat.id, chat.title)}
                             className="!h-auto rounded-md !px-2.5 !py-1.5 text-[12px] leading-4 tracking-[-0.2px] transition-colors data-highlighted:bg-kumo-danger-tint"
@@ -6317,31 +6327,42 @@ function ChatInterface({
                             return (
                               <div className="group/work max-w-[860px] text-[14px] leading-5 tracking-[-0.25px] text-kumo-subtle">
                                 <div className="flex w-full items-center gap-2 px-1.5 py-1">
-                                  <button
-                                    type="button"
-                                    onClick={() => toggleErrorExpansion(key)}
-                                    className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-md text-left transition-colors duration-150 ease-out hover:text-kumo-default focus-visible:text-kumo-default focus-visible:outline-none active:scale-[0.995]"
-                                    aria-expanded={expanded}
-                                  >
+                                  {msg.code === "stopped" ? (
                                     <Tooltip content={formatFullTimestamp(msg.timestamp)} asChild>
                                       <span className="flex min-w-0 flex-1 items-center gap-2">
-                                        <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center text-kumo-danger" aria-hidden="true">
-                                          <WarningCircle size={16} weight="fill" />
+                                        <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center text-kumo-inactive" aria-hidden="true">
+                                          <StopCircle size={16} weight="fill" />
                                         </span>
-                                        <span className="flex min-w-0 flex-1 items-center gap-1">
-                                          <span className="min-w-0 truncate">
-                                            <span className="font-medium text-kumo-danger">Error: </span>
-                                            <span className="text-kumo-subtle">{msg.message}</span>
-                                          </span>
-                                          <CaretRight
-                                            size={13}
-                                            weight="bold"
-                                            className={`flex-shrink-0 text-kumo-inactive transition-transform duration-150 ease-out ${expanded ? "rotate-90" : ""}`}
-                                          />
-                                        </span>
+                                        <span className="min-w-0 truncate">Stopped</span>
                                       </span>
                                     </Tooltip>
-                                  </button>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={() => toggleErrorExpansion(key)}
+                                      className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-md text-left transition-colors duration-150 ease-out hover:text-kumo-default focus-visible:text-kumo-default focus-visible:outline-none active:scale-[0.995]"
+                                      aria-expanded={expanded}
+                                    >
+                                      <Tooltip content={formatFullTimestamp(msg.timestamp)} asChild>
+                                        <span className="flex min-w-0 flex-1 items-center gap-2">
+                                          <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center text-kumo-danger" aria-hidden="true">
+                                            <WarningCircle size={16} weight="fill" />
+                                          </span>
+                                          <span className="flex min-w-0 flex-1 items-center gap-1">
+                                            <span className="min-w-0 truncate">
+                                              <span className="font-medium text-kumo-danger">Error: </span>
+                                              <span className="text-kumo-subtle">{msg.message}</span>
+                                            </span>
+                                            <CaretRight
+                                              size={13}
+                                              weight="bold"
+                                              className={`flex-shrink-0 text-kumo-inactive transition-transform duration-150 ease-out ${expanded ? "rotate-90" : ""}`}
+                                            />
+                                          </span>
+                                        </span>
+                                      </Tooltip>
+                                    </button>
+                                  )}
                                   {isLast && msg.code === "usage_limit" && (
                                     <Tooltip content="Add credits to continue." asChild>
                                       <button
@@ -6355,7 +6376,7 @@ function ChatInterface({
                                     </Tooltip>
                                   )}
                                   {isLast && msg.code !== "usage_limit" && (
-                                    <Tooltip content="Retry the last action." asChild>
+                                    <Tooltip content={msg.code === "stopped" ? "Continue where the agent stopped." : "Retry the last action."} asChild>
                                       <button
                                         type="button"
                                         onClick={() => handleRetry()}
@@ -6363,7 +6384,7 @@ function ChatInterface({
                                         className="flex flex-shrink-0 cursor-pointer items-center gap-1 rounded-md px-1 py-0.5 text-[13px] leading-4 font-medium text-kumo-default transition-[color,opacity,transform] duration-150 ease-out hover:text-kumo-default-hover focus-visible:text-kumo-default-hover focus-visible:outline-none active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40"
                                       >
                                         <ArrowsClockwise size={12} weight="bold" />
-                                        Retry
+                                        {msg.code === "stopped" ? "Continue" : "Retry"}
                                       </button>
                                     </Tooltip>
                                   )}

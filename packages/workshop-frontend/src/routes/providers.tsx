@@ -17,6 +17,7 @@ import AddModelModal, { type ModelModalMode } from '../AddModelModal'
 import XcityAddModelModal from '../XcityAddModelModal'
 import XcityProviderCard from '../XcityProviderCard'
 import { useDocumentTitle } from '../useDocumentTitle'
+import { useCloudflareLimitsEnabled } from '../ServerConfigContext'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER } from '../components/menuStyles'
 
 export const Route = createFileRoute('/providers')({ component: ProvidersPage })
@@ -30,7 +31,8 @@ const PRIMARY_BTN =
 
 // Rows mirror the Blueprints list: a clickable row (here, clicking sets/clears the quick model)
 // plus a kebab for the rest. The whole row is the primary affordance, so it shows a pointer. A
-// decision model can't be the quick model, so its row has no primary affordance.
+// decision model can't be the quick model, and neither can any model on a deployment that applies
+// Cloudflare limits, so such a row has no primary affordance.
 function ModelRow({
   model,
   isQuick,
@@ -125,11 +127,11 @@ function ModelRow({
             {!isBuiltIn && !isTokenhub && canEdit && (
               <>
                 <DropdownMenu.Item onClick={onEdit} className={MENU_ITEM}>
-                  <PencilSimple size={13} className="mr-2" />
+                  <PencilSimple size={13} />
                   Edit provider
                 </DropdownMenu.Item>
                 <DropdownMenu.Item onClick={onClone} className={MENU_ITEM}>
-                  <Copy size={13} className="mr-2" />
+                  <Copy size={13} />
                   Clone provider
                 </DropdownMenu.Item>
               </>
@@ -143,7 +145,7 @@ function ModelRow({
             )}
             {!isBuiltIn && !isTokenhub && (
               <DropdownMenu.Item variant="danger" onClick={onDelete} className={MENU_ITEM_DANGER}>
-                <Trash size={13} className="mr-2" />
+                <Trash size={13} />
                 Delete provider
               </DropdownMenu.Item>
             )}
@@ -171,6 +173,9 @@ function ProvidersPage() {
 
   const { authenticatedApi } = useAuthenticatedApi()
   const toasts = useKumoToastManager()
+  // A deployment that applies Cloudflare limits runs quick tasks on its own model, so the server
+  // refuses a quick model of the user's there.
+  const quickModelChoosable = !useCloudflareLimitsEnabled()
   const [chatModels, setChatModels] = useState<AiChatAuthorInfo[]>([])
   const [decisionModels, setDecisionModels] = useState<AiChatAuthorInfo[]>([])
   const [quickModel, setQuickModel] = useState<string | null>(null)
@@ -371,6 +376,8 @@ function ProvidersPage() {
                       'models from the enabled providers.'
                     : 'your deployment’s administrator provides the models. Adding your own is ' +
                       'turned off.'}
+                  {!quickModelChoosable &&
+                    ' Fast tasks like generating chat titles use your deployment’s own model.'}
                 </span>
               </Notice>
             )}
@@ -448,7 +455,9 @@ function ProvidersPage() {
                 onClone={() => openWithSource('clone', model)}
                 onDelete={() => handleDelete(model)}
                 onRemove={() => handleRemove(model)}
-                onSetQuick={decisionModels.includes(model) ? undefined : () => handleSetQuick(model.id)}
+                onSetQuick={!quickModelChoosable || decisionModels.includes(model)
+                  ? undefined
+                  : () => handleSetQuick(model.id)}
               />
             </div>
           ))

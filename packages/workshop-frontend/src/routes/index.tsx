@@ -175,7 +175,7 @@ export function HomePageContent({ prompt, agent }: HomeSearch) {
 
   const ensureProvisionalGadget = useCallback(() => {
     if (!provisionalOverseerRef.current) {
-      const overseer = authenticatedApi.newGadget();
+      const overseer = authenticatedApi.newWorkspace();
       provisionalOverseerRef.current = { stub: overseer };
     }
   }, [authenticatedApi]);

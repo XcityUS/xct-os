@@ -75,6 +75,16 @@ export type GatekeeperRecord = {
 };
 
 /**
+ * The vendor a connection belongs to, as its creationSpec names it (case preserved, as account
+ * selection and the User DO's getVerifier() expect it). Undefined for vendorless records
+ * (aiModel/agentSpawner) and legacy ones with no creationSpec.
+ */
+export function connectionVendorId(record: GatekeeperRecord | undefined): string | undefined {
+  let spec = record?.creationSpec;
+  return spec && "vendorId" in spec ? spec.vendorId : undefined;
+}
+
+/**
  * A stored blueprint annotation. Those written while the UI still offered an exclusion control
  * may carry `included: false`, which keeps the binding out of blueprints. Nothing writes the
  * flag anymore, but old binding edges still hold it and collectBindingMetadata honors it.
@@ -406,7 +416,9 @@ export type GatekeeperCaller = {
   /**
    * Which gadget made the call. Optional for backward compatibility: callers embedded in
    * ActionRecords persisted before multi-gadget support have no gadgetId. `defaultGadgetId`
-   * should be assumed when `gadgetId` is absent.
+   * should be assumed when `gadgetId` is absent -- except by observer tracking, which refuses
+   * such a caller (see observerContextOf): the default gadget can change, and attribution must
+   * not.
    */
   gadgetId?: WorkpieceId;
 } | {
@@ -414,7 +426,23 @@ export type GatekeeperCaller = {
   chatId?: number;
 } | {
   from: "hook";
+
+  /**
+   * The gadget the firing hook wakes: its BoundHookRecord's `gadgetId`, or the `defaultGadgetId`
+   * that resolved to when it fired. Observer tracking attributes the firing's observations to it
+   * (see observerContextOf). Absent when neither names a gadget, and on records written before
+   * firings carried it.
+   */
+  gadgetId?: WorkpieceId;
 };
+
+/**
+ * A stored action description. Records written before the wire type required `autoApprovable` may
+ * lack it, and so may a creation card from a stale GatekeeperVendor.createResource(), whose reply
+ * is not validated; readers treat absence as `false`.
+ */
+export type StoredActionDescription =
+    Omit<ActionDescription, "autoApprovable"> & {autoApprovable?: boolean};
 
 export type ActionRecord = {
   id: number,
@@ -445,11 +473,20 @@ export type ActionRecord = {
    * creation queued by createExternalResource, which applies via Gatekeeper.applyCreation().
    */
   action: number | "create";
-  description: ActionDescription;
+  description: StoredActionDescription;
   resolvedBy?: AiChatAuthorInfo;  // set when resolved (approved/rejected); absent while pending (or legacy)
   autoApproved?: boolean;         // set when applied by an auto-approval rule rather than a human
 } | {
   type: "observation";
+
+  /**
+   * `subresources` is kept only on an observation the Workshop verified them for: it writes the
+   * validated list, and strips the field from a pending creation's simulated read. Kept, it makes
+   * the record an observer requirement, attributed by `caller` (see observerContextOf and
+   * ObserverLedger.observerScope). Nothing else stores requirements, which is why the
+   * action log is append-only: deleting such a record would silently drop checks while its
+   * connection still exists.
+   */
   description: ObservationDescription;
 } | {
   type: "bindHook";
@@ -485,9 +522,10 @@ export type BoundHookRecord = {
   gatekeeperId: WorkpieceId;
 
   /**
-   * The gadget whose code this hook wakes. Bookkeeping only -- used to display which gadget a
-   * hook belongs to and to delete a gadget's hooks when the gadget is deleted. Operationally the
-   * `callback` already encapsulates OverseerRestoreParams pointing at the correct gadget.
+   * The gadget whose code this hook wakes: shown as the hook's gadget, deleted with it, and
+   * trusted for its "use" scope and the attribution of its firings (see GatekeeperCaller).
+   * Operationally the `callback` encapsulates its own OverseerRestoreParams, which an agent-bound
+   * hook's inferred gadgetId (see OverseerImpl.bindHook) can rarely mismatch; that is accepted.
    * If omitted, use `defaultGadgetId`.
    */
   gadgetId?: WorkpieceId;
@@ -553,9 +591,22 @@ export type StoredChatMetadata = AiChatMetadata & {hasProposedChanges?: boolean}
  */
 type StoredChangesMessage = Extract<AiChatMessage, {type: "changes"}> & {update?: Uint8Array};
 
-/** A stored chat message: the wire type, except that "changes" messages may be legacy ones. */
+/**
+ * A stored chat message: the wire type plus server-only fields, which are removed before the
+ * message is sent to clients. "changes" messages may also be legacy ones (see
+ * StoredChangesMessage).
+ */
 export type StoredChatMessage =
-    Exclude<AiChatMessage, {type: "changes"}> | StoredChangesMessage;
+    (Exclude<AiChatMessage, {type: "changes"}> | StoredChangesMessage) & {
+      /**
+       * For unread counts: how many visible messages (text or attachments; see
+       * `isCountableChatMessage()` in overseer.ts) the chat has up to and including this record,
+       * counting only from when unread tracking began. Every new record gets this, visible or not,
+       * so any read position can be turned into a count of visible messages by looking up a single
+       * record. Absent on records written before unread tracking existed.
+       */
+      visibleThroughSequence?: number;
+    };
 
 /** Additional per-chat-thread info needed by the AI agent but not by the client. */
 export type AiChatAgentContext = {
@@ -1056,6 +1107,12 @@ export type ShareLinkRecord = {
   role?: CollaboratorRole;
 
   /**
+   * The one gadget a "use" link grants (see PermissionEdge.gadgetId). A "use" link without one
+   * grants every gadget; no such links are created anymore, and redeeming one adds no one new.
+   */
+  gadgetId?: WorkpieceId;
+
+  /**
    * Soft-revocation flag. Revoking a link sets this rather than deleting the record, so that the
    * permission graph keeps its `shareKey` edges intact (no dangling references) and access could
    * be restored in the future. A revoked link contributes nothing to the permission graph and its
@@ -1080,11 +1137,15 @@ export type ShareKeyAliasRecord = {
 export type ShareKeyRecord = ShareLinkRecord | ShareKeyAliasRecord;
 
 /**
- * Storage record describing a non-owner collaborator who has configured their gatekeeper accounts
- * and passed all `addObserver` checks -- i.e. is actually set up to observe data the Gadget has
- * read. This is distinct from the sharing table (which records the owner's *intent* that a user
- * have access): opening requires BOTH a reachable role in the sharing graph AND a complete
- * observer record. See observers-implementation-plan.md §3.
+ * Storage record of a non-owner collaborator's observer identity and the gatekeeper accounts they
+ * chose for it. Their first admission -- to the workspace, for a "build" collaborator, or to one
+ * gadget -- reserves it with no choices before registering its observerId with any gatekeeper, so
+ * concurrent admissions share the id and forward exclusion can always resolve it; each admission
+ * then publishes the choices it verified. The record outlives a failed admission and is deleted
+ * only when the collaborator loses access. This is distinct from the sharing table (which records
+ * the owner's *intent* that a user have access): opening requires BOTH reachable access in the
+ * sharing graph AND passing verification for what is opened, which this record only remembers
+ * choices for. See observers-implementation-plan.md §3.
  */
 export type ObserverRecord = {
   /** The sharing-table key for this user (their profile.id). Primary key of the collection. */
@@ -1099,13 +1160,78 @@ export type ObserverRecord = {
   observerId: string;
 
   /**
-   * The account the user chose to satisfy each in-scope gatekeeper binding, remembered so they are
-   * not asked again. Keyed by gatekeeper id (GatekeeperRecord.id). The accountId refers to a
-   * ConnectedAccountRecord in THIS user's own User DO. An entry records only that choice -- it
-   * asserts nothing about whether the gatekeeper still admits them, which every open re-checks.
+   * The account the user chose to satisfy each in-scope gatekeeper binding, published once an
+   * admission verified it and remembered so they are not asked again; empty on a reservation.
+   * Keyed by gatekeeper id (GatekeeperRecord.id). The accountId refers to a ConnectedAccountRecord
+   * in THIS user's own User DO. An entry records only that choice -- it asserts nothing about
+   * whether the gatekeeper still admits them, which every open re-checks.
    */
   accountChoices: { [gatekeeperId: number]: number };
 };
+
+/**
+ * What an observer requirement is attached to: the workspace (requirements with no
+ * narrower trusted attribution, which every chat and gadget includes), one chat, or one gadget.
+ */
+export type ObserverContext =
+  | {type: "workspace"}
+  | {type: "chat", chatId: number}
+  | {type: "gadget", gadgetId: WorkpieceId};
+
+/**
+ * The context an observation by `caller` is attributed to: its trusted binding authorizer's chat
+ * or gadget, the gadget a firing hook wakes, or the workspace for a hook naming no gadget and a
+ * user acting outside any chat. Undefined for gadget callers persisted without a gadgetId.
+ *
+ * The actions `byObserverRequirement` index stores this mapping's result when each record is
+ * written, so changing an existing attributed mapping requires reindexing its observations keeping
+ * `subresources`.
+ */
+export function observerContextOf(caller: GatekeeperCaller): ObserverContext | undefined {
+  switch (caller.from) {
+    case "agent": return {type: "chat", chatId: caller.chatId};
+    case "user":
+      return caller.chatId !== undefined ? {type: "chat", chatId: caller.chatId} : {type: "workspace"};
+    case "gadget":
+      return caller.gadgetId !== undefined ? {type: "gadget", gadgetId: caller.gadgetId} : undefined;
+    case "hook":
+      return caller.gadgetId !== undefined
+          ? {type: "gadget", gadgetId: caller.gadgetId} : {type: "workspace"};
+  }
+}
+
+// Leads the part of an observer requirement key naming its context's type.
+const OBSERVER_CONTEXT_TAGS = {workspace: "w", chat: "c", gadget: "g"} as const;
+
+/**
+ * `listKeys()` prefix selecting the actions `byObserverRequirement` keys through `gatekeeperId` on
+ * `context`, or on every context of that type when given only a type.
+ */
+export function observerRequirementPrefix(
+    gatekeeperId: WorkpieceId, context: ObserverContext | ObserverContext["type"]): string {
+  if (typeof context === "string") {
+    return `${keyString(gatekeeperId)}:${OBSERVER_CONTEXT_TAGS[context]}`;
+  }
+  let id = context.type === "chat" ? keyString(context.chatId)
+      : context.type === "gadget" ? keyString(context.gadgetId) : "";
+  return `${observerRequirementPrefix(gatekeeperId, context.type)}${id}:`;
+}
+
+/**
+ * Key of the actions `byObserverRequirement` index: one per subresource of an observer
+ * requirement, led by its connection and context (see observerRequirementPrefix()) and ending
+ * with the subresource itself (see observerRequirementSubresource()). The connection and context
+ * parts are colon-free and colon-terminated, so they never run into the subresource.
+ */
+export function observerRequirementKey(
+    gatekeeperId: WorkpieceId, context: ObserverContext, subresource: string): string {
+  return `${observerRequirementPrefix(gatekeeperId, context)}${subresource}`;
+}
+
+/** The subresource an observerRequirementKey() names: everything after its second colon. */
+export function observerRequirementSubresource(key: string): string {
+  return key.slice(key.indexOf(":", key.indexOf(":") + 1) + 1);
+}
 
 // =======================================================================================
 // Blueprints
@@ -1176,6 +1302,10 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
     singletons: {
       // Initialized on first startup.
       ownerId: <string | undefined>undefined,
+      // Set when the workspace starts being deleted. From then on it can't be opened. Its storage is
+      // wiped only after every user who had it listed has confirmed removing it, along with their
+      // unread state and queued notifications for it (see pendingUserUpdates).
+      deleting: false,
 
       // Version of this DO's storage schema, gating lazy migrations. Used to trigger migrations
       // at construction time.
@@ -1256,9 +1386,10 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       // deadWorktreeIds: <WorkpieceId[]>[],
 
       // True if any past observation was authorized that had the `containsRestrictedData` flag
-      // set in its `ObservationDescription`. While set, public-web fetches are refused and every
-      // action pends for manual approval (autoApprovalRule never fires); the approver checks the
-      // action text for restricted data. The key on disk predates the flag's rename.
+      // set in its `ObservationDescription`. While set, web fetches reach only the hosts in
+      // `AdminConfig.restrictedWebFetchHosts`, and every action pends for manual approval
+      // (autoApprovalRule never fires); the approver checks the action text for restricted data.
+      // The key on disk predates the flag's rename.
       containsRestrictedData: singleton(false, {storageKey: "prohibitAllSharing"}),
 
       // True if any past observation was authorized that had the `ownerInvitesOnly` flag set in
@@ -1273,6 +1404,47 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
     },
 
     collections: {
+      // Changes to a user's access to this workspace that still need to be sent to that user's
+      // User DO: a new role (e.g. downgraded to use-only), or removal (`role: null`), which also
+      // clears their unread state and queued notifications for this workspace. When the workspace
+      // is deleted, every user gets a removal. Retried from the alarm until each User DO confirms.
+      // Before each attempt, the user's current access is checked again (via `profileId`), so an
+      // outdated entry is updated or dropped. Deletion entries have no `profileId`.
+      pendingUserUpdates: collection<{
+        /** The recipient's User DO ID. */
+        userId: string;
+        profileId?: string;
+        role: CollaboratorRole | null;
+      }>()({primaryKey: "userId"}),
+      // Chats whose changes (new visible messages, new notifications, renames, deletion) haven't yet
+      // reached every user who tracks unread state for this workspace (the owner and build
+      // collaborators). Written in the same transaction as the change itself, so the update isn't
+      // lost if the DO restarts; the alarm retries it. There's at most one row per chat: later
+      // changes merge into it. The row is deleted once every recipient has accepted the update (or
+      // been skipped for lacking access). See docs/user-unread-state.md.
+      dirtyChats: collection<ChatFanoutStart & {
+        chatId: number;
+        /**
+         * Everyone has received the latest changes except `failedRecipients`, so only they need
+         * another attempt.
+         */
+        retryOnly?: true;
+        /**
+         * Recipients whose last attempt failed, each with the earliest change they still haven't
+         * received. Only written after a failure; a fully successful delivery deletes the row.
+         */
+        failedRecipients?: (ChatFanoutStart & {userId: string})[];
+      }>()({primaryKey: "chatId"}),
+      // Notifications ("task completed" or "permission requested") to send to a user. They're
+      // delivered to the user's User DO along with the chat's next unread update (see dirtyChats).
+      // Each refers to the timeline position where its event happened, rather than copying any
+      // message content. `userId` is the recipient's User DO ID. `id` is a stable notification ID,
+      // reused if recovery records the same outcome again, so the user isn't notified twice.
+      chatNotifications: collection<{
+        id: string;
+        chatId: number; sequence: number; userId: string;
+        kind: "taskCompleted" | "permissionRequested";
+      }>()({primaryKey: record => `${chatKey(record.chatId, record.sequence)}:${record.userId}:${record.kind}`}),
       // READ-ONLY LEGACY: the pre-git-storage incremental code log, tightly-packed from version 1
       // (there's no entry for version 0, the starting empty state). Nothing writes it anymore --
       // mainline code lives in `gitObjects` as commits -- and it is read only by the git-storage
@@ -1360,7 +1532,9 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       actions: collection<ActionRecord>()({
         primaryKey: "id",
 
-        // All three indexes are backfilled by the version-3 migration.
+        // The first three indexes are backfilled by the version-3 migration;
+        // byObserverRequirement needs none: no gatekeeper reported subresources before the
+        // Workshop enforced them, so no earlier observation is a requirement.
         uniqueIndexes: {
           // Resume-replay index (see subscribeToActions): keyed by last state-change time so a
           // reconnect replays only the records changed during the gap.
@@ -1379,6 +1553,23 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
           // read. The "all" filter has no key: it reads the collection itself.
           byHistoryFilter(record: ActionRecord) {
             return record.state === "pending" ? ["pending", record.type] : record.type;
+          },
+
+          // Sparse index over the observer requirements: one key per subresource of each
+          // observation through a real connection that kept `subresources` (see ActionRecord),
+          // led by the connection and the context its caller attributes it to. Admission lists
+          // only the distinct keys (see ObserverLedger.observerScope), never the records
+          // under them, so its cost follows distinct requirements, not repeated reads.
+          byObserverRequirement(record: ActionRecord): string[] {
+            let subresources = record.type === "observation" && record.gatekeeperId >= 0
+                ? record.description.subresources : undefined;
+            let context = subresources ? observerContextOf(record.caller) : undefined;
+            if (!subresources || !context) return [];
+            let keys = new Set<string>();
+            for (let id of subresources) {
+              keys.add(observerRequirementKey(record.gatekeeperId, context, id));
+            }
+            return [...keys];
           },
         }
       }),
@@ -1479,7 +1670,25 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
         primaryKey: "chatId"
       }),
 
-      nextChatSequences: collection<{chatId: number, nextSequence: number}>()({
+      nextChatSequences: collection<{
+        chatId: number;
+        nextSequence: number;
+        /**
+         * Number of visible messages written to the chat since unread tracking began; older history
+         * isn't counted. Equal to the `visibleThroughSequence` of the chat's latest record.
+         */
+        visibleThroughSequence?: number;
+        /**
+         * Sequence of the chat's latest visible message (since unread tracking began), so its
+         * preview can be read directly without searching back through internal activity.
+         */
+        latestVisibleMessageSequence?: number;
+        /**
+         * Sequence of the first record written after unread tracking began. Earlier records have no
+         * `visibleThroughSequence`; they count as read, and their notifications are never sent.
+         */
+        trackingStartSequence?: number;
+      }>()({
         primaryKey: "chatId"
       }),
 
@@ -1538,9 +1747,10 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
         },
       }),
 
-      // Non-owner collaborators who have configured their gatekeeper accounts and passed all
-      // `addObserver` checks. See `ObserverRecord`. The secondary index lets the forward-exclusion
-      // path (`authorizeObservation`) map an opaque observerId back to a profileId.
+      // Non-owner collaborators' observer identities, reserved at their first admission and kept,
+      // with the account choices admissions verified, until they lose access. See
+      // `ObserverRecord`. The secondary index lets the forward-exclusion path
+      // (`authorizeObservation`) map an opaque observerId back to a profileId.
       observers: collection<ObserverRecord>()({
         primaryKey: "profileId",
         uniqueIndexes: {
@@ -1552,6 +1762,22 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
     }
   });
 }
+
+/**
+ * Where a chat's pending unread update starts: the earliest change that recipients haven't received
+ * yet (see `dirtyChats`). It decides which notifications go with the update. For a user who has no
+ * read state for the chat yet, it also sets their starting read position: everything before it
+ * counts as read.
+ */
+export type ChatFanoutStart = {
+  /**
+   * Sequence of the earliest new message or notification in the pending update. Absent if only the
+   * chat's details (e.g. its title) changed.
+   */
+  firstMessageSequence?: number;
+  /** The `visibleThroughSequence` of the earliest new visible message in the pending update, if any. */
+  firstVisibleSequence?: number;
+};
 
 /** The Overseer's typed storage. See makeOverseerStorage. */
 export type OverseerStorage = ReturnType<typeof makeOverseerStorage>;

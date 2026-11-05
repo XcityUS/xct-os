@@ -24,9 +24,8 @@ The ambient binding exposes `ScheduleSession`. The exact agent-facing contract a
 [`src/types.d.ts`](src/types.d.ts).
 
 ```ts
-const callback = await ctx.restore({ type: "dailyBrief" });
-
-const scheduleId = await SCHEDULER.calendarAt(
+// executeCode, where `callback` is a persistent stub for the params `{ type: "dailyBrief" }`
+const scheduleId = await env.SCHEDULER.calendarAt(
   {
     timeZone: "America/Chicago",
     freq: "weekly",
@@ -76,8 +75,9 @@ does not expose schedules from other workspaces in the account.
 
 ## Persistent callbacks and retries
 
-Callbacks implement `ScheduledTaskHook.onSchedule()` and must be made persistent with
-`ctx.restore()` before registration. Each firing contains:
+Callbacks implement `ScheduledTaskHook.onSchedule()` and must be made persistent before
+registration: `this.ctx.restore(params)` inside the Gadget, or through the Gadget's binding from
+`executeCode`, as the agent's instructions on persistent stubs describe. Each firing contains:
 
 - `scheduleId`, the stable registration ID;
 - `runId`, stable across retries of one logical occurrence;

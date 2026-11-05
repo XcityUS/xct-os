@@ -24,8 +24,9 @@
 // Gadget a stub pointing to the Gadget's server-side Durable Object interface.
 
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
-import { AccountDescription, ActionKind, ActionDescription, AvatarImage, GatekeeperUiFrame, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription, HookDescription } from "./gatekeeper.js";
+import { AccountDescription, ActionKind, ActionDescription, AgentCatalog, AvatarImage, GatekeeperUiFrame, GatekeeperUserSelection, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription, HookDescription } from "./gatekeeper.js";
 import type { CodeChange } from "./code-change.js";
+import type { GitOid } from "./gatekeeper.js";
 import type { UiFeatureFlags } from "./feature-flags.js";
 
 export const SERVICE_SALT = new Uint8Array([
@@ -33,16 +34,35 @@ export const SERVICE_SALT = new Uint8Array([
 ]);
 
 /**
+ * How a connect, reconnect, ensure-resources or sign-in flow starts, as returned by
+ * `AuthenticatedApi.connectAccount()` and its siblings. `url` is the gatekeeper's flow URL, which
+ * the Workshop opens as a disowned popup. `nonce` is a 64-lowercase-hex secret minted for this
+ * flow, which the Workshop writes into that popup's own sessionStorage before navigating it and
+ * nowhere else: sessionStorage is per top-level browsing context and per origin, so it survives the
+ * trip through the gatekeeper and the provider and is readable again once the popup is back on the
+ * Workshop's origin. When the flow finishes, the popup lands on the Workshop's /connect/handoff
+ * page, which presents the ticket from its URL fragment together with the nonce
+ * (`AuthenticatedApi.completeConnectHandoff()` / `PublicApi.confirmLogin()`). A handoff page opened
+ * any other way holds no nonce and redeems nothing. The nonce is single-use and dies with the flow:
+ * a connect's after CONNECT_FLOW_LIFETIME_MS (30 minutes, server-side), a sign-in's with its
+ * `PendingLogin` attempt.
+ */
+export type ConnectFlowStart = { url: string; nonce: string };
+
+/**
  * A pending gatekeeper sign-in attempt, returned by `PublicApi.startGatekeeperLogin()`. Holding this
  * stub is the capability to receive the resulting session token; dispose it to abandon the attempt.
  */
 export interface LoginAttempt extends RpcTarget {
   /**
-   * Resolves with a session token (to store and pass to `authenticate()`, same format as `login()`)
-   * once the gatekeeper popup completes, or rejects if the attempt fails or is abandoned. Safe to
-   * call immediately after `startGatekeeperLogin()`.
+   * The session token (same format as `login()`; store it and pass it to `authenticate()`) once the
+   * sign-in popup has confirmed the attempt's ticket via `PublicApi.confirmLogin()`; null until
+   * then, so the caller polls. Throws with a user-facing message once the attempt has expired, the
+   * gatekeeper reported a failure, or the token was already received. Holding this stub alone never
+   * yields a token: the sign-in URL is a bearer capability, and only the popup this browser opened
+   * holds the nonce that confirms it.
    */
-  wait(): Promise<string>;
+  receive(): Promise<string | null>;
 }
 
 /** Public API exposed to the internet. */
@@ -58,14 +78,27 @@ export interface PublicApi extends RpcTarget {
 
   /**
    * Begin a sign-in via an authentication gatekeeper (e.g. "google", "github", "cloudflare").
-   * Returns a `url` the client opens in a new tab (the gatekeeper's OAuth popup, which self-closes)
-   * and an `attempt` stub whose `wait()` resolves once the popup completes. The vendor must be
-   * auth-capable and allowlisted (see ServerConfig.authVendors); throws otherwise.
+   * Returns the `url` the client opens as a disowned popup, the `nonce` it writes into that popup's
+   * sessionStorage before navigating it (see `ConnectFlowStart`), and an `attempt` stub the client
+   * polls with `receive()` for the session token. When the flow finishes, the popup lands on the
+   * Workshop's own /connect/handoff page, which calls `confirmLogin(ticket, nonce)`. The vendor must
+   * be auth-capable and allowlisted (see ServerConfig.authVendors); throws otherwise.
    *
-   * Dispose `attempt` to abandon the sign-in (e.g. the user closed the popup); this cancels the wait
-   * server-side.
+   * Dispose `attempt` to abandon the sign-in (e.g. the user closed the popup). Nothing is cancelled
+   * server-side: the browser just stops polling, and an unreceived token expires on its own.
    */
-  startGatekeeperLogin(vendorId: string): Promise<{ url: string; attempt: RpcStub<LoginAttempt> }>;
+  startGatekeeperLogin(vendorId: string): Promise<{ url: string; nonce: string; attempt: RpcStub<LoginAttempt> }>;
+
+  /**
+   * Confirm a finished sign-in flow. Called by the /connect/handoff page in the sign-in popup, which
+   * has no session: `ticket` is the handoff ticket from the page's URL fragment and `nonce` the one
+   * `startGatekeeperLogin()` returned for the same flow, read from the popup's own sessionStorage.
+   * Marks the attempt's delivered result as confirmed, so that `LoginAttempt.receive()` releases the
+   * token to whoever holds the attempt stub; the popup itself never sees a token. Throws with a
+   * user-facing message when the attempt is unknown, expired, or failed, or the ticket is not the
+   * attempt's.
+   */
+  confirmLogin(ticket: string, nonce: string): Promise<void>;
 
   /** Authenticates the user using an auth token (typically stored in localStorage). */
   authenticate(token: string): Promise<AuthenticatedApi>;
@@ -146,6 +179,45 @@ export interface ConnectedAccountsSubscriber {
   ready(): void;
 }
 
+/** A notification delivered to one authenticated user. */
+export type UserNotification = {
+  /** Stable identifier shared by the live and push delivery attempts. */
+  id: string;
+
+  /** Whether the task finished or is paused on a connection or action-approval prompt. */
+  kind: "taskCompleted" | "permissionRequested";
+
+  /** Workspace containing the task. */
+  workspaceId: string;
+
+  /** Chat containing the task. */
+  chatId: number;
+
+  /** Current human-readable chat title. */
+  chatTitle: string;
+};
+
+/** A browser's Web Push subscription: the endpoint its push service issued, and the keys that encrypt pushes to it. */
+export type WebPushSubscription = {
+  /** Push service URL the browser issued for this subscription. */
+  endpoint: string;
+  /** The browser's encryption keys, base64url-encoded as `PushSubscription.toJSON()` returns them. */
+  keys: { p256dh: string; auth: string };
+};
+
+/** How long a workspace's notifications stay muted: until a time, or until the user unmutes it. */
+export type NotificationMute = { until: Date, indefinite?: never } | { indefinite: true, until?: never };
+
+/** Callback used by `AuthenticatedApi.subscribeToNotifications()`. */
+export interface NotificationSubscriber extends RpcTarget {
+  /**
+   * Present a notification to the active user. Resolve only once the user has seen it, or is
+   * already viewing its chat; if no subscriber resolves promptly, the backend falls back to push to
+   * the user's registered devices and browsers.
+   */
+  notify(notification: UserNotification): Promise<void>;
+}
+
 /**
  * When listing gatekeeper vendors or connected accounts, you can filter to only vendors/accounts
  * that support certain features. This type specifies the filter.
@@ -216,6 +288,17 @@ export function validateBindingName(name: string): void {
   if (name === "prototype" || name in Object.prototype) {
     throw new Error(
         `Invalid binding name "${name}": this name collides with a built-in object property.`);
+  }
+}
+
+/**
+ * Throws unless `email` is acceptable as `AiChatAuthorInfo.commitEmail`: `local@domain`, at most
+ * 254 characters, with no whitespace, control characters, or angle brackets. This is not full
+ * address validation; it exists so the value cannot break out of a git `Name <email>` header.
+ */
+export function validateCommitEmail(email: string): void {
+  if (email.length > 254 || !/^[^\p{Cc}\s<>@]+@[^\p{Cc}\s<>@]+$/u.test(email)) {
+    throw new Error(`Invalid commit email: expected an address like name@example.com.`);
   }
 }
 
@@ -315,6 +398,7 @@ function codedErrorFamily<Code extends string>(messages: Record<Code, string>) {
 export const OPEN_GADGET_ERROR_CODES = {
   workspaceNotFound: "WORKSPACE_NOT_FOUND",
   workspaceAccessDenied: "WORKSPACE_ACCESS_DENIED",
+  shareLinksDisabled: "SHARE_LINKS_DISABLED",
 } as const;
 
 /** An expected failure code from `AuthenticatedApi.openGadget()`. */
@@ -324,6 +408,9 @@ export type OpenGadgetErrorCode =
 const openGadgetErrors = codedErrorFamily<OpenGadgetErrorCode>({
   [OPEN_GADGET_ERROR_CODES.workspaceNotFound]: "Workspace not found.",
   [OPEN_GADGET_ERROR_CODES.workspaceAccessDenied]: "You don't have access to this workspace.",
+  [OPEN_GADGET_ERROR_CODES.shareLinksDisabled]:
+      "Share links are disabled for this workspace because it contains sensitive data. " +
+      "The owner must add each person directly.",
 });
 
 /** Creates an expected `openGadget()` error with a machine-readable code. */
@@ -356,13 +443,67 @@ export const createAuthError = authErrors.create;
 /** Reads the machine-readable code from an authentication failure. */
 export const getAuthErrorCode = authErrors.getCode;
 
+/**
+ * One user as listed in the deployment-wide user directory (see
+ * `AuthenticatedApi.searchUsers`).
+ */
+export type UserDirectoryRecord = {
+  /**
+   * Canonical user identifier: email for Access / sign-in accounts, username
+   * for password accounts.
+   */
+  id: string;
+
+  /** The user's current display name. */
+  name: string;
+};
+
+/** Routing identity and one-use proof posted by the authenticated browser to redeem a transfer. */
+export type DeviceSessionHandoffStart = {
+  /** Durable Object identifier for the staging user; this value is not secret. */
+  userDoId: string;
+  /** Single-use 256-bit secret in lowercase hex; only its hash is stored server-side. */
+  ticket: string;
+};
+
 /** Top-level API exposed to the user after they have authenticated. */
 export interface AuthenticatedApi extends RpcTarget {
   /** Get profile info for the user who is logged in. */
   whoami(): Promise<AiChatAuthorInfo>;
 
+  /**
+   * Stage a two-minute, single-use device-session transfer for a native app. The state is an
+   * opaque 16–512 character URL-safe value and the key is an uncompressed P-256 public key encoded
+   * as unpadded base64url. The encrypted credential remains server-side until the browser POSTs
+   * the returned ticket to `/api/device-session/callback`, which redirects to the fixed, claimed
+   * HTTPS app link. Repeating a live state reissues its ticket and invalidates the previous one.
+   */
+  beginDeviceSessionHandoff(publicKey: string, state: string)
+    : Promise<DeviceSessionHandoffStart>;
+
   /** Set the user's own display name, seen in chats, etc. */
   setOwnDisplayName(name: string): Promise<void>;
+
+  /**
+   * Set the email address used on git commits the user authors, or clear it with null to fall
+   * back to one derived from their user ID. Rejects an address `validateCommitEmail` refuses.
+   */
+  setOwnCommitEmail(email: string | null): Promise<void>;
+
+  /**
+   * Find other users of this deployment by a case-insensitive substring of
+   * their display name or id, for inviting collaborators. Excludes the caller
+   * and every user named by `excludeIds`. Returns at most 10 records, earliest
+   * substring match first.
+   *
+   * Rejects a `query` longer than 1000 characters or containing a line break,
+   * and more than 1000 distinct ids to exclude, the caller's own included.
+   *
+   * Returns no records while the admin has user search turned off
+   * (`ServerConfig.userSearchEnabled`); inviting by exact username/email via
+   * `Overseer.addCollaborator()` still works then.
+   */
+  searchUsers(query: string, excludeIds: string[]): Promise<UserDirectoryRecord[]>;
 
   /**
    * Change the user's password, if using password-based authentication.
@@ -378,18 +519,69 @@ export interface AuthenticatedApi extends RpcTarget {
   hasPasswordLogin(): Promise<boolean>;
 
   /**
-   * List the user's configured AI models.
+   * Register one of the user's devices for push: the native app's one-time central device
+   * registration, or this browser's Web Push subscription. Each registered device gets push; a
+   * device that registers again replaces its own subscription. The deployment never receives an
+   * APNs device token or Cloudflare account token. A browser's subscription passes through it to
+   * the central notification service, which delivers to an endpoint only for its most recent
+   * registration.
+   */
+  registerNotificationDevice(registration: string | WebPushSubscription): Promise<void>;
+
+  /**
+   * Subscribe while this client can visibly present notifications. Dispose the returned handle
+   * when the page becomes hidden so the backend can promptly fall back to push.
+   */
+  subscribeToNotifications(
+      subscriber: RpcStub<NotificationSubscriber>): Promise<RpcStub<{}>>;
+
+  /**
+   * Mute a workspace in the user's list, so its finished tasks notify no tab or device, or unmute
+   * it with null. Permission requests still come through.
+   */
+  setWorkspaceNotificationMute(workspaceId: string, mute: NotificationMute | null): Promise<void>;
+
+  /**
+   * List the user's configured AI models of one kind, by default the language models, which can
+   * chat.
    *
    * Note that the list returned here could be different from a particular gadget's Overseer,
    * especially if the gadget is owned by someone else.
    */
-  listModels(): Promise<AiChatAuthorInfo[]>;
+  listModels(kind?: ModelKind): Promise<AiChatAuthorInfo[]>;
 
   /**
-   * Adds a new model to the user's configured set. The ID must be unique among the user's
-   * configured models.
+   * Adds a new model to the user's configured set. The ID must not name a model the user already
+   * added; use `updateModel()` to replace one.
+   *
+   * `copySecretsFrom` names a hand-added model (see `getModelConfig()`) whose stored secrets fill
+   * in the `null` secrets of `config`, which is how a model is cloned without the client ever
+   * holding the secrets. The rules of `updateModel()` for keeping a secret apply to copying one.
+   * Without it, `config` must contain no `null` secrets. With it, `profile.id` must also not name
+   * a model provided by the deployment's AI Gateway configuration.
+   *
+   * Throws on a deployment whose users may not add their own models (see
+   * `AiGatewayInfo.userModelsEnabled`), as `updateModel()` does.
    */
-  addModel(profile: AiChatAuthorInfo, config: AiModelConfig): Promise<void>;
+  addModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig,
+           copySecretsFrom?: string): Promise<void>;
+
+  /**
+   * Gets the profile and configuration of a model the user added by hand, i.e. not one provided
+   * by the deployment's AI Gateway configuration, with its secrets withheld.
+   */
+  getModelConfig(id: string): Promise<{profile: AiChatAuthorInfo, config: RedactedAiModelConfig}>;
+
+  /**
+   * Replaces the configuration of a model the user added by hand. `profile.id` names the model,
+   * and `config.provider` and `config.model` must match the stored values.
+   *
+   * A `null` secret keeps the stored value; for a header, that of the stored header with exactly
+   * the same name. Secrets may be kept only while `config.provider` and `config.apiUrl` are
+   * unchanged, since otherwise the client could direct the stored secrets to a server it controls.
+   * Passing back what `getModelConfig()` returned therefore changes nothing.
+   */
+  updateModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig): Promise<void>;
 
   /** Deletes a configured model. */
   deleteModel(id: string): Promise<void>;
@@ -414,11 +606,16 @@ export interface AuthenticatedApi extends RpcTarget {
 
   /**
    * Get the user's preferred model, chosen during onboarding. Returns null if the user has not
-   * set a preference (or explicitly chose "No agent").
+   * set a preference (or explicitly chose "No agent"). The preference may name a model that is
+   * no longer offered (see setPreferredModel).
    */
   getPreferredModel(): Promise<string | null>;
 
-  /** Set the user's preferred model. Pass null to indicate "No agent". */
+  /**
+   * Set the user's preferred model. Pass null to indicate "No agent". Any model that resolves is
+   * accepted, including one hidden from pickers, but a new external conversation uses the
+   * preference only while it is offered, and otherwise the first offered model.
+   */
   setPreferredModel(id: string | null): Promise<void>;
 
   /** List Xcity marketplace agents available from the deployment's configured xct-home catalog. */
@@ -479,7 +676,9 @@ export interface AuthenticatedApi extends RpcTarget {
    * Open an existing gadget.
    *
    * If `shareKey` is provided, the server redeems it before opening, adding the caller as a
-   * collaborator. If the key is invalid or expired, the call throws an exception. This design
+   * collaborator. If the key is invalid or expired, the call throws an exception. If the gadget has
+   * `ownerInvitesOnly` set (see `GadgetMetadata`), a caller the owner has not added directly
+   * is refused with a `shareLinksDisabled` coded exception. This design
    * allows share-key redemption and gadget opening in a single round trip, and further calls
    * can be pipelined on the returned Overseer.
    *
@@ -519,6 +718,9 @@ export interface AuthenticatedApi extends RpcTarget {
    */
   listGadgets(): Promise<GadgetMetadataWithTimestamps[]>;
 
+  /** Pin or unpin this workspace in the user's list. */
+  setWorkspacePinned(workspaceId: string, pinned: boolean): Promise<void>;
+
   /**
    * List the outputs of all the user's workspaces. Used to display the Outputs page, which lets
    * the user find things they made without remembering which workspace they made them in.
@@ -544,10 +746,12 @@ export interface AuthenticatedApi extends RpcTarget {
   listGatekeeperVendors(filter?: GatekeeperVendorFilter): Promise<GatekeeperVendorInfo[]>;
 
   /**
-   * Connect this account to a specific account on a third-party service. Returns the URL which
-   * should be opened in a new tab in the user's browser to complete the authorization. When the
-   * authorization flow completes, the account will be added to the list, which can be observed
-   * through subscribeConnectedAccounts().
+   * Connect this account to a specific account on a third-party service. Returns the URL which the
+   * Workshop opens as a disowned popup to complete the authorization, plus the flow's nonce (see
+   * `ConnectFlowStart`). When the flow finishes, the popup lands on the Workshop's own
+   * /connect/handoff page, which redeems the handoff with completeConnectHandoff() over its own
+   * session; only then is the account added to the list, which can be observed through
+   * subscribeConnectedAccounts().
    *
    * `resourceUrlPatterns`, if given, limits the connection to the authorization needed for those
    * grantable resource types (those with `grantable`; see `SupportedResource`). If omitted,
@@ -556,15 +760,31 @@ export interface AuthenticatedApi extends RpcTarget {
    * caller connects an account for a non-resource purpose (e.g. billing) without asking the user to
    * grant data access it will never use.
    */
-  connectAccount(vendorId: string, resourceUrlPatterns?: string[]): Promise<{url: string}>;
+  connectAccount(vendorId: string, resourceUrlPatterns?: string[]): Promise<ConnectFlowStart>;
+
+  /**
+   * Redeem a finished connect flow's handoff. Called by the Workshop's own /connect/handoff page
+   * running in the popup, over the popup's session, which is the initiating user's (the SPA
+   * authenticates as any Workshop tab does: from the shared localStorage token, or from the
+   * Cloudflare Access identity in an Access deployment). `ticket` is the handoff ticket from the
+   * page's URL fragment; `nonce` must be the one connectAccount() / reconnectAccount() /
+   * ensureAccountResources() returned for the flow that produced the ticket, read from the popup's
+   * own sessionStorage. Both are single-use. Activates the pending connect / reconnect /
+   * ensure-resources grant, after which the account (or its restored credentials) appears via
+   * subscribeConnectedAccounts(). Throws with a user-facing message if the ticket or nonce is
+   * unknown to this user, already used, or expired, or they belong to different flows.
+   */
+  completeConnectHandoff(ticket: string, nonce: string): Promise<void>;
 
   /**
    * Ensure the authorization for the listed grantable resource types (by `urlPattern`) is granted
-   * on a connected account, expanding if needed. Returns a URL to open in a new tab to authorize
-   * them, or no url if nothing was needed. The updated grant is observable via
-   * subscribeConnectedAccounts().
+   * on a connected account, expanding if needed. Returns a flow to open as a disowned popup (as for
+   * connectAccount()) to authorize them, or null if nothing was needed. Completion is redeemed via
+   * completeConnectHandoff(); the updated grant is then observable via subscribeConnectedAccounts().
+   * Returning null also re-reads the account's description, so a list of granted resource types
+   * that was out of date is corrected and observable the same way.
    */
-  ensureAccountResources(accountId: number, resourceUrlPatterns: string[]): Promise<{url?: string}>;
+  ensureAccountResources(accountId: number, resourceUrlPatterns: string[]): Promise<ConnectFlowStart | null>;
 
   /**
    * List the auto-provisioning ("ambient") gatekeepers the user can opt into right now: those set to
@@ -608,6 +828,14 @@ export interface AuthenticatedApi extends RpcTarget {
     accountId: number,
     resourceUrlPattern: string,
   ): Promise<ResourceConfiguratorFrame>;
+
+  /**
+   * Get the UI in which the approver of a creation of the type `resourceUrlPattern` configures it
+   * in their connected account `accountId` (see SupportedResource.creationConfigurator). The
+   * frame's collectResourceUrl() gives CreationApproval.configuration.
+   */
+  startCreationConfigurator(accountId: number, resourceUrlPattern: string)
+      : Promise<GatekeeperUiFrame>;
 
   /**
    * Remove a shared gadget from the user's home page listing. Does NOT revoke the user's
@@ -692,10 +920,12 @@ export interface AuthenticatedApi extends RpcTarget {
 
   /**
    * Re-authenticate a connected account whose credentials have expired (or may be about to
-   * expire). Returns the URL to open in a new tab. When the OAuth flow completes, the account
-   * is updated and subscribers are notified with credentialsValid: true.
+   * expire). Returns a flow to open as a disowned popup (as for connectAccount()). Once the OAuth
+   * flow completes and the popup's /connect/handoff page redeems the handoff via
+   * completeConnectHandoff(), the account is updated and subscribers are notified with
+   * credentialsValid: true.
    */
-  reconnectAccount(accountId: number): Promise<{url: string}>;
+  reconnectAccount(accountId: number): Promise<ConnectFlowStart>;
 
   // --- Gatekeeper management apps ---
 
@@ -712,6 +942,16 @@ export interface AuthenticatedApi extends RpcTarget {
    * in a sandboxed iframe and exposes `ui` to it over a MessagePort RPC session.
    */
   getGatekeeperApp(id: string): Promise<GatekeeperUiFrame | null>;
+
+  /**
+   * Mint a single-use ticket for a user selected on behalf of a gatekeeper app,
+   * redeemable through that gatekeeper app's exchange capability (see
+   * GatekeeperUserSelectionExchangeImpl). Returns null if the selected user is
+   * this user or does not exist.
+   */
+  createGatekeeperUserSelection(
+      vendorId: string, selectedUserId: string,
+  ): Promise<GatekeeperUserSelection | null>;
 
   // --- Deployment admin ---
 
@@ -871,10 +1111,52 @@ export const MAX_SITE_LOGO_BYTES = 256 * 1024;
 /** Maximum width or height of an admin-uploaded site logo in pixels. */
 export const MAX_SITE_LOGO_DIMENSION = 512;
 
+/**
+ * The default of the deployment's check interval (see AdminApi.setUpdateCheckIntervalMinutes): how
+ * many minutes a successful update check is relied on before the deployment asks again.
+ */
+export const DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES = 60;
+
+/** The largest check interval, in minutes, an admin may set: 30 days. */
+export const MAX_UPDATE_CHECK_INTERVAL_MINUTES = 43_200;
+
+/**
+ * The default of the deployment's minimum age (see AdminApi.setUpdateMinimumAgeHours): how many
+ * hours a newer release must have been available before admins are notified of it.
+ */
+export const DEFAULT_UPDATE_MINIMUM_AGE_HOURS = 24;
+
+/**
+ * The default of the deployment's notice snooze (see AdminApi.setUpdateNoticeSnoozeHours): how
+ * many hours a dismissed update notice stays hidden in the browser that dismissed it.
+ */
+export const DEFAULT_UPDATE_NOTICE_SNOOZE_HOURS = 24;
+
+/** The largest minimum age and notice snooze, in hours, an admin may set: 30 days. */
+export const MAX_UPDATE_HOURS = 720;
+
+/**
+ * The path a Workshop browser POSTs to, through the router, before it reads the update status, so
+ * that the backend records the router's current version tag first. The Workshop's other calls
+ * travel over one WebSocket, which carries the router's tag only when it opens. Answered with an
+ * empty 204.
+ */
+export const ROUTER_TAG_PROBE_PATH = "/api/router-tag";
+
+/**
+ * The path a Workshop browser GETs, through the router, to learn the version id of the backend that
+ * new requests reach: `{ version: string | null }`, never cached, `null` where the backend has no
+ * version id. A deploy does not move the WebSocket a tab already holds, so a tab whose
+ * `ServerConfig.backendVersion` differs is still talking to an older backend, and reconnects.
+ */
+export const VERSION_PATH = "/api/version";
+
 /** All admin-managed deployment settings, returned by AdminApi.getSettings() for the admin UI. */
 export type AdminSettingsView = {
   /** Whether new account signups are allowed. */
   signupsEnabled: boolean;
+  /** Whether users may search the user directory to find collaborators. */
+  userSearchEnabled: boolean;
   /** Site name shown next to the top-bar logo ("" falls back to DEFAULT_SITE_NAME). */
   siteName: string;
   /** Custom deployment logo, or undefined to use the default Xcity OS mark. */
@@ -891,6 +1173,27 @@ export type AdminSettingsView = {
   resourceVendors: AdminResourceVendor[];
   /** The blueprints promoted as standard output formats, in menu order (including disabled ones). */
   formats: AdminFormat[];
+  /** The models the deployment provides through AI Gateway. Absent outside AI Gateway mode. */
+  gatewayModels?: {
+    /** The providers a model may be added under: the ones the gateway both enables and serves. */
+    providers: AiModelProvider[];
+    /** Every provider the gateway serves, on or off, in the order the models are listed in. */
+    providerSettings: AdminGatewayProvider[];
+    /** Every gateway model, in any mode, in listing order. */
+    models: AdminModelView[];
+    /**
+     * The reasoning level of each gateway model that has none of its own (see
+     * AdminApi.setDefaultReasoning), or null while the deployment sets none.
+     */
+    defaultReasoning: ReasoningLevel | null;
+    /** Whether users may add models of their own (see AdminApi.setUserModelsEnabled). */
+    userModelsEnabled: boolean;
+    /**
+     * Whether the admin UI may suggest models from models.dev while an admin adds one (see
+     * AdminApi.setModelsDevSuggestions).
+     */
+    modelsDevSuggestions: boolean;
+  };
 };
 
 /**
@@ -929,19 +1232,90 @@ export type AdminFormat = {
   missing: boolean;
 
   /**
-   * The blueprint ships with the deployment (see format-blueprints/ and the FORMAT_BLUEPRINTS the
-   * build generates from it), so an upgrade can replace its contents. Curation stays the admin's: an upgrade never re-promotes something they
+   * The blueprint ships with the deployment (see packages/bundled-blueprints and the
+   * BUNDLED_BLUEPRINTS the backend's build generates from it), so an upgrade can replace its contents. Curation stays the admin's: an upgrade never re-promotes something they
    * removed, nor resets their overrides.
    */
   bundled: boolean;
 };
 
 /**
+ * Whether a newer release is available for a deployment the deploy flow installed, returned by
+ * AdminApi.getUpdateStatus(). The check fields describe the last successful update check made for
+ * the release this backend runs: until one succeeds, `latestReleaseId`, `availableSince` and
+ * `checkedAt` are absent and `updateAvailable` is false.
+ */
+export type DeploymentUpdateStatus = {
+  /** The release this backend runs. */
+  currentReleaseId: string;
+  /** The newest release the last successful check for `currentReleaseId` reported. */
+  latestReleaseId?: string;
+  /** Whether that check said a release newer than `currentReleaseId` exists. */
+  updateAvailable: boolean;
+  /**
+   * When the first release newer than `currentReleaseId` was published. Absent unless
+   * `updateAvailable`.
+   */
+  availableSince?: Date;
+  /**
+   * Whether the home page should show admins the update notice now, before the browser applies
+   * its own dismissal (see `noticeSnoozeHours`). True exactly when `checksEnabled`, the check says
+   * `updateAvailable`, the deployment is not `modified`, and `availableSince` is at least
+   * `minimumAgeHours` ago.
+   */
+  notify: boolean;
+  /**
+   * Whether the deployment checks for updates by itself (see AdminApi.setUpdateChecksEnabled).
+   * When false, `notify` is false and only AdminApi.checkForUpdates() asks for the newest release.
+   */
+  checksEnabled: boolean;
+  /**
+   * The deployment's check interval: how many minutes a successful check is relied on before the
+   * deployment asks again (see AdminApi.setUpdateCheckIntervalMinutes).
+   */
+  checkIntervalMinutes: number;
+  /**
+   * The deployment's minimum age: how many hours a newer release must have been available before
+   * `notify` is true (see AdminApi.setUpdateMinimumAgeHours).
+   */
+  minimumAgeHours: number;
+  /**
+   * The deployment's notice snooze: how many hours a browser hides the notice after an admin
+   * dismisses it there (see AdminApi.setUpdateNoticeSnoozeHours).
+   */
+  noticeSnoozeHours: number;
+  /**
+   * Whether this deployment's running code differs from what the deploy flow installed: true
+   * exactly when `modifiedWorkers` is non-empty. The deploy flow refuses to upgrade a modified
+   * deployment.
+   */
+  modified: boolean;
+  /**
+   * The Workers whose running version is neither this installation's current one nor another
+   * release of it: they have no version tag, or one the deploy flow did not write for this
+   * installation. Each is "backend", "router", or a gatekeeper's install slug. A Worker that did
+   * not report its version is in neither this list nor `unfinishedWorkers`.
+   */
+  modifiedWorkers: string[];
+  /**
+   * The Workers still running another release of this installation: an update that did not
+   * finish, which the deploy flow can finish once no Worker is modified. Named as in
+   * `modifiedWorkers`. Unlike those, they do not affect `notify`.
+   */
+  unfinishedWorkers: string[];
+  /** The opaque link that opens the deploy flow for this installation. */
+  updateUrl: string;
+  /** When the last successful check for `currentReleaseId` was made. */
+  checkedAt?: Date;
+};
+
+/**
  * Capability for managing deployment-wide admin settings, obtained via
  * AuthenticatedApi.getAdminApi() (which is null for non-admins). The access check happens when the
- * capability is minted, so these methods don't re-check. Covers branding, agent instructions, and
- * which gatekeeper connectors/resources are offered — NOT authentication config (that's env-var
- * driven). Each setter throws on invalid input.
+ * capability is minted, so these methods don't re-check. Covers branding, agent instructions,
+ * which gatekeeper connectors/resources are offered, and the models an AI Gateway deployment
+ * provides — NOT authentication config (that's env-var driven). Each setter throws on invalid
+ * input.
  */
 export interface AdminApi {
   /** Read all admin-managed settings for the admin UI in one call. */
@@ -949,6 +1323,12 @@ export interface AdminApi {
 
   /** Enable or disable new account signups. Existing users can still log in while signups are closed. */
   setSignupsEnabled(enabled: boolean): Promise<void>;
+
+  /**
+   * Enable or disable user directory search. The directory itself is maintained
+   * either way, and this switch just controls user access.
+   */
+  setUserSearchEnabled(enabled: boolean): Promise<void>;
 
   /**
    * Set the site name shown next to the top-bar logo. Pass "" to reset to DEFAULT_SITE_NAME.
@@ -1038,6 +1418,188 @@ export interface AdminApi {
 
   /** Reorder the menu. `blueprintIds` must be a permutation of the currently promoted ids. */
   setFormatOrder(blueprintIds: string[]): Promise<void>;
+
+  // --- AI Gateway models ---
+  //
+  // The models the deployment provides through AI Gateway (AdminSettingsView.gatewayModels). Each
+  // of these throws outside AI Gateway mode.
+
+  /**
+   * Set how the deployment offers one of its gateway models (see GatewayModelMode). Setting the
+   * model's default mode forgets the override, so the model follows its default from then on.
+   * Throws if `modelId` is not one of the deployment's gateway models.
+   *
+   * 'disabled' revokes nothing that is stored: the chats, spawners, preferences and gadget model
+   * bindings that name the model keep naming it, and stop resolving for as long as it is disabled.
+   */
+  setGatewayModelMode(modelId: string, mode: GatewayModelMode): Promise<void>;
+
+  /**
+   * Add a model to the ones the deployment provides, listed after its provider's suggested models
+   * and 'enabled' by default. Throws if the model is malformed (an empty or over-long ID or name,
+   * an over-long `behavesLike`, a token limit that isn't a positive integer), if the gateway does
+   * not serve and enable its provider (see AdminSettingsView.gatewayModels), if a suggested or
+   * added model already has its ID, if the model runtime does not know its `behavesLike` under
+   * its provider, or if what its context window reserves for the response (its output limit, or
+   * WORKERS_AI_OUTPUT_LIMIT for a Cloudflare model that gives none) leaves a prompt no room.
+   */
+  addGatewayModel(model: GatewayModel): Promise<void>;
+
+  /**
+   * Remove a model added with addGatewayModel(), along with its mode and settings. Throws if no
+   * added model has this ID; a suggested model can't be removed, only disabled.
+   *
+   * Removing frees the ID rather than reserving it. The chats, spawners and preferences that name
+   * the model resolve again if a model is later added under the same ID. A gadget model binding
+   * minted for it carries its own provider and model, so while users may add their own models
+   * (see setUserModelsEnabled) it runs once the model is removed, even if the model was disabled.
+   * To shut a model off, disable it instead.
+   */
+  removeGatewayModel(modelId: string): Promise<void>;
+
+  /**
+   * Set whether users may add models of their own, which run through the deployment's gateway
+   * like the models it provides. On by default.
+   *
+   * Off makes the deployment's models the only ones: a user can't add or edit a model, and the
+   * models users added are neither listed nor resolved. A gadget model binding stops at its next
+   * call unless a gateway model has its provider and model. Nothing stored is deleted, so the
+   * models users added work again once this is back on.
+   */
+  setUserModelsEnabled(enabled: boolean): Promise<void>;
+
+  /**
+   * Set whether the admin UI may suggest models from models.dev while an admin adds one. Off by
+   * default.
+   *
+   * The admin's browser reads the setting and, with it on, downloads models.dev's public model
+   * list while an admin adds a model, to fill in the add-model form. It changes nothing the server
+   * does: the server never contacts models.dev, and addGatewayModel() validates a suggested model
+   * like any other.
+   */
+  setModelsDevSuggestions(enabled: boolean): Promise<void>;
+
+  /**
+   * Replace what the deployment sets for one of its gateway models (see GatewayModelSettings):
+   * a field left out of `settings` is unset, and an empty `settings` unsets everything. Throws
+   * if `modelId` is not one of the deployment's gateway models, or if the compaction budget is
+   * not a positive whole number within the model's maximum (see
+   * AdminModelView.maxCompactionInputBudget).
+   *
+   * The reasoning level may be one the model lacks, since it is fitted to the model when a
+   * request is made (see ReasoningLevel).
+   */
+  setGatewayModelSettings(modelId: string, settings: GatewayModelSettings): Promise<void>;
+
+  /**
+   * Set the reasoning level of every gateway model that has none of its own, or null for each
+   * model's built-in behaviour. It never applies to a model a user added.
+   */
+  setDefaultReasoning(level: ReasoningLevel | null): Promise<void>;
+
+  /**
+   * Turn a provider on or off beside the ones CF_AI_GATEWAY_PROVIDERS lists. On is the same as
+   * listing it there: its suggested models appear in their default modes, models can be added
+   * under it, and so can users' own while those are allowed. Throws for a provider the gateway
+   * does not serve, and when turning off one that the variable lists: it is a floor, which an
+   * admin adds to.
+   *
+   * Off takes the provider's models out of the deployment's and deletes nothing: their modes and
+   * settings, and the models added under the provider, are kept for when it is back on. It stops
+   * neither a model a user already added under the provider nor a gadget model binding already
+   * minted for one of its models, which setUserModelsEnabled(false) does.
+   */
+  setGatewayProviderEnabled(provider: AiModelProvider, enabled: boolean): Promise<void>;
+
+  /**
+   * Send one small request to the first of a provider's SUGGESTED_MODELS through the gateway, as
+   * the admin, and report what happened within 15 seconds: the Workshop can't see which provider
+   * keys the gateway holds. It works on a provider that is off, and changes nothing. Throws for
+   * a provider the gateway does not serve; a request that fails is a result (see
+   * GatewayModelTest).
+   *
+   * A pass says that one model answered once. A 401 or 403 does not tell a provider key the
+   * gateway lacks from a CF_AI_GATEWAY_API_TOKEN that may not run models. The request is a
+   * quick one that takes none of a model's settings: testGatewayModel() sends a model the
+   * request its chats would.
+   */
+  testGatewayProvider(provider: AiModelProvider): Promise<GatewayModelTest>;
+
+  /**
+   * Send one request to a gateway model the way a chat turn would, through the gateway, as the
+   * admin, and report what happened within 30 seconds. The request asks for the reasoning level
+   * in effect for the model (its own, else the deployment's default, else what BuiltInReasoning
+   * describes), with the capabilities stated for it and the flags of the model it behaves like,
+   * under a response cap of at most 2,048 tokens. A level that a model takes as a token budget
+   * comes out of that cap, so it is cut to the room the cap leaves and is smaller than a chat's.
+   * It works on a model in any mode, hidden and disabled included, and changes nothing. Throws
+   * outside AI Gateway mode and for an ID that names no gateway model; a request that fails is a
+   * result (see GatewayModelTest).
+   *
+   * A pass says that the model answered that one request. It costs more than
+   * testGatewayProvider(), whose quick request is capped at a few tokens.
+   */
+  testGatewayModel(modelId: string): Promise<GatewayModelTest>;
+
+  /**
+   * Test a model as described, without adding it. It sends one request the way a chat turn would
+   * with no reasoning level set (so asking for what BuiltInReasoning describes, whatever the
+   * deployment's default level is), and one at each reasoning level the model would list once
+   * added (see AdminModelView.reasoningLevels). The requests are sent together, through the
+   * gateway, as the admin, each under testGatewayModel()'s response cap and time limit. The
+   * results come with the request that set no level first, then the levels from least to most.
+   * It stores nothing. Throws outside AI Gateway mode and for a model addGatewayModel() would
+   * refuse, for the same reason; a request that fails is a result (see GatewayModelLevelTest).
+   *
+   * A pass says that the model answered that one request. A model that lists every level is sent
+   * eight requests, each of which may use the whole response cap.
+   */
+  testNewGatewayModel(model: GatewayModel): Promise<GatewayModelLevelTest[]>;
+
+  /**
+   * Whether a newer release is available. Null unless the deploy flow installed this deployment.
+   * While automatic update checks are off (see setUpdateChecksEnabled) it asks no one and reports
+   * the last check made for the running release, if any.
+   */
+  getUpdateStatus(): Promise<DeploymentUpdateStatus | null>;
+
+  /**
+   * Ask now for the newest release, whether or not automatic update checks are on, and return
+   * the status that check produces. Null unless the deploy flow installed this deployment. Throws
+   * when the check fails.
+   */
+  checkForUpdates(): Promise<DeploymentUpdateStatus | null>;
+
+  /**
+   * Set whether the deployment checks for updates by itself. On by default. When off,
+   * getUpdateStatus() makes no outbound call and admins are never notified; checkForUpdates()
+   * still asks.
+   */
+  setUpdateChecksEnabled(enabled: boolean): Promise<void>;
+
+  /**
+   * Set how many minutes a successful update check is relied on before the deployment asks again,
+   * DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES by default. A failed check is retried after the interval
+   * or 15 minutes, whichever is shorter. The deployment asks only while an admin is using it
+   * (getUpdateStatus() makes the check when one is due), never on a schedule of its own. Throws
+   * unless `minutes` is a whole number from 1 to MAX_UPDATE_CHECK_INTERVAL_MINUTES.
+   */
+  setUpdateCheckIntervalMinutes(minutes: number): Promise<void>;
+
+  /**
+   * Set how many hours a newer release must have been available before admins are notified of
+   * it, DEFAULT_UPDATE_MINIMUM_AGE_HOURS by default. It delays the notice only: an update always
+   * installs the newest release. 0 notifies as soon as a check reports an update. Throws unless
+   * `hours` is a whole number from 0 to MAX_UPDATE_HOURS.
+   */
+  setUpdateMinimumAgeHours(hours: number): Promise<void>;
+
+  /**
+   * Set how many hours a dismissed update notice stays hidden in the browser that dismissed it,
+   * DEFAULT_UPDATE_NOTICE_SNOOZE_HOURS by default. 0 means a closed notice comes back on the next
+   * visit to Home. Throws unless `hours` is a whole number from 0 to MAX_UPDATE_HOURS.
+   */
+  setUpdateNoticeSnoozeHours(hours: number): Promise<void>;
 }
 
 /** A partial edit to one promoted format. Absent fields are left alone. */
@@ -1105,6 +1667,13 @@ export type ServerConfig = {
   signupsEnabled: boolean;
 
   /**
+   * Whether users may search the user directory to find collaborators. When not explicitly
+   * configured, this defaults to the opposite of `signupsEnabled`. When false the share UI offers
+   * only an exact username/email field.
+   */
+  userSearchEnabled: boolean;
+
+  /**
    * Site name shown next to the top-bar logo (admin-configurable). Empty falls back to
    * DEFAULT_SITE_NAME.
    */
@@ -1125,6 +1694,19 @@ export type ServerConfig = {
    * overrides the brand CSS variables with this (and derived shades) at runtime.
    */
   accentColor: string;
+
+  /**
+   * The central notification service's VAPID public key (base64url), which browsers subscribe to
+   * Web Push with. Absent when this deployment can't send browser push, which hides the browser
+   * notification setting.
+   */
+  webPushPublicKey?: string;
+
+  /**
+   * The version id of the backend answering this connection, or undefined where it has none.
+   * Compared with what VERSION_PATH answers to notice a connection that outlived a deploy.
+   */
+  backendVersion?: string;
 };
 
 /** One skill summary attached to an Xcity marketplace agent catalog entry. */
@@ -1262,10 +1844,237 @@ export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" |
 /** Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`. */
 export type AiGatewayInfo = {
   enabled: true;
+  /**
+   * The providers the deployment enables: the ones CF_AI_GATEWAY_PROVIDERS lists and the ones its
+   * admin turned on (see AdminApi.setGatewayProviderEnabled). A user can add a model of their own
+   * under these only.
+   */
   enabledProviders: AiModelProvider[];
+  /**
+   * The ID of every model the deployment provides through AI Gateway, in any mode (see
+   * GatewayModelMode). A user can't edit or delete these, nor add a model under one of these IDs.
+   */
+  builtInModelIds: string[];
+  /**
+   * Whether users may add models of their own (see AdminApi.setUserModelsEnabled). When false,
+   * addModel() and updateModel() refuse, and the models the user added are neither listed nor
+   * resolved.
+   */
+  userModelsEnabled: boolean;
 } | {
   enabled: false;
 };
+
+/**
+ * How a deployment offers one of the models it provides through AI Gateway:
+ *   - 'enabled':  offered in model pickers.
+ *   - 'hidden':   left out of pickers but still resolves, so the chats, spawners, preferences and
+ *                 gadget model bindings that already name it keep working.
+ *   - 'disabled': left out of pickers and does not resolve: a chat or spawner that names it is
+ *                 refused, and a gadget model binding minted for it fails at its next call. Its ID
+ *                 stays reserved, so a user can't add a model of their own under it.
+ */
+export const GATEWAY_MODEL_MODES = ['enabled', 'hidden', 'disabled'] as const;
+
+/** One of GATEWAY_MODEL_MODES. */
+export type GatewayModelMode = typeof GATEWAY_MODEL_MODES[number];
+
+/** Whether `value` is a GatewayModelMode. */
+export function isGatewayModelMode(value: unknown): value is GatewayModelMode {
+  return GATEWAY_MODEL_MODES.includes(value as GatewayModelMode);
+}
+
+/**
+ * How much reasoning a model is asked for on an agent's turns, least to most. The values are the
+ * model runtime's own (pi's ModelThinkingLevel). Each model takes some of them. One it lacks is
+ * fitted to the next higher one it has, or else the next lower, so 'off' on a model that cannot
+ * stop reasoning asks for its lowest level. A model that does no reasoning is sent none.
+ */
+export const REASONING_LEVELS =
+    ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+
+/** One of REASONING_LEVELS. */
+export type ReasoningLevel = typeof REASONING_LEVELS[number];
+
+/** Whether `value` is a ReasoningLevel. */
+export function isReasoningLevel(value: unknown): value is ReasoningLevel {
+  return REASONING_LEVELS.includes(value as ReasoningLevel);
+}
+
+/**
+ * What a model is asked for while no reasoning level is set for it: 'adaptive' when the model
+ * itself decides whether and how much to reason, a level when the Workshop asks for that effort,
+ * and null when no level is sent.
+ */
+export type BuiltInReasoning = ReasoningLevel | 'adaptive' | null;
+
+/**
+ * The share of its compaction budget a chat's prompt may reach before the chat compacts, leaving
+ * room for the response.
+ */
+export const COMPACTION_TRIGGER_RATIO = 0.85;
+
+/**
+ * What a deployment's admin sets for one of its AI Gateway models. A field left out is unset: the
+ * model then has its built-in behaviour, or for `reasoning` the deployment's default level where
+ * one is set.
+ */
+export type GatewayModelSettings = {
+  /**
+   * The reasoning level of the agent's turns on the model, ahead of the deployment's default
+   * (see AdminApi.setDefaultReasoning). One-shot calls, such as titles, compaction summaries
+   * and gadget model bindings, ask for none either way.
+   */
+  reasoning?: ReasoningLevel;
+
+  /**
+   * The prompt budget, in tokens, that a chat on the model compacts against (see
+   * COMPACTION_TRIGGER_RATIO), in place of the model's built-in one. A positive whole number, at
+   * most the model's AdminModelView.maxCompactionInputBudget.
+   */
+  compactionInputBudget?: number;
+};
+
+/**
+ * What a deployment's admin states that a model it adds can do. Nothing checks a stated fact
+ * against the provider: requests are built from it as it stands.
+ */
+export type GatewayModelCapabilities = {
+  /** Whether the model takes images as input, beside text. Absent while not stated. */
+  imageInput?: boolean;
+
+  /**
+   * The reasoning levels the model can be sent. A list with no level above 'off' states a model
+   * that does no reasoning. Absent while not stated.
+   */
+  reasoningLevels?: ReasoningLevel[];
+};
+
+/**
+ * The description of a model a deployment provides through AI Gateway. Its admin supplies one to
+ * add a model beside the SUGGESTED_MODELS of the providers the gateway enables.
+ */
+export type GatewayModel = {
+  /** Which AI provider hosts the model. */
+  provider: AiModelProvider;
+
+  /**
+   * Name of the model as specified to the provider's API, which is also the ID chats and
+   * preferences refer to it by.
+   */
+  id: string;
+
+  /** Display name. */
+  name: string;
+
+  /** The maximum tokens one request may total. */
+  contextWindow: number;
+
+  /** When present, both the requested response cap and the space reserved for it. */
+  outputLimit?: number;
+
+  /**
+   * The ID of a model of the same provider that the model runtime knows. While the runtime has
+   * no entry for this model's own ID, the model borrows that one's runtime flags: its request
+   * formats and, for what `capabilities` leaves unstated, its reasoning levels and the kinds of
+   * input it takes. Its name, limits and cost stay its own.
+   */
+  behavesLike?: string;
+
+  /**
+   * What the model is stated to do. Used only while the runtime has no entry for this model's
+   * own ID, where each stated fact comes ahead of what `behavesLike` lends.
+   */
+  capabilities?: GatewayModelCapabilities;
+};
+
+/** A model a deployment provides through AI Gateway, as its admin sees it. */
+export type AdminModel = GatewayModel & {
+  /** How the deployment offers the model. */
+  mode: GatewayModelMode;
+
+  /**
+   * The mode the model has while the admin leaves it alone: SUGGESTED_MODELS decides it for a
+   * suggested model, and an added model's is 'enabled'.
+   */
+  defaultMode: GatewayModelMode;
+
+  /** Whether the admin added the model, rather than SUGGESTED_MODELS listing it. */
+  added: boolean;
+
+  /** What the admin set for the model. Absent while nothing is set. */
+  settings?: GatewayModelSettings;
+};
+
+/** An AdminModel with what the admin UI needs in order to offer its settings. */
+export type AdminModelView = AdminModel & {
+  /** The reasoning levels the model can be sent, least to most. Empty when it takes none. */
+  reasoningLevels: ReasoningLevel[];
+
+  /**
+   * What the model is asked for while neither its settings nor the deployment's default give it
+   * a reasoning level.
+   */
+  builtInReasoning: BuiltInReasoning;
+
+  /** The compaction budget the model has while GatewayModelSettings sets none. */
+  builtInCompactionInputBudget: number;
+
+  /**
+   * The largest compaction budget the model may be given: the room its context window leaves for
+   * a prompt.
+   */
+  maxCompactionInputBudget: number;
+
+  /**
+   * Whether the model runtime has an entry for the model's own ID. When it has, the runtime's
+   * entry is used, and neither `behavesLike` nor `capabilities` is.
+   */
+  runtimeKnown: boolean;
+
+  /**
+   * For a model with a `behavesLike`, whether the model runtime knows the model it names. When
+   * it does not, there is nothing to borrow, and the model runs as one the runtime does not know
+   * for as long as it has no entry for the model's own ID either.
+   */
+  behavesLikeKnown?: boolean;
+};
+
+/** One of the providers AI Gateway serves, as a deployment's admin sees it. */
+export type AdminGatewayProvider = {
+  /** The provider. */
+  provider: AiModelProvider;
+
+  /**
+   * Who enabled the provider: the CF_AI_GATEWAY_PROVIDERS environment variable, or an admin (see
+   * AdminApi.setGatewayProviderEnabled). Absent while the provider is off.
+   */
+  enabledBy?: 'environment' | 'admin';
+
+  /**
+   * Whether the provider's requests need CF_AI_GATEWAY_API_TOKEN on a deployment that has none,
+   * so that they fail until it is set. It says nothing of the provider keys the gateway holds,
+   * which the Workshop can't see (see AdminApi.testGatewayProvider).
+   */
+  needsApiToken: boolean;
+};
+
+/**
+ * What one request of AdminApi.testGatewayProvider(), AdminApi.testGatewayModel() or
+ * AdminApi.testNewGatewayModel() found: the model asked, and whether it answered. A failure
+ * carries a message on one line, cut short: what the provider or the gateway answered, or why no
+ * answer came. It carries the HTTP status of the response only when the model runtime reports
+ * one, which it does not for every provider (a failed Google request has none): the message then
+ * says what there is.
+ */
+export type GatewayModelTest = { model: string } &
+    ({ ok: true } | { ok: false; status?: number; message: string });
+
+/**
+ * One request of AdminApi.testNewGatewayModel(): its result, and the reasoning level it asked
+ * for. Null is the request sent with no level set.
+ */
+export type GatewayModelLevelTest = GatewayModelTest & { reasoning: ReasoningLevel | null };
 
 /** Configuration specifying how to connect to an AI model provider. */
 export type AiModelConfig = {
@@ -1275,7 +2084,11 @@ export type AiModelConfig = {
   /** Name of the specific model, as specified to the provider's API. */
   model: string;
 
-  /** Secret API token for the respective provider, for billing purposes. */
+  /**
+   * Secret API token for the respective provider, for billing purposes. For providers "anthropic",
+   * "openai", and "ollama", an empty token means no key is sent at all, e.g. because a proxy
+   * authenticated through `extraHeaders` supplies its own.
+   */
   apiToken: string;
 
   /**
@@ -1290,6 +2103,68 @@ export type AiModelConfig = {
    * alternative provider that provides a compatible API.
    */
   apiUrl?: string;
+
+  /**
+   * Additional HTTP headers to send with every request to the provider, keyed by header name.
+   * These override the provider's default headers of the same name (including authentication
+   * headers), which is useful for proxies that require their own credentials. Like `apiToken`
+   * and `apiUrl`, these are ignored when the Workshop routes requests through its own AI
+   * Gateway configuration rather than contacting the provider directly.
+   */
+  extraHeaders?: Record<string, string>;
+
+  /**
+   * The maximum tokens one request may total, overriding the Workshop's built-in value for this
+   * model. Useful for a model the Workshop doesn't know, which is otherwise assumed to be small.
+   */
+  contextWindow?: number;
+
+  /**
+   * Overrides the built-in response cap for this model. Like `outputLimit` in the suggested-model
+   * table, it is both the requested response cap and the space reserved for it in the window.
+   */
+  outputLimit?: number;
+
+  /**
+   * The reasoning level of an agent's turns on the model. Absent gives the model's built-in
+   * behaviour. Set only on a deployment's AI Gateway models (see GatewayModelSettings).
+   */
+  reasoning?: ReasoningLevel;
+
+  /**
+   * Overrides the model's built-in compaction budget, up to the room its window leaves for a
+   * prompt. Set only on a deployment's AI Gateway models (see GatewayModelSettings).
+   */
+  compactionInputBudget?: number;
+
+  /**
+   * The model whose runtime flags this one borrows (see GatewayModel.behavesLike). Set only on
+   * the models a deployment's admin added to its AI Gateway.
+   */
+  behavesLike?: string;
+
+  /**
+   * What the model is stated to do (see GatewayModel.capabilities). Set only on the models a
+   * deployment's admin added to its AI Gateway.
+   */
+  capabilities?: GatewayModelCapabilities;
+};
+
+/**
+ * An `AiModelConfig` whose secrets may be withheld, so that a stored configuration can be shown
+ * and edited without the client ever receiving its secrets. As returned by
+ * `AuthenticatedApi.getModelConfig()`, a `null` secret is a non-empty value that was withheld. As
+ * passed to `AuthenticatedApi.updateModel()` or `addModel()`, a `null` secret keeps (or copies)
+ * the stored value. It has none of the fields that only a deployment sets on its own models.
+ */
+export type RedactedAiModelConfig = Omit<AiModelConfig,
+    "apiToken" | "extraHeaders" | "reasoning" | "compactionInputBudget" | "behavesLike" |
+    "capabilities"> & {
+  /** `AiModelConfig.apiToken`, or null if withheld. */
+  apiToken: string | null;
+
+  /** `AiModelConfig.extraHeaders`, with each value null if withheld. */
+  extraHeaders?: Record<string, string | null>;
 };
 
 /**
@@ -1299,14 +2174,43 @@ export type AiModelConfig = {
 export const WORKERS_AI_OUTPUT_LIMIT = 32768;
 
 /**
- * Models offered in the picker. `contextWindow` is the maximum tokens one request may total.
- * `outputLimit`, when present, is both the requested response cap and the space reserved for it,
- * leaving the remainder as the prompt budget context compaction sizes against.
+ * What a model does, which decides where it can be used. A `"language"` model writes text: it can
+ * chat and back a `LanguageModelBinding`. A `"decision"` model answers typed questions with
+ * probabilities: gadgets can bind it as a `DecisionModelBinding`, but it can't chat.
  */
-export const SUGGESTED_MODELS: Record<
-  AiModelProvider,
-  Record<string, {name: string, contextWindow: number, outputLimit?: number}>
-> = {
+export type ModelKind = "language" | "decision";
+
+/** One entry of SUGGESTED_MODELS. */
+type SuggestedModel = {
+  name: string;
+
+  /** The maximum tokens one request may total. */
+  contextWindow: number;
+
+  /** When present, both the requested response cap and the space reserved for it. */
+  outputLimit?: number;
+
+  /**
+   * When present, the preferred prompt budget used for compaction, below the model's hard context
+   * window. Can avoid long-context pricing (GPT-5.6 doubles above 272K) while retaining the full
+   * window as the hard limit.
+   */
+  compactionInputBudget?: number;
+
+  /**
+   * Makes the model's default mode 'hidden' rather than 'enabled' (see GatewayModelMode): still
+   * resolvable for stored references, not offered in pickers. Set on models superseded by a newer
+   * one, which chats, spawners, and preferences created earlier may still name. A deployment's
+   * admin can override the default for its AI Gateway.
+   */
+  hidden?: true;
+
+  /** The model's kind; absent means `"language"`. */
+  kind?: ModelKind;
+};
+
+// The literal is kept apart from the export so SuggestedModelId can derive the model ids from it.
+const SUGGESTED_MODEL_CATALOG = {
   "cloudflare": {
     "@cf/moonshotai/kimi-k2.7-code": {
       name: "Kimi K2.7 Code (Workers AI)", contextWindow: 262144,
@@ -1315,29 +2219,100 @@ export const SUGGESTED_MODELS: Record<
     "@cf/zai-org/glm-5.2": {
       name: "GLM 5.2 (Workers AI)", contextWindow: 262144, outputLimit: WORKERS_AI_OUTPUT_LIMIT,
     },
+    "@cf/zai-org/glm-5.3-flash": {
+      name: "GLM 5.3 Flash (Workers AI)", contextWindow: 1048576,
+      outputLimit: WORKERS_AI_OUTPUT_LIMIT,
+    },
     "@cf/deepseek-ai/deepseek-v4-pro-0813": {
       name: "DeepSeek V4 Pro 0813 (Workers AI)", contextWindow: 1048576,
       outputLimit: WORKERS_AI_OUTPUT_LIMIT,
     },
+    "@cf/cloudflare/clef": {name: "Clef (Workers AI)", contextWindow: 65536, kind: "decision"},
+    "@cf/cloudflare/clef-flash": {
+      name: "Clef Flash (Workers AI)", contextWindow: 65536, kind: "decision",
+    },
   },
   "anthropic": {
-    // TODO: Include Fable -- but we need an admin option to disable it, since many orgs don't
-    //   allow it for ZDR reasons. It's sort of overkill for building gadgets anyway.
-    "claude-opus-5": {name: "Claude Opus 5", contextWindow: 1000000},
-    "claude-sonnet-5": {name: "Claude Sonnet 5", contextWindow: 1000000},
+    "claude-opus-5-5": {name: "Claude Opus 5.5", contextWindow: 1000000},
+    "claude-sonnet-5-5": {name: "Claude Sonnet 5.5", contextWindow: 1000000},
+    "claude-fable-5-1": {name: "Claude Fable 5.1", contextWindow: 1000000},
+    "claude-opus-5": {name: "Claude Opus 5", contextWindow: 1000000, hidden: true},
+    "claude-sonnet-5": {name: "Claude Sonnet 5", contextWindow: 1000000, hidden: true},
     "claude-haiku-4-5": {name: "Claude Haiku 4.5", contextWindow: 200000},
   },
   "openai": {
-    "gpt-5.6-sol": {name: "GPT 5.6 Sol", contextWindow: 1050000, outputLimit: 128000},
-    "gpt-5.6-luna": {name: "GPT 5.6 Luna", contextWindow: 1050000, outputLimit: 128000},
-    "gpt-5.6-terra": {name: "GPT 5.6 Terra", contextWindow: 1050000, outputLimit: 128000},
+    // pi's GPT-6 catalog reports a 272K window, but these models support 1.05M. Use 272K as the
+    // preferred compaction budget, not as the hard context limit.
+    "gpt-6.1-sol": {
+      name: "GPT-6.1 Sol", contextWindow: 1050000, outputLimit: 128000,
+      compactionInputBudget: 272000,
+    },
+    "gpt-6-sol": {
+      name: "GPT-6 Sol", contextWindow: 1050000, outputLimit: 128000,
+      compactionInputBudget: 272000,
+      hidden: true,
+    },
+    "gpt-6-luna": {
+      name: "GPT-6 Luna", contextWindow: 1050000, outputLimit: 128000,
+      compactionInputBudget: 272000,
+    },
+    "gpt-6-astra": {
+      name: "GPT-6 Astra", contextWindow: 1050000, outputLimit: 128000,
+      compactionInputBudget: 272000,
+    },
+    "gpt-5.6-sol": {
+      name: "GPT 5.6 Sol", contextWindow: 1050000, outputLimit: 128000,
+      compactionInputBudget: 272000,
+      hidden: true,
+    },
+    "gpt-5.6-luna": {
+      name: "GPT 5.6 Luna", contextWindow: 1050000, outputLimit: 128000,
+      compactionInputBudget: 272000,
+      hidden: true,
+    },
+    "gpt-5.6-terra": {
+      name: "GPT 5.6 Terra", contextWindow: 1050000, outputLimit: 128000,
+      compactionInputBudget: 272000,
+      hidden: true,
+    },
   },
   "google": {
     "gemini-3.6-flash": {name: "Gemini 3.6 Flash", contextWindow: 1048576},
   },
   "ollama": {
   },
-};
+} satisfies Record<AiModelProvider, Record<string, SuggestedModel>>;
+
+/**
+ * Models built into the Workshop, by provider and model id. Pickers skip the hidden ones, unless
+ * the admin of an AI Gateway deployment enabled them there.
+ */
+export const SUGGESTED_MODELS: Record<AiModelProvider, Record<string, SuggestedModel>> =
+    SUGGESTED_MODEL_CATALOG;
+
+/** A model ID listed in SUGGESTED_MODELS, optionally narrowed to one provider's catalog. */
+export type SuggestedModelId<P extends AiModelProvider = AiModelProvider> =
+  { [K in P]: keyof (typeof SUGGESTED_MODEL_CATALOG)[K] & string }[P];
+
+/** The kind of a model, named by its provider and its ID on the provider's API. */
+export function modelKind(provider: string, model: string): ModelKind {
+  return SUGGESTED_MODELS[provider as AiModelProvider]?.[model]?.kind ?? "language";
+}
+
+/**
+ * Providers whose pi API adapter refuses a custom fetch, so their inference cannot ride the
+ * Workers AI binding and needs CF_AI_GATEWAY_API_TOKEN over HTTPS. pi's Google adapter throws
+ * "Custom fetch is not supported by the Google Generative AI adapter" whenever the fetch it is
+ * given is not globalThis.fetch, and the client it builds on offers no hook to route around that:
+ * @google/genai's `GoogleGenAI` takes only `httpOptions`, whose knobs are
+ * baseUrl/apiVersion/headers/timeout/extraBody/retryOptions.
+ * https://github.com/earendil-works/pi/blob/v0.84.2/packages/ai/src/api/google-generative-ai.ts#L80
+ *
+ * pi's Vertex adapter throws the same way, so a google-vertex provider would belong here too; it
+ * is absent only because this deployment has no such provider.
+ * https://github.com/earendil-works/pi/blob/v0.84.2/packages/ai/src/api/google-vertex.ts#L98
+ */
+export const HTTPS_ONLY_PROVIDERS: ReadonlySet<string> = new Set<AiModelProvider>(["google"]);
 
 /**
  * Metadata about a workspace (one Overseer DO and everything in it). Includes everything needed
@@ -1364,6 +2339,9 @@ export type GadgetMetadata = {
   /** Whether the user has pinned this gadget to the top of their list. */
   pinned?: boolean;
 
+  /** Set while the user has muted this workspace's notifications. */
+  notificationMute?: NotificationMute;
+
   /**
    * Set when the gadget is not owned by the current user. Presence of this field indicates the
    * user is a collaborator, not the owner.
@@ -1378,10 +2356,19 @@ export type GadgetMetadata = {
   role?: CollaboratorRole;
 
   /**
-   * True when the gadget has observed data marked as share-prohibited. Such gadgets can no longer
-   * be shared with additional users or links.
+   * True when the gadget has observed data marked `containsRestrictedData` (see
+   * `ObservationDescription`). It can still be shared, with collaborators verified per
+   * gatekeeper (if `ownerInvitesOnly` is also set, only the owner can add them), but can no longer
+   * fetch from the public web, and every action requires manual approval.
    */
-  sharingProhibited?: boolean;
+  containsRestrictedData?: boolean;
+
+  /**
+   * True when the gadget has observed data marked `ownerInvitesOnly` (see
+   * `ObservationDescription`). Only collaborators the owner added directly have access: share
+   * links can no longer be created, copied, or redeemed, and only the owner can add collaborators.
+   */
+  ownerInvitesOnly?: boolean;
 
   /**
    * Various objects in the API specify a gadgetId, but make the property optional. When omitted,
@@ -1592,6 +2579,45 @@ export type CommitInfo = {
 };
 
 /**
+ * One entry of a commit's tree, as returned by Overseer.listTree(): a directory carrying its own
+ * entries, or a leaf of one of git's four non-directory modes. `name` is a single path segment
+ * (never containing `/`); a file's path is the `/`-join of the names down to it. A `symlink` and
+ * a `submodule` (gitlink) are listed with their kind and have no readable text (see
+ * FileAtCommit). Nested rather than a flat path list so the tree needs one call per commit and
+ * no parsing, and each name travels once. Carries no oids or sizes.
+ */
+export type TreeNode =
+  | { name: string; kind: "file" | "executable" | "symlink" | "submodule" }
+  | { name: string; kind: "dir"; children: TreeNode[] };
+
+/**
+ * One file's content at a commit, as returned by Overseer.readFilesAtCommit(). `text` carries
+ * the file's UTF-8 content; `absent` means the path names no entry at that commit (or names a
+ * directory); `unreadable` means the entry exists but cannot be presented as text -- a symlink,
+ * a submodule, binary content, or a blob over the git store's per-object size cap -- and carries
+ * a descriptive, path-flavored message suitable for display in place of the file.
+ */
+export type FileAtCommit =
+  | { kind: "text"; text: string }
+  | { kind: "absent" }
+  | { kind: "unreadable"; message: string };
+
+/**
+ * Maximum number of paths one Overseer.readFilesAtCommit() call may name. Callers with more
+ * paths chunk them across calls.
+ */
+export const MAX_READ_FILES_PER_CALL = 64;
+
+/**
+ * Text bytes after which Overseer.readFilesAtCommit() stops decoding and omits the remaining
+ * requested paths from its response (the client re-requests them). Keeps one response well
+ * under the RPC message ceiling even with the UTF-16 inflation of serialized text. The first
+ * file is always returned whole, however large, so every call makes progress; its size is
+ * bounded only by what the git store could hold.
+ */
+export const READ_FILES_RESPONSE_BUDGET = 8 * 1024 * 1024;
+
+/**
  * Specifies the state of an action in the action log:
  * * pending: Action has not been applied yet. It is waiting for approval.
  * * approved: Action was approved and applied.
@@ -1632,6 +2658,13 @@ export type ActionLogEntry = {
    * clicking Approve. Only ever set alongside state "approved" (there is no automatic rejection).
    */
   autoApproved?: boolean;
+
+  /**
+   * True for the creation queued by createExternalResource. Approving it requires one of the
+   * approver's accounts for the gatekeeper's vendor (see GatekeeperClient.getCreationSpec()), in
+   * which the resource is created.
+   */
+  creation?: true;
 } | {
   type: "observation";
   description: ObservationDescription;
@@ -1649,6 +2682,19 @@ export type ActionLogEntry = {
   // Note that `state` is not meaningful for hooks. Instead of being "approved" or "rejected", they
   // are enabled/disabled, which the user can freely toggle as often as they want.
 });
+
+/** How the approver of a creation (see ActionLogEntry.creation) chose to make it. */
+export type CreationApproval = {
+  /** The approver's connected account, for the gatekeeper's vendor, to create the resource in. */
+  accountId: number;
+
+  /**
+   * What the approver chose in that account's creation configurator (see
+   * AuthenticatedApi.startCreationConfigurator()): a vendor-defined URL only the gatekeeper reads.
+   * Omitted when they made no choice, as for a type without one.
+   */
+  configuration?: string;
+};
 
 export type BoundHookInfo = {
   id: number;
@@ -1670,8 +2716,9 @@ export type BoundHookInfo = {
  * create new agents, that is, start new agent chat threads, which appear in the gadget's agent
  * chat UI as new conversations. Agents created this way don't typically edit the gadget code, but
  * rather use the `executeCode` tool to directly invoke the gadget's bindings to perform tasks.
- * Each agent can additionally be provide "props" which may include additional RPC stubs
- * representing specific resources or callbacks relevant to that agent session.
+ * Beyond the bindings configured here, a gadget hands an agent per-task capabilities -- RPC stubs
+ * representing specific resources or callbacks relevant to that agent session -- as the arguments
+ * of calls made on the stub that the binding's `spawnCallable()` returns.
  *
  * For example, a gadget that responds to emails might invoke an agent for each email message that
  * arrives, with an RPC stub that allows it to reply to that email -- but prohibits the agent from
@@ -1684,23 +2731,36 @@ export type AgentSpawnerConfig = {
 
   /**
    * Model ID to run, of the gadget owner's available models. Can be `null` to just create a chat
-   * that doesn't actually run an agent -- the chat will be notified that the chat needs attention,
-   * same as for an agent chat where the agent fails to mark the task complete.
+   * that doesn't actually run an agent -- the prompt, or the calls made on a callable agent, are
+   * appended to the chat for a human to pick up.
    */
   modelId: string | null,
 
   /**
    * The bindings available to agents spawned by this spawner: binding name (as it appears as
-   * `env.NAME` in the spawned agent's executeCode environment) -> target workpiece. When an agent
-   * is spawned, this map is snapshotted into the spawned chat's seed binding layer (entries whose
-   * targets no longer exist are dropped); the spawned agent sees only these bindings, never the
-   * workspace's default binding list.
+   * `env.NAME` in the spawned agent's executeCode environment) -> target workpiece. This is the
+   * spawner's initial set: afterwards the chat agent may add more with `setGadgetBinding`, each
+   * a proposal that takes effect once the user accepts the chat's changes. When an agent is
+   * spawned, the spawner's bindings are snapshotted into the spawned chat's seed binding layer
+   * (entries whose targets no longer exist are dropped); the spawned agent sees only these
+   * bindings, never the workspace's default binding list.
    *
    * The entries are deliberately not limited to bindings held by the gadget that owns the
    * spawner: a spawner may define bindings of its own, with its own names and targets.
+   *
+   * Once a gadget binds the spawner, every binding target joins each "use" collaborator's
+   * verification scope transitively: spawning is reachable from the gadget UI, and the spawned
+   * agent reads these bindings with the spawner creator's authority.
    */
   env: Record<string, WorkpieceId>,
 };
+
+/**
+ * The `vendorId` with which the agent's requestConnection asks the user to add an agent spawner
+ * (see AgentSpawnerConfig) rather than connect a gatekeeper vendor's resource. No vendor can have
+ * it: vendor ids come from binding names, which have no hyphen.
+ */
+export const AGENT_SPAWNER_CONNECTION_ID = "agent-spawner";
 
 /**
  * Interface to a workspace's Overseer, used to display the Gadget Workshop shell UI around that
@@ -1736,9 +2796,6 @@ export interface Overseer extends RpcTarget {
   /** Change the workspace title. */
   setTitle(title: string): Promise<void>;
 
-  /** Pin or unpin this workspace in the user's list. */
-  setPinned(pinned: boolean): Promise<void>;
-
   /**
    * Instruct the workspace to delete itself, removing it from the User's workspace list and
    * deleting all data. Further method calls will fail.
@@ -1751,8 +2808,10 @@ export interface Overseer extends RpcTarget {
    * Subscribe to the workspace's workpiece list.
    *
    * The subscriber receives one entry() per existing workpiece, followed by ready(), then
-   * incremental entry()/removed() calls as workpieces are created, renamed, or deleted. In v1
-   * only gadget-type workpieces are delivered (see WorkpieceSummary).
+   * incremental entry()/removed() calls as workpieces are created, renamed, or deleted, and
+   * whenever a summary field changes (a gadget's head, a worktree's accepted or head commit).
+   * Gadgets and worktrees are delivered (see WorkpieceSummary for which subscriptions see
+   * worktrees).
    *
    * Disposing the returned `RpcStub` will cancel the subscription.
    */
@@ -1786,23 +2845,60 @@ export interface Overseer extends RpcTarget {
   getGadget(id: WorkpieceId): Promise<RpcStub<GadgetClient>>;
 
   /**
-   * Read the full contents of a commit in the workspace's git object store: one
-   * `[path, content]` entry per file, with nested trees flattened to `/`-joined paths. Paths are
-   * unique; entry order carries no meaning. (`files` is a list of pairs rather than a path-keyed
-   * object so that file names like `__proto__`, which RPC deserialization drops from object
-   * keys, survive in transit -- see CodeChange in `@gadgets/workshop-shared/code-change`.)
+   * Read a commit's whole tree as nested TreeNodes: the root directory's entries, each
+   * directory carrying its own, in git tree order (byte order of names, a directory sorting as
+   * if its name had a trailing `/`). Only tree objects are read -- never blobs -- so the
+   * response is proportional to the commit's entry count. Commits are immutable, so responses
+   * are cacheable client-side by commit ID. Like readFilesAtCommit(), the read may pull missing
+   * trees through the gatekeeper that provided the commit.
    *
-   * Commits are immutable, so responses are cacheable client-side by commit ID. Use this to view
-   * committed code (outside any chat, or for a gadget the open chat has no pin for) and to fetch
-   * the base content of a chat's pins (see ChatCodeBase).
+   * Together with readFilesAtCommit() this is how clients read committed code: a workpiece's
+   * tree at its head or accepted commit (outside any chat, or when the open chat has no pin for
+   * it), and the base content of a chat's pins (see ChatCodeBase), one file at a time as it is
+   * opened or edited.
    */
-  getCodeAtCommit(commitId: string): Promise<{files: [path: string, content: string][]}>;
+  listTree(commitId: string): Promise<TreeNode[]>;
+
+  /**
+   * Read the content of the named files at a commit. Returns one `[path, FileAtCommit]` entry
+   * per requested path, in request order (a list of pairs rather than a path-keyed object so
+   * that file names like `__proto__`, which RPC deserialization drops from object keys, survive
+   * in transit -- see CodeChange in `@gadgets/workshop-shared/code-change`). Blobs missing from
+   * the workspace's git store are pulled in one batch through the gatekeeper that provided the
+   * commit; a pull failure fails the whole call, since it is transient or actionable rather than
+   * a fact about any one file, whereas per-file conditions -- absent path, symlink, submodule,
+   * binary or oversized content -- are reported per entry (see FileAtCommit).
+   *
+   * At most MAX_READ_FILES_PER_CALL paths per call. The server stops decoding once the
+   * accumulated text exceeds READ_FILES_RESPONSE_BUDGET and omits the remaining paths from the
+   * result, so a missing entry means "not answered, ask again" -- never "absent", which is
+   * always stated explicitly. Responses are cacheable by (commit ID, path).
+   */
+  readFilesAtCommit(commitId: string, paths: string[])
+      : Promise<[path: string, FileAtCommit][]>;
+
+  /**
+   * List the paths whose entry differs between two commits' trees: added, removed, or changed
+   * in content or mode, sorted by code unit (as `Array.prototype.sort()` sorts). Only files are
+   * listed, never a directory: a symlink or submodule is listed as a file is, and a name that is
+   * a file in one tree and a directory in the other lists the file and the paths within the
+   * directory. The two commits may come in either order; the list is the same.
+   *
+   * Like listTree(), only tree objects are read, never blobs, and a subtree with the same id
+   * in both is not read at all, so the cost is proportional to what differs. The result is
+   * immutable and cacheable by the pair of commit IDs.
+   *
+   * This is how a client finds the files a merge changed: where a chat's pin has a `baseCommit`
+   * other than its `mergedCommit` (see ChatGadgetPinState), the files that differ between the
+   * two are changed in the chat even where none of the chat's code changes touch them.
+   */
+  listChangedPaths(fromCommit: string, toCommit: string): Promise<string[]>;
 
   /**
    * Walk the commit graph from `fromCommit` (that commit first, then its ancestry), returning up
    * to `depth` commits' metadata -- all reachable commits when `depth` is omitted. Traversal
    * order for merge commits follows git log's default (reverse chronological). Like
-   * getCodeAtCommit(), results are immutable and cacheable.
+   * listTree(), results are immutable and cacheable.
    */
   getCommitLog(fromCommit: string, depth?: number): Promise<CommitInfo[]>;
 
@@ -1820,12 +2916,15 @@ export interface Overseer extends RpcTarget {
    *
    * `submission.pins` must carry one declaration per *permanent* gadget the change touches that is
    * not yet pinned in the chat, each naming the head commit the client's content derives from.
-   * The server checks that each declared base is the gadget's current head, or a parent of it
+   * The server checks that each declared base is the gadget's current head, or its first parent
    * (tolerating a race with one concurrent merge), and establishes the pin atomically with the
    * change. A declaration identical to the existing pin is accepted idempotently; one naming a
    * different `baseCommit` (a race between two first editors) throws. Exception: a gadget still
    * pending in this chat has no head commit to pin (see WorkpieceSummary.commitId), so its changes
-   * carry no declaration and build its content up from nothing (see ChatCodeBase).
+   * carry no declaration and build its content up from nothing (see ChatCodeBase). A worktree
+   * declaration is accepted iff its `baseCommit` is the worktree's accepted commit -- the
+   * content as of the chat's last accept, the analog of a gadget's head -- exactly, with no
+   * parent tolerance (only this chat's accept moves it, and that closes the generation).
    *
    * Retries: `submission.clientId` names the client's editing session and `submission.seq`
    * numbers its submissions from 1. The server remembers each session's last accepted seq and
@@ -1876,7 +2975,8 @@ export interface Overseer extends RpcTarget {
 
   /**
    * Create a new gatekeeper for an AI model binding. The model can be any returned by
-   * listModels().
+   * `AuthenticatedApi.listModels()`. A language model's gatekeeper provides a
+   * `LanguageModelBinding`, a decision model's a `DecisionModelBinding`.
    */
   newAiModelGatekeeper(modelId: string): Promise<GatekeeperClient<any>>;
 
@@ -1901,9 +3001,10 @@ export interface Overseer extends RpcTarget {
 
   /**
    * Approve an action that is currently in the "pending" state. The action will be performed on
-   * approval.
+   * approval. Approving a creation (see ActionLogEntry.creation) requires `creation`: how the
+   * approver chose to make it.
    */
-  approveAction(id: number): Promise<void>;
+  approveAction(id: number, creation?: CreationApproval): Promise<void>;
 
   /**
    * Reject an action that is in the "pending" state. This notifies the gatekeeper that it will not
@@ -1936,6 +3037,9 @@ export interface Overseer extends RpcTarget {
    *
    * Auto-approval rules are workspace-wide per gatekeeper: approving an action kind approves it
    * no matter which gadget invokes it.
+   *
+   * Once the workspace has read restricted data (`GadgetMetadata.containsRestrictedData`), rules
+   * are stored but never fire: every action pends for manual approval.
    */
   setAutoApprovedActionKind(gatekeeperId: WorkpieceId, actionKind: ActionKind): Promise<void>;
 
@@ -1996,8 +3100,8 @@ export interface Overseer extends RpcTarget {
   listChats(): Promise<AiChatMetadata[]>;
 
   /**
-   * List available models. The first listed model should be the default, unless the user has
-   * chosen something else.
+   * List available language models; decision models are left out. The first listed model should
+   * be the default, unless the user has chosen something else.
    */
   listModels(): Promise<AiChatAuthorInfo[]>;
 
@@ -2033,6 +3137,16 @@ export interface Overseer extends RpcTarget {
   subscribeToChat(subscriber: RpcStub<AiChatSubscriber>, startAfter?: Date): Promise<RpcStub<{}>>;
 
   /**
+   * Records that this client shows chat `chatId` until the returned handle is disposed. When a
+   * turn finishes in a chat someone is viewing, the workspace resends that turn's last model
+   * request just before the provider's cached copy of it would expire, so the user's next message
+   * costs less and starts sooner. The resends are billed like the turn. They stop when the last
+   * viewer leaves, at the chat's next turn, an hour after the turn, or before they would cost
+   * more than the cache miss they avoid. Throws if the chat doesn't exist.
+   */
+  viewChat(chatId: number): Promise<RpcStub<{}>>;
+
+  /**
    * Lists slash commands available from Gatekeepers currently attached to this Gadget, including
    * ambient ones.
    */
@@ -2057,6 +3171,10 @@ export interface Overseer extends RpcTarget {
   /**
    * Send a message to the chat from this client. Sending a message causes the LLM to start
    * running if it isn't already.
+   * While it runs, plain text with no capsules, attachments or formats steers it, on the running
+   * turn's model whatever `modelId` is, even null: it waits in `AiChatMetadata.queuedSteers` until
+   * the agent reads it. Anything else, or anything sent after `stopAgent()`, throws until the
+   * agent finishes.
    * If a slash command produces no message, only its visible invocation event is committed and the
    * agent does not run.
    * Slash-command requests cannot include capsules or attachments.
@@ -2070,13 +3188,13 @@ export interface Overseer extends RpcTarget {
                   formats?: MessageFormatRef[]): Promise<void>;
 
   /**
-   * Upload an attachment for use in a future chat message. This way by the time the user wants to
-   * send the message, likely uploading is complete. `modelId` determines whether the
-   * selected provider can receive a raw file attachment.
-   *
-   * Pass the returned handle to newChat() or sendChatMessage() to commit the attachment into chat history.
+   * Store raw bytes as an immutable Git blob and return its OID after durable storage.
+   * Retrying identical bytes returns the same OID. This does not change any worktree or message.
+   * Use the OID in a chat attachment, or in a worktree's whole-file `setBytes` change together
+   * with the payload's byte length. The blob must be present in this workspace's Git store.
+   * Limited to 8,000,000 bytes; larger-file support is deferred.
    */
-  uploadChatAttachment(attachment: ChatAttachmentUpload, modelId: string | null): Promise<ChatAttachmentHandle>;
+  uploadBlob(content: Uint8Array): Promise<GitOid>;
 
   /**
    * Fetch the bytes of a committed chat attachment over RPC. The canonical metadata is already
@@ -2084,9 +3202,6 @@ export interface Overseer extends RpcTarget {
    * only to download non-image attachments on demand.
    */
   getChatAttachmentContent(chatId: number, id: string): Promise<Uint8Array>;
-
-  /** Delete an uploaded attachment that the user explicitly removed before sending the message. */
-  deleteChatAttachment(id: string): Promise<void>;
 
   /**
    * Update the title of a chat. Usually not needed as a title is generated automatically from
@@ -2100,10 +3215,17 @@ export interface Overseer extends RpcTarget {
    * `changes` message are swept in first, and there is no way to accept only a subset.
    *
    * Accepting is only ever a fast-forward: every gadget touched by the merged changes must have
-   * its chat pin equal to the gadget's current head commit (see
-   * ChatGadgetPinState.mergedCommit). If mainline has advanced past any pin, nothing at all is
-   * merged and the call returns a "stale" outcome (an expected result, not an exception; see
-   * MergeChangesResult): call updateChatFromMainline(), resolve any conflicts, and retry.
+   * its chat pin's ChatGadgetPinState.mergedCommit equal to the gadget's current head commit.
+   * If mainline has advanced past any pin, nothing at all is merged and the call returns a
+   * "stale" outcome (an expected result, not an exception; see MergeChangesResult): call
+   * updateChatFromMainline(), resolve any conflicts, and retry. Where the pin's `baseCommit` is
+   * a merge commit not yet accepted, whose first parent is `mergedCommit`, the head moves
+   * through it: to the merge commit itself if the chat changed nothing since, else to a new
+   * commit on top of it.
+   *
+   * A chat has something to accept when it holds a pin, a gadget or binding edge pending in it,
+   * or a blueprint proposal that is neither merged nor reverted. Otherwise this is a no-op and
+   * records nothing.
    *
    * A successful merge closes the chat's current **epoch**: all merged content now lives in
    * commits, so the chat's code base resets to empty (every pin is dropped, the change stream
@@ -2112,6 +3234,11 @@ export interface Overseer extends RpcTarget {
    * is content-preserving: ChatCodeBase.prior describes the closed stream, and in-flight
    * submissions rooted in it are transformed onto the new generation rather than discarded (see
    * submitCodeChange()), so a client typing through someone's accept loses nothing.
+   *
+   * A blueprint release the chat proposes to merge into a gadget (see
+   * AiChatMessageBody.blueprintMerges) is accepted with the rest: the gadget's new head gains
+   * the release as a parent, unless its history already holds it, and the gadget follows that
+   * blueprint from then on.
    */
   mergeChanges(chatId: number): Promise<MergeChangesResult>;
 
@@ -2122,22 +3249,28 @@ export interface Overseer extends RpcTarget {
    * chat, so it tracks mainline head live and there is nothing to merge into. For each pinned
    * gadget whose ChatGadgetPinState.mergedCommit is behind the gadget's current head, the server
    * computes a 3-way text merge (base = the last merged commit, ours = the head, theirs = the
-   * chat's current files) and applies the result to the chat as an ordinary change -- broadcast via
-   * AiChatSubscriber.changeApplied(), so concurrent editors transform against it like any other
-   * remote change -- recorded in a `changes` message carrying `mainlineMerge`, advancing the pin to
-   * head. Conflicting hunks are left inline as 3-way conflict markers
-   * (`<<<<<<<`/`|||||||`/`=======`/`>>>>>>>`) for the user or their agent to clean up; the
-   * affected paths, each qualified by its gadget's binding name (`GADGET_NAME/path`), are
-   * returned in sorted order and also recorded on the message. An empty `conflictPaths` means
-   * every file merged cleanly (or there was nothing to merge).
+   * chat's current files) and writes it as commits: the chat's files before the update, and the
+   * merge commit, whose parents are the head and that (see MainlineMergeGadget). The chat's pin
+   * for the gadget then re-roots at the merge commit (see ChatGadgetPinRecord), with the head as
+   * its `mergedCommit`. A gadget whose files in the chat are already in the head's history had
+   * nothing of its own to merge, and re-roots at the head itself. Conflicting hunks are left
+   * inline as 3-way conflict markers (`<<<<<<<`/`|||||||`/`=======`/`>>>>>>>`) for the user or
+   * their agent to clean up; the affected paths, each qualified by its gadget's binding name
+   * (`GADGET_NAME/path`), are returned in sorted order and also recorded on the message. An
+   * empty `conflictPaths` means every file merged cleanly (or there was nothing to merge).
+   *
+   * The update is recorded as a `changes` message carrying `mainlineMerge` and declaring the
+   * re-roots, with no `change`. It then ends the chat's change stream with a destructive bump
+   * of ChatCodeBase.generation, delivered after the message: clients rebuild their content from
+   * the log, re-rooted. Changes a client has submitted and not yet had acknowledged are lost.
+   *
+   * Throws, changing nothing, if both sides changed a file and a version of it, or the merged
+   * text, is too large for a file to hold; the error names the file. Making it smaller on
+   * either side, or undoing the chat's own changes to it, lets the update through.
    *
    * Once the chat is up to date (and mainline hasn't moved again), mergeChanges() succeeds as a
-   * plain fast-forward.
-   *
-   * Whenever any pin advances, a `changes` message carrying `mainlineMerge` is recorded -- even
-   * when the chat's content already matched mainline and there is no change to deliver -- so the
-   * chat log always accounts for the advancement (see the revert restriction on
-   * AiChatMessageBody.mainlineMerge).
+   * plain fast-forward through the merge commit. The update can be reverted like any other
+   * proposed change, which puts the pins back as they were before it (see revertChanges()).
    */
   updateChatFromMainline(chatId: number): Promise<{conflictPaths: string[]}>;
 
@@ -2145,14 +3278,17 @@ export interface Overseer extends RpcTarget {
    * Indicates that the user has requested that proposed changes starting from the given sequence
    * number in the chat thread be reverted.
    *
-   * Throws if the range covers a still-proposed mainline merge (see
+   * Throws if the range covers a still-proposed mainline merge that records no `gadgets` (see
    * AiChatMessageBody.mainlineMerge for why such a message cannot be erased), or if the range
    * erases the chat's conversion boundary while keeping an earlier still-proposed batch (see
    * AiChatMessageBody.conversionBoundary; a revert covering everything, `revertFrom` 0, always
    * satisfies this).
    *
-   * Pins declared by reverted messages are removed from ChatCodeBase (a pin survives a revert
-   * iff its declaring message survives), and changes not yet materialized into a message are erased
+   * Each pin is settled from the log as it stands after the revert: its `baseCommit` is that of
+   * its last surviving declaration, and a pin with none is removed from ChatCodeBase. Its
+   * `mergedCommit` is put back to what the earliest update from mainline the revert covers
+   * records it was before (MainlineMergeGadget.baseCommit), and is otherwise left alone.
+   * Changes not yet materialized into a message are erased
    * along with the reverted range. Erasing already-applied changes invalidates every client's local
    * state -- content they may have transformed against is gone -- so ChatCodeBase.generation is
    * bumped destructively: in-flight submitCodeChange() calls fail and clients rebuild instead of
@@ -2188,6 +3324,9 @@ export interface Overseer extends RpcTarget {
    * reflecting this before `stop()` returns.
    *
    * If no LLM is running, `stop()` does nothing and returns immediately.
+   *
+   * Stopping drops the chat's queued steers (see `AiChatMetadata.queuedSteers`), whoever sent them.
+   * The client that stops is expected to put them in its draft, so its user can still send them.
    */
   stopAgent(chatId: number): Promise<void>;
 
@@ -2195,7 +3334,7 @@ export interface Overseer extends RpcTarget {
    * Retry the agent on the given chat. This starts the agent without adding a new user message.
    * The agent will re-process the existing chat history using the specified model.
    *
-   * If an agent is already running, this does nothing.
+   * Throws if an agent is already running on the chat.
    */
   retryAgent(chatId: number, modelId: string): Promise<void>;
 
@@ -2223,8 +3362,9 @@ export interface Overseer extends RpcTarget {
    * atomically in a single call with one propagation pass.
    *
    * - `title` / `description`: if provided, update the respective field.
-   * - `updateCode`: if true, snapshot the source gadget's current committed code into the
-   *   blueprint and increment the blueprint version.
+   * - `updateCode`: if true, release the source gadget's current committed code as the
+   *   blueprint's next version. If that code is what the blueprint's latest version already
+   *   holds, the version stays as it is.
    * - `updateBindings`: if true, refresh the blueprint's connection annotations from
    *   the source gadget's current bindings without changing the code snapshot.
    *
@@ -2354,10 +3494,28 @@ export type AiChatMetadata = {
   activeAgent?: AiChatAuthorInfo,
 
   /**
-   * If true, this chat thread has proposed changes which have not been accepted yet,
-   * including any changes that have not yet been materialized into a durable `changes` message.
+   * The workpieces to which this chat has proposed changes that have not been accepted yet
+   * (including changes not yet materialized into a durable `changes` message): gadgets and
+   * worktrees whose code the chat modified (pinned in the current epoch -- for a worktree, an
+   * explicit commit() counts as a modification), gadgets it provisionally created, and gadgets
+   * it added a binding to. A worktree's creation alone is not listed: the worktree is private to
+   * the chat either way, so a checkout made only to be read proposes nothing (see
+   * AiChatMessageBody.createdWorktrees). Absent (or empty) when the chat proposes nothing --
+   * the pending-changes accept/discard affordances and per-workpiece draft previews key off this
+   * list. Derived server-side and delivered on metadata updates; never submitted by clients.
+   * (This replaces the earlier `hasProposedChanges` boolean; values of that retired field may
+   * linger in stored metadata but are never delivered as truth.)
    */
-  hasProposedChanges?: boolean;
+  proposedChangeWorkpieces?: WorkpieceId[];
+
+  /**
+   * Messages sent while the agent works that it has not read yet, oldest first (see
+   * `Overseer.sendChatMessage`). Each then appears in the chat as a message marked `steered`,
+   * unless a turn ends without reading it and without failing or waiting on the user's decision:
+   * it then prompts the next turn as an ordinary message. Stopping the agent drops them all (see
+   * `Overseer.stopAgent`). Absent when none.
+   */
+  queuedSteers?: {text: string, author: AiChatAuthorInfo}[];
 
   /** If this was started from an agent spawner, the spawner's display name. */
   spawnerName?: string;
@@ -2373,6 +3531,19 @@ export type AiChatMetadata = {
 
   /** Total cost of this conversation so far, in dollars, if known. */
   totalCost?: number;
+
+  /**
+   * Prompt tokens this conversation has sent to the model so far, including the ones the
+   * provider read from or wrote to its prompt cache, if known. A running total, like
+   * `totalCost`: compaction does not reset it.
+   */
+  promptTokens?: number;
+
+  /** How many of `promptTokens` the provider read from its prompt cache. */
+  cacheReadTokens?: number;
+
+  /** How many of `promptTokens` the provider wrote to its prompt cache. */
+  cacheWriteTokens?: number;
 
   /**
    * First sequence this chat still replays. Everything before it is covered by a compaction
@@ -2401,20 +3572,30 @@ export type AiChatMetadata = {
  * changes fast-forwards each touched gadget's head (see Overseer.mergeChanges()). A gadget
  * joins the stream only when its code is first *modified* in the chat -- at that moment it is
  * pinned at a commit, whose tree its changes apply on top of. Unpinned gadgets always track
- * mainline head, live, and are read via Overseer.getCodeAtCommit(). One exception: a gadget
- * created within this chat and still pending has no head commit to pin, so it stays unpinned
- * while its changes build its content up from nothing (every file starts with a `set`); the merge
- * that makes it permanent ends the epoch anyway, and in later epochs it pins like any other
- * gadget.
+ * mainline head, live, and are read via Overseer.listTree()/readFilesAtCommit(). One exception:
+ * a gadget created within this chat and still pending has no head commit to pin, so it stays
+ * unpinned while its changes build its content up from nothing (every file starts with a
+ * `set`); the merge that makes it permanent ends the epoch anyway, and in later epochs it pins
+ * like any other gadget. A worktree (see createdWorktrees) follows the same rule with its
+ * accepted commit in the role of the head: unpinned it reads as that commit's tree, its first
+ * modification pins it there, and an accept advances the accepted commit rather than creating a
+ * mainline commit.
  *
- * Clients derive the chat's content themselves: for each pin, fetch the base tree
- * (Overseer.getCodeAtCommit(baseCommit)); apply the current epoch's non-reverted `changes`
- * messages' changes in log order; then apply the changes not yet materialized into a message,
- * delivered in revision order via AiChatSubscriber.changeApplied(). Accepting changes ends the
- * epoch: the pin set resets to empty and the change stream restarts.
+ * Clients derive the chat's content themselves: for each pin, start from `baseCommit`'s tree
+ * (Overseer.listTree(baseCommit), with each file's text read by path via readFilesAtCommit()
+ * only when something needs it -- an `edit` to apply, or a file the user opens; a whole
+ * repository tree is never fetched); apply the current epoch's non-reverted `changes` messages'
+ * changes in log order, from the pin's last declaration on (see ChatGadgetPinRecord, and
+ * `composeEpochChanges` in `@gadgets/workshop-shared/code-change`); then apply the changes not
+ * yet materialized into a message, delivered
+ * in revision order via AiChatSubscriber.changeApplied(). Accepting changes ends the epoch: the
+ * pin set resets to empty and the change stream restarts.
  */
 export type ChatCodeBase = {
-  /** Per-gadget pins: every permanent gadget whose code has been modified in the current epoch. */
+  /**
+   * Per-workpiece pins: every permanent gadget, and every worktree, whose code has been modified
+   * in the current epoch.
+   */
   pins: ChatGadgetPinState[];
 
   /**
@@ -2423,9 +3604,10 @@ export type ChatCodeBase = {
    * two classes. **Content-preserving** (a merge's epoch reset): the stream identity changes
    * but the content carries over -- `prior` describes the closed stream, and in-flight
    * submissions are transformed onto the new generation (see submitCodeChange()). **Destructive**
-   * (a revert, draft discard, or agent turn abort erased already-applied changes): content other
-   * clients may have transformed against is gone, so they must discard local state and rebuild.
-   * Pin additions and updateChatFromMainline() do *not* bump -- they only append changes.
+   * (a revert, draft discard, or agent turn abort erased already-applied changes, or
+   * updateChatFromMainline() re-rooted pins): content other clients may have transformed against
+   * is gone, so they must discard local state and rebuild. Pin additions do *not* bump -- they
+   * only append changes.
    */
   generation: number;
 
@@ -2473,45 +3655,66 @@ export type ChatCodeBase = {
 };
 
 /**
- * One gadget's pin within a chat (see ChatCodeBase): the record that the gadget's code was
- * modified for the first time in the chat's current epoch, fixing the commit its uncommitted
- * changes apply on top of. A pin is established by that first modification -- a
- * submitCodeChange() pin declaration, or the agent's first write, which pins at the then-current
- * head -- and lasts until the epoch ends or the declaring message is reverted.
+ * One workpiece's pin within a chat (see ChatCodeBase): the record that the gadget's (or
+ * worktree's) code was modified for the first time in the chat's current epoch, fixing the
+ * commit its uncommitted changes apply on top of. A pin is established by that first
+ * modification -- a submitCodeChange() pin declaration, or the agent's first write (for a
+ * worktree, also its first commit()), which pins at the then-current head (a worktree's
+ * accepted commit) -- and lasts until the epoch ends or the declaring message is reverted.
  *
- * This same shape is both the declaration a client submits with a first modification
- * (CodeChangeSubmission.pins) and the permanent record of it in the chat log (the `pins` field of
- * a "changes" message) and in compaction checkpoints. The log record is what a closed epoch's
- * content is reconstructed from: start from `baseCommit`'s tree, then apply the epoch's changes
- * in order. Nothing here ever changes once recorded; a pin's mutable state lives in
- * ChatGadgetPinState.
+ * This shape is the declaration a client submits with a first modification
+ * (CodeChangeSubmission.pins). Its permanent record in the chat log and in compaction
+ * checkpoints is a ChatGadgetPinRecord, which only the server writes.
  */
 export type ChatGadgetPin = {
   /** The pinned gadget. */
   gadgetId: WorkpieceId;
 
   /**
-   * The commit whose tree the chat's uncommitted changes for this gadget apply on top of.
-   * Immutable for the life of the pin: every change recorded for this gadget since is expressed
-   * against content rooted here, so the base moving would invalidate them all. (Mainline movement
-   * is merged into the chat as ordinary changes, advancing ChatGadgetPinState.mergedCommit --
-   * never this.)
+   * The commit whose tree the chat's uncommitted changes for this gadget apply on top of. Fixed
+   * until a later declaration re-roots the gadget (see ChatGadgetPinRecord): every change
+   * recorded for this gadget since is expressed against content rooted here, so nothing else
+   * moves it.
    */
   baseCommit: string;
 };
 
 /**
- * A pin's current state within a chat (see ChatCodeBase.pins): the immutable ChatGadgetPin the
- * epoch recorded, plus how far mainline has been merged into the chat since. That addition is
- * live state rather than history, which is why it is absent from the declaration a client submits
- * and from the record the chat log keeps.
+ * A pin declaration as the chat log records it: the `pins` of a "changes" message, and of a
+ * compaction checkpoint. A declaration **re-roots** its gadget: the gadget's chat content
+ * becomes `baseCommit`'s tree, and any changes that earlier messages of the epoch recorded for
+ * the gadget no longer count. Every fold of the log applies that one rule, so a closed epoch's
+ * content is reconstructed by starting each gadget from its last surviving declaration's tree
+ * and applying the changes recorded from that message on. A reverted message declares nothing,
+ * so reverting a re-root brings back the declaration before it and the changes recorded since.
+ */
+export type ChatGadgetPinRecord = ChatGadgetPin & {
+  /**
+   * ChatGadgetPinState.mergedCommit as of the declaration, for whoever describes it. Absent
+   * when it equals `baseCommit`. A record of the past only: the pin's live `mergedCommit` is
+   * never set from it.
+   */
+  mergedCommit?: string;
+};
+
+/**
+ * A pin's current state within a chat (see ChatCodeBase.pins): its current declaration, plus how
+ * far mainline has been merged into the chat since. That addition is live state rather than
+ * history, which is why it is absent from the declaration a client submits.
  */
 export type ChatGadgetPinState = ChatGadgetPin & {
   /**
-   * The most recent mainline commit whose content has been merged into the chat for this gadget.
-   * Starts equal to baseCommit and advances on updateChatFromMainline(). Accepting the chat's
-   * changes requires this to equal the gadget's current head (WorkpieceSummary.commitId); a
-   * difference means the chat is stale and the UI should offer updating from mainline.
+   * The most recent mainline commit whose content the chat's content for this gadget includes.
+   * Accepting the chat's changes requires this to equal the gadget's current head
+   * (WorkpieceSummary.commitId); a difference means the chat is stale and the UI should offer
+   * updating from mainline.
+   *
+   * It starts equal to `baseCommit`. An update from mainline recorded before re-roots existed
+   * advanced it to a descendant of `baseCommit`. A re-root that merges mainline into the chat
+   * declares a merge commit as `baseCommit` and sets this to the merge's first parent, the head
+   * that was merged; accepting then fast-forwards the head from here through the merge commit
+   * (see Overseer.mergeChanges()). A revert puts back what the earliest update it covers
+   * records the pin had before (see AiChatMessageBody.mainlineMerge).
    */
   mergedCommit: string;
 };
@@ -2556,9 +3759,10 @@ export type CodeChangeSubmission = {
 
   /**
    * Pin declarations, one per permanent gadget this change touches that is not yet pinned in the
-   * chat (a gadget still pending in the chat is never pinned or declared). The same shape is
-   * what the chat log keeps permanently; see Overseer.submitCodeChange() for the validation
-   * rules.
+   * chat (a gadget still pending in the chat is never pinned or declared), and one per worktree
+   * it touches that is not yet pinned -- pending or not, since a worktree's content is its
+   * accepted commit's tree, never built up from nothing. The same shape is what the chat log
+   * keeps permanently; see Overseer.submitCodeChange() for the validation rules.
    */
   pins?: ChatGadgetPin[];
 
@@ -2667,6 +3871,13 @@ export type AiChatAuthorInfo = {
   /** Display name for author, e.g. "Kenton Varda" or "GPT" */
   name: string;
 
+  /**
+   * The user's preferred email address for git commits they author, set via
+   * `AuthenticatedApi.setOwnCommitEmail()`. When absent, commits derive an address from `id`.
+   * Self-asserted and unverified: it is attribution only and must never be read as identity.
+   */
+  commitEmail?: string;
+
   // Note: the avatar is intentionally not included here to keep this type lightweight (it's
   // embedded in every chat message). Fetch user avatars separately via
   // `AuthenticatedApi.getAvatar(userId)`.
@@ -2713,6 +3924,13 @@ export type AiChatMessageBody = {
    * Clients use this to group the two records for display.
    */
   generatedBySlashCommandSequence?: number;
+
+  /**
+   * Sent while the agent was working, so it steers that turn rather than prompting one. The agent
+   * reads it before its next model request, or, if the turn ended before it could and started no
+   * other (it failed, or stopped to wait on the user's decision), when the agent next runs.
+   */
+  steered?: true;
 } | {
   /**
    * A slash command exactly as requested by the client, retained for display and never included in
@@ -2749,12 +3967,12 @@ export type AiChatMessageBody = {
   observedCodeVersion?: number;
 
   /**
-   * Pins this batch establishes: for each gadget listed, this message's `change` contains the
-   * epoch's first modification of that gadget's code, applied on top of the pinned commit's
-   * tree. Content reconstruction establishes each listed pin's base before applying the change (see
-   * ChatGadgetPin).
+   * Pins this batch declares. For each gadget listed, the chat's content restarts at the pinned
+   * commit's tree, dropping whatever earlier messages of the epoch changed in it (see
+   * ChatGadgetPinRecord), and this message's `change` applies on top. Usually the declaration
+   * accompanies the epoch's first modification of the gadget's code.
    */
-  pins?: ChatGadgetPin[];
+  pins?: ChatGadgetPinRecord[];
 
   /**
    * The span of the change stream this batch materialized: this message's `change` is the
@@ -2769,20 +3987,26 @@ export type AiChatMessageBody = {
   watermark?: {changesGeneration: number, throughRevision: number};
 
   /**
-   * Present when this batch was produced by Overseer.updateChatFromMainline(): `change` merges
-   * mainline commits into the chat. `conflictPaths` lists the files whose 3-way merge was not
-   * clean, in sorted order, each qualified by its gadget's binding name
-   * (`GADGET_NAME/path/to/file`); their merged contents carry inline conflict markers (or, for
-   * delete-vs-modify, the surviving side's content) for the user or their agent to resolve.
-   * `change` is absent when the chat's content already matched the merged mainline commits;
-   * the batch then records only that the pins advanced.
+   * Present when this batch was produced by Overseer.updateChatFromMainline(). `conflictPaths`
+   * lists the files whose 3-way merge was not clean, in sorted order, each qualified by its
+   * gadget's binding name (`GADGET_NAME/path/to/file`); their merged contents carry inline
+   * conflict markers (or, for delete-vs-modify, the surviving side's content) for the user or
+   * their agent to resolve.
    *
-   * A batch carrying this cannot be reverted while still proposed (Overseer.revertChanges()
-   * refuses): the merge advanced the chat's pins, and erasing its content while keeping the
-   * advanced pins would let a later accept silently overwrite the mainline changes it
-   * delivered.
+   * `gadgets` records each gadget's part of the merge, whose result is a commit: the batch has
+   * no `change`, and its `pins` re-root each gadget merged at that commit, with the head merged
+   * as the declaration's `mergedCommit` (see ChatGadgetPinRecord). Each entry also records what
+   * the pin's `mergedCommit` was before the update, which a revert covering this message puts
+   * back (see Overseer.revertChanges()).
+   *
+   * A batch without `gadgets` was recorded before merges were commits. Its `change` merged
+   * mainline commits into the chat, or is absent when the chat's content already matched them,
+   * and it advanced the chat's pins with no record of their earlier values, so it cannot be
+   * reverted while still proposed (Overseer.revertChanges() refuses). Erasing its content while
+   * keeping the advanced pins would let a later accept silently overwrite the mainline changes
+   * it delivered.
    */
-  mainlineMerge?: {conflictPaths: string[]};
+  mainlineMerge?: {conflictPaths: string[], gadgets?: MainlineMergeGadget[]};
 
   /**
    * Present on the synthetic message that converted this chat from the pre-git-storage
@@ -2812,14 +4036,68 @@ export type AiChatMessageBody = {
   createdGadgets?: {gadgetId: WorkpieceId, title: string, bindingName: string}[];
 
   /**
+   * Worktrees created as part of this batch of changes (by the agent's `createWorktree` tool).
+   * Deliberately separate from `createdGadgets` so a client can never mistake a worktree for a
+   * gadget creation. Unlike a gadget creation, a worktree creation is not a proposed change (see
+   * AiChatMetadata.proposedChangeWorkpieces), so it is not provisional either: recording this
+   * message makes each worktree permanent (though private to this chat for life), nothing needs
+   * accepting until the worktree is first modified, and a revert covering this message rolls
+   * back the worktree's content and head but never deletes it. A creation pins nothing: like a
+   * gadget, a worktree joins `pins` when it is first modified (see ChatGadgetPin). Batches
+   * written before that was so carry the worktree's birth pin `{gadgetId: worktreeId,
+   * baseCommit}` alongside the creation, which readers honor as an ordinary pin. `bindingName`
+   * is the name in the creating chat's env, recorded so replay can pick it back up. The worktree
+   * itself reaches the client as a WorktreeSummary on the workpiece subscription, and its
+   * content rides `change` and `pins` like a gadget's.
+   */
+  createdWorktrees?: {worktreeId: WorkpieceId, title: string, bindingName: string}[];
+
+  /**
+   * Explicit worktree commits made as part of this batch: the agent's `commit()` calls on the
+   * Worktree binding, each advancing the worktree's head from `previousHead` to `commit` (the
+   * new head; also the call's return value). This is the durable, sequence-bearing record of the
+   * advancement: the worktree registry record's head is updated in the same synchronous step
+   * this message is written, and a revert covering this message rolls each affected worktree's
+   * head back to its earliest reverted entry's `previousHead` (entries are ordered within the
+   * message and messages by sequence, so multiple commits per step or per reverted range
+   * compose). The commit objects themselves always remain -- content-addressed, and merely
+   * dangling after a rollback -- so a queued push naming a rolled-back commit stays valid.
+   */
+  worktreeCommits?: {worktreeId: WorkpieceId, commit: string, previousHead: string}[];
+
+  /**
    * Binding edges added to gadgets as part of this batch of changes (by the agent's
    * setGadgetBinding tool, or by the user binding a connection with a chat open -- in the latter
    * case `change` is omitted). Like `createdGadgets`, the additions are
    * provisional: the edge is visible only from this chat until a merge through this message
    * makes it permanent, and a revert covering it deletes the edge. `name` is the binding's name
-   * within the gadget identified by `gadgetId`; `target` is the bound workpiece.
+   * within the gadget (or agent spawner) identified by `gadgetId`; `target` is the bound
+   * workpiece.
    */
   addedBindings?: {gadgetId: WorkpieceId, name: string, target: WorkpieceId}[];
+
+  /**
+   * Blueprint releases this batch proposes to merge into gadgets: recorded by
+   * GadgetClient.applyBlueprint(), and by the agent's `createGadget` tool when it builds the new
+   * gadget from a blueprint.
+   *
+   * A proposal that GadgetClient.applyBlueprint() records is one message with no `change`. Its
+   * merge was written as a commit, whose parents are the gadget's head and the release, and
+   * which marks the release as merged. The batch's `pins` re-root the gadget at that commit,
+   * with the head as the declaration's `mergedCommit` (see ChatGadgetPinRecord). The agent's
+   * `createGadget` instead delivers the release's files as the batch's `change`, since a gadget
+   * still pending in the chat has no head to commit on.
+   *
+   * Like the rest of the batch this is provisional. A merge through this message makes each
+   * gadget follow the blueprint named (see GadgetUpstream) and records the release in the
+   * gadget's history; a revert covering it withdraws the proposal, and until one or the other
+   * the gadget is as it was.
+   *
+   * A proposal whose release is already in the gadget's history writes no commit and pins
+   * nothing, so it does not put its gadget in AiChatMetadata.proposedChangeWorkpieces: this
+   * record is then the only sign that the chat has something to accept.
+   */
+  blueprintMerges?: BlueprintMerge[];
 } | {
   /**
    * Indicates that at this point in the chat, the user chose to merge all (non-reverted) changes
@@ -2852,6 +4130,22 @@ export type AiChatMessageBody = {
    * epochs.
    */
   epochBoundary?: true;
+
+  /**
+   * No longer written; honored when read. Merges from when worktrees were pinned from birth
+   * recorded here the re-pin of each live worktree in the new generation, at `baseCommit`: a
+   * fresh local auto-commit capturing its uncommitted overlay when the closed epoch left it
+   * dirty, else its unchanged base. Content reconstruction and compaction checkpoints still
+   * re-root worktree content at these pins so the epochs they open fold as they were written.
+   * Today a worktree pins on first modification like a gadget, and an accept merely advances
+   * the worktree's accepted commit (to the same auto-commit) with no pin in the new generation,
+   * so a merge written now carries no entry here. Auto-commits are internal bookkeeping,
+   * squashed out of explicit history -- the worktree's reported head is untouched, and a later
+   * explicit commit parents on that head, never on an auto-commit. Clients do not need to read
+   * this field: a re-pin that is still in effect is mirrored in ChatCodeBase.pins, which is the
+   * only pin source a client uses.
+   */
+  worktreePins?: {worktreeId: WorkpieceId, baseCommit: string}[];
 } | {
   /**
    * Indicates that at this point in the chat, the user chose to revert all changes starting at the
@@ -2882,6 +4176,18 @@ export type AiChatMessageBody = {
   type: "useGadget";
 } | {
   /**
+   * The always-available resources changed after the agent's system prompt listed them: a
+   * catalog changed, e.g. a skill was added to the Context Library, or the chat gained a resource,
+   * e.g. the owner turned on Web Search. The agent writes this before the model request that first
+   * sees the change, and tells the model what changed, so the system prompt can stay the same for
+   * the whole chat. Clients show nothing for it.
+   */
+  type: "catalogChange";
+
+  /** Each changed or new resource, as it is now. */
+  resources: AlwaysAvailableResource[];
+} | {
+  /**
    * Indicates that the agent run ended with an error (e.g. LLM API failure, abort, server
    * restart). This is displayed to the user with a "retry" button, but is NOT included in the
    * chat log sent to the LLM so the agent does not react to it.
@@ -2895,23 +4201,30 @@ export type AiChatMessageBody = {
   code?: string;
 } | {
   /**
-   * Indicates that a callback was received on the agent's `self` object. When the agent uses
-   * `executeCode`, the executed code receives a `self` parameter. Calling any method on `self`
-   * (e.g., `self.onUpdate(data)`) delivers a callback message back to this chat thread and
-   * activates the agent to respond.
+   * Indicates that a call was delivered to the agent: a method was called on its `self` object
+   * (which code run by the agent's `executeCode` tool receives, and may pass along or store) or on
+   * the stub an agent spawner's `spawnCallable()` returned. The call activates the agent to
+   * respond; nothing is returned to the caller.
    */
   type: "agentCallback";
 
-  /** The method name that was called on `self`. */
+  /** The method name that was called. */
   methodName: string;
 
   /** A depth-limited summary string of the arguments for the agent's context window. */
   argsSummary: string;
+
+  /**
+   * Name under which the arguments appear in the agent's `env`. Absent on messages from before
+   * callable agents became durable, whose arguments are no longer available.
+   */
+  bindingName?: string;
 } | {
   /**
-   * A system-generated nudge message sent to the agent when it tries to end its turn while
-   * agent callbacks are still unresolved. This is displayed as a user message to the LLM
-   * so it can be prompted to continue.
+   * A model-visible control note for an approved-decision handoff, explicit Retry, or Stop.
+   * It also ends the preceding decision segment for recovery. Not rendered in the chat UI:
+   * the decision cards and turn controls already show these transitions to the user.
+   * Older logs used this variant to nudge an agent whose callbacks were still unresolved.
    */
   type: "agentNudge";
   text: string;
@@ -2928,7 +4241,10 @@ export type AiChatMessageBody = {
   /** Unique id used by acceptConnectionRequest()/denyConnectionRequest(). */
   requestId: string;
 
-  /** The gatekeeper vendor the agent is requesting (id + denormalized display name). */
+  /**
+   * The gatekeeper vendor the agent is requesting (id + denormalized display name), or
+   * AGENT_SPAWNER_CONNECTION_ID for an agent spawner.
+   */
   vendorId: string;
   vendorName: string;
 
@@ -2950,9 +4266,10 @@ export type AiChatMessageBody = {
   /**
    * The urlPattern of the supported resource this request resolved to at request time (one of the
    * vendor's SupportedResource.urlPattern values, e.g. "https://github.com/:owner/:repo" or the
-   * whole-instance "https://*"). The backend guarantees every connection request resolves to a
-   * concrete resource (see resolveRequestedResource), and the accept modal pre-selects exactly this
-   * resource — so accepting never opens a blank "create new connection" picker.
+   * whole-instance "https://*"). The backend guarantees every connection request for a vendor
+   * resolves to a concrete resource (see resolveRequestedResource), and the accept modal
+   * pre-selects exactly this resource — so accepting never opens a blank "create new connection"
+   * picker. Absent for an agent spawner, which has no resources: accepting opens its form.
    */
   resourceUrlPattern?: string;
 
@@ -2982,37 +4299,58 @@ export type AiChatMessageBody = {
 };
 
 /**
- * Bytes to upload as a chat attachment.
- *
- * The server stores the bytes and returns the handle to pass when sending the message.
+ * A resource the agent can always use without requesting it (e.g. the Context Library's read
+ * session), as its system prompt lists it.
  */
-export type ChatAttachmentUpload = {
-  mimeType: string;
-  content: Uint8Array;
-  name?: string;
+export type AlwaysAvailableResource = {
+  /** The resource's binding name in the agent's `env`. */
+  name: string;
+
+  /** The resource's title. */
+  title: string;
+
+  /** The resource's discovery catalog, or null if it has none or it failed to load. */
+  catalog: AgentCatalog | null;
 };
 
 /**
- * Handle for an attachment that has been uploaded but not yet sent as part of a message.
- *
- * Pass this back unchanged when sending the chat message.
+ * A previously uploaded blob to attach to a chat message, with display/model-input metadata.
+ * The blob must be present in this workspace's Git store. Attachment limits and MIME signatures
+ * are checked when sending. The ID-only variant accepts legacy staged uploads.
  */
 export type ChatAttachmentHandle = {
-  /** Clients must not infer storage paths from this ID or construct handles by hand. */
+  /** Immutable Git blob returned by `uploadBlob()`. */
+  oid: GitOid;
+  /** MIME type of this use of the blob; it does not change the stored bytes. */
+  mimeType: string;
+  /** Original display filename, sanitized when sending. */
+  name?: string;
+} | {
+  /** Legacy staged-upload ID; new clients use a blob OID instead. */
   id: string;
 };
 
 /**
  * Attachment metadata returned to clients.
  *
- * For image attachments, `content` carries the full image bytes inline so the client can render
- * them in the chat without an extra round trip. For other attachments, fetch the bytes on demand
- * via `Overseer.getChatAttachmentContent()`.
+ * For supported inline image formats, `content` carries the image bytes so the client can render
+ * them without an extra round trip. For other attachments, fetch the bytes on demand via
+ * `Overseer.getChatAttachmentContent()`.
  */
-export type ChatAttachmentRef = ChatAttachmentHandle & {
+export type ChatAttachmentRef = {
+  /** Chat-owned attachment identity used for downloads and message rendering. */
+  id: string;
+  /** Original immutable upload blob. Absent on legacy attachments. */
+  oid?: GitOid;
   mimeType: string;
   name?: string;
   size: number;
+
+  /**
+   * Path in the chat's scratch worktree, preserving uploaded bytes for every file format.
+   * Absent only on legacy attachments committed before workspace ingress was introduced.
+   */
+  workspacePath?: string;
 
   /** Inlined bytes for small image attachments. Present only for images. */
   content?: Uint8Array;
@@ -3054,17 +4392,53 @@ export type AiToolCall = {
    * the pair of a workpiece reference (the `workpiece` chat binding name) and `filename`.
    */
   toolName: "readFile";
-  input: {workpiece?: string, filename: string};
+  input: {
+    workpiece?: string;
+    filename: string;
+
+    /**
+     * Optional line window: `startLine` is 1-based and `lineCount` is the number of lines to return
+     * from there, each defaulting to the file's edge. A windowed read ends with a line stating the
+     * range shown and where to continue. Absent on reads recorded before ranges existed.
+     */
+    startLine?: number;
+    lineCount?: number;
+  };
 
   /**
    * Present when the read was served from committed code rather than the chat's uncommitted
    * content: the workpiece was not pinned in the chat (see ChatGadgetPin), so the agent read the
-   * file at the mainline head commit recorded here. History replay uses this to detect
-   * staleness: if the file has since changed, the read's content is elided from the model's
-   * context and the agent is told to re-read. Reads of pinned workpieces come from the chat's
-   * content, which cannot go stale within an epoch, and carry no stamp.
+   * file at its head -- a gadget's mainline head, a worktree's accepted commit -- and this is
+   * the blob oid of the content it saw. History replay reproduces the read's exact text from
+   * it, whatever the head holds now, and the agent's read-before-edit gate compares it against
+   * the file's oid at the head an edit is about to pin at, refusing an edit anchored to content
+   * another chat has since changed. Reads of pinned workpieces come from the chat's content,
+   * which cannot go stale within an epoch, and carry no stamp.
+   */
+  observedOid?: string;
+
+  /**
+   * No longer written; honored when read. Before reads were stamped with the blob's oid
+   * (`observedOid`), an unpinned read recorded the commit it read at; replay resolves the file's
+   * blob from it by path.
    */
   observedCommit?: string;
+} | {
+  /**
+   * Search a workpiece's files for lines matching a regular expression, in `grep -n` form. The
+   * output, bounded as the model saw it, is recorded so replay doesn't re-run the search.
+   */
+  toolName: "grep";
+  input: {
+    workpiece: string;
+
+    /** JavaScript regular expression, matched against each line. */
+    pattern: string;
+
+    /** A file to search, or a directory to search recursively. Absent means the whole workpiece. */
+    path?: string;
+  };
+  output?: string;
 } | {
   toolName: "writeFile";
   input: {
@@ -3082,13 +4456,23 @@ export type AiToolCall = {
   };
 } | {
   /**
-   * Describe one of the chat's bindings by name. Numeric names appear only in logs persisted
-   * before named chat bindings (they were capsule indices).
+   * Describe a binding by name: one of the chat's bindings or, when `gadget` is given, one of
+   * that gadget's own bindings. Numeric names appear only in logs persisted before named chat
+   * bindings (they were capsule indices).
    */
   toolName: "describeBinding";
   input: {
     name: string | number;
+    /** Chat binding name of a gadget; when present, `name` is a binding in that gadget's env. */
+    gadget?: string;
   };
+
+  /**
+   * The description, exactly as the model saw it (already bounded), which history replay returns
+   * verbatim rather than describing the binding again. Absent when the call failed, and in logs
+   * persisted before descriptions were recorded, whose replay elides the result.
+   */
+  output?: string;
 } | {
   toolName: "setBindingHook";
   input: {
@@ -3097,12 +4481,12 @@ export type AiToolCall = {
   };
 } | {
   /**
-   * Wire one of the chat's bindings into a gadget's own binding list. The addition is provisional
-   * to the chat, recorded by a "changes" message (see `addedBindings`).
+   * Wire one of the chat's bindings into a gadget's own binding list, or an agent spawner's. The
+   * addition is provisional to the chat, recorded by a "changes" message (see `addedBindings`).
    */
   toolName: "setGadgetBinding";
   input: {
-    /** Chat binding name of the target gadget. */
+    /** Chat binding name of the target gadget or agent spawner. */
     gadget: string;
     /** Chat binding name of the resource to wire into the gadget. */
     source: string;
@@ -3163,6 +4547,49 @@ export type AiToolCall = {
    */
   output?: {gadgetId: WorkpieceId, changeId?: number, blueprintNotes?: string};
 } | {
+  /**
+   * Create a new worktree workpiece: a file tree rooted at a git commit, private to the creating
+   * chat, whose files the agent then reads and edits with the regular file tools. Unlike a
+   * gadget, a worktree has no output, no bindings, and cannot execute; its name lives only in
+   * the chat's binding map, never in the workspace default binding list.
+   */
+  toolName: "createWorktree";
+  input: {
+    /** Human-readable title for the new worktree. Required, like a gadget's. */
+    title: string;
+
+    /**
+     * Name under which the worktree appears in the chat's env (see validateBindingName()). The
+     * chat's binding map is the only namespace a worktree name occupies.
+     */
+    bindingName: string;
+
+    /**
+     * The git commit to root the worktree at: a full 40-hex oid, resolved against the
+     * workspace's local git store and its gatekeeper-provided metadata (never a remote lookup --
+     * remote refs resolve through gatekeeper APIs first). Abbreviated ids are refused, since
+     * knowing a commit's id is the capability to read it; logs written before that may carry an
+     * unambiguous prefix.
+     */
+    commitId: string;
+  };
+
+  /**
+   * The created worktree's workpiece ID, recorded when the worktree was actually created; like
+   * createGadget's output, replay returns this recorded result instead of re-creating.
+   *
+   * `changeId` is the change number of the "changes" batch that records the creation (see
+   * `createdWorktrees` on the "changes" message body), like createGadget's.
+   *
+   * `baseCommit` is the full oid `input.commitId` resolved to -- the commit the worktree is
+   * rooted at, and its accepted commit until the chat's first accept of changes to it. Recorded
+   * because the input of an older log may be a prefix and the model is told the resolved oid. The creation pins
+   * nothing: the worktree reads as its accepted commit until its first modification pins it
+   * (see ChatGadgetPin), so replay serves untouched files from the pin when there is one and
+   * from the accepted commit otherwise, never from this field.
+   */
+  output?: {worktreeId: WorkpieceId, changeId?: number, baseCommit: string};
+} | {
   toolName: "executeCode";
   input: {
     code: string;
@@ -3171,6 +4598,11 @@ export type AiToolCall = {
   /** Output, if the code actually ran. (Otherwise, `error` should be present.) */
   output?: string;
 } | {
+  /**
+   * **Obsolete.** Rejected all of the agent's outstanding callbacks with an error. No longer
+   * emitted since callable agents stopped returning values; retained so older chat logs remain
+   * readable.
+   */
   toolName: "giveUp";
   input: {
     error: string;
@@ -3232,6 +4664,28 @@ export type AiToolCall = {
     bindingName?: string;
   };
   output?: string;
+} | {
+  /**
+   * Create a new external resource of a creatable type (see `SupportedResource.creatable`). Its
+   * binding is usable at once: the gatekeeper simulates the resource until a user approves the
+   * creation action, choosing the account to create it in.
+   */
+  toolName: "createExternalResource";
+  input: {
+    vendorId: string;
+
+    /** `urlPattern` of the creatable resource type. */
+    resourceUrlPattern: string;
+
+    /** Title of the new resource, e.g. a document's title. */
+    title: string;
+
+    /** Name under which the resource appears in the chat's env (see validateBindingName()). */
+    bindingName: string;
+  };
+
+  /** The new gatekeeper workpiece; replay re-binds it rather than creating again. */
+  output?: {gatekeeperId: WorkpieceId};
 });
 
 // TODO: Extend AiToolCall for code-mode tool calls.
@@ -3368,12 +4822,21 @@ export type SlashCommandChoice = {
  *
  * At most one provisional stream is active per chat at a time. The client should not persist
  * these events. Instead, it should display them temporarily and discard them as soon as the
- * corresponding durable `message()` and/or `changes` message arrives, or when the agent stops
- * running (`activeAgent` becomes unset in the chat metadata).
+ * corresponding durable `message()` and/or `changes` message arrives, when the agent stops
+ * running (`activeAgent` becomes unset in the chat metadata), or when a `streamReset` event
+ * arrives.
  */
 export type AiChatStreamEvent = {
   /** The turn is summarizing older context before it can continue, or before `/compact` ends. */
   type: "compacting";
+} | {
+  /**
+   * The in-progress model request failed transiently and will be retried. Nothing it streamed
+   * will become durable, so the client should discard the step's provisional state -- streamed
+   * text and reasoning, tool-call cards, the active-file marker and all edit previews -- as it
+   * would for an error message. The retry then streams afresh.
+   */
+  type: "streamReset";
 } | {
   /**
    * The compaction attempt ended, whether it compacted, failed, was cancelled, or found nothing to
@@ -3434,8 +4897,9 @@ export type AiChatStreamEvent = {
    * content/replacement field begins, since it is the input's final field).
    *
    * The event carries no base content: the client locates the span in its own copy of the file
-   * -- the chat's content, or the committed head for a gadget the chat doesn't cover -- which
-   * mirrors the content the agent computes its edit against (both are the same change stream).
+   * -- the chat's content, or the committed head (a worktree's accepted commit) for a workpiece
+   * the chat doesn't cover, read via readFilesAtCommit() if not yet loaded -- which mirrors the
+   * content the agent computes its edit against (both are the same change stream).
    * The preview is display-only provisional state, never entering the client's own change
    * tracking.
    *
@@ -3529,8 +4993,7 @@ export interface AiChatSubscriber {
   /**
    * Delivers one accepted change of a chat's change stream: a human submitCodeChange(), an agent
    * tool edit (broadcast when the tool call completes, superseding the provisional editPreview*
-   * stream of its in-progress content -- see AiChatStreamEvent), or an updateChatFromMainline()
-   * merge. Changes must be applied in
+   * stream of its in-progress content -- see AiChatStreamEvent). Changes must be applied in
    * revision order within a generation; a gap means events were lost and the client should
    * rebuild from fresh metadata and history. On a generation switch, first finish the old
    * generation's remaining changes -- complete once seen through
@@ -3545,7 +5008,7 @@ export interface AiChatSubscriber {
    * CodeChangeSubmission's clientId and seq), so the submitting client recognizes its own change
    * -- in the live feed and in subscribe-replay alike, without depending on ack/broadcast
    * ordering -- and drops its in-flight buffer instead of re-applying. The echo is informational
-   * only; server-authored changes (agent edits, mainline merges) omit it.
+   * only; server-authored changes (agent edits) omit it.
    */
   changeApplied(chatId: number, generation: number, revision: number, author: AiChatAuthorInfo,
                 change: CodeChange, submission?: {clientId: string, seq: number}): void;
@@ -3583,15 +5046,20 @@ export type ConsoleLogEvent = {
 }
 
 /**
- * Summary of one workpiece, delivered via Overseer.subscribeToWorkpieces(). In v1 only
- * gadget-type workpieces are published (gatekeeper workpieces -- chat capsules, ambient
- * singletons, connections -- are not listed); `type` discriminates for future workpiece types.
+ * Summary of one workpiece, delivered via Overseer.subscribeToWorkpieces(), discriminated by
+ * `type`. Gadgets and worktrees are published (gatekeeper workpieces -- chat capsules, ambient
+ * singletons, connections -- are not listed). Worktrees are published only to subscriptions that
+ * include pending workpieces (build role): like a pending gadget, a worktree belongs to one chat
+ * (its `chatId` is always set) and the UI shows it only while that chat is selected.
  */
-export type WorkpieceSummary = {
+export type WorkpieceSummary = GadgetSummary | WorktreeSummary;
+
+/** The WorkpieceSummary of a gadget: an app built from code, with a committed mainline head. */
+export type GadgetSummary = {
   id: WorkpieceId;
   type: "gadget";
 
-  /** Display title. (For a gadget, its user-renamable title.) */
+  /** Display title: the gadget's user-renamable title. */
   title: string;
 
   /**
@@ -3602,13 +5070,21 @@ export type WorkpieceSummary = {
 
   /**
    * The gadget's head commit (40-hex hash) in the workspace's git object store -- i.e. its
-   * committed mainline code, readable via Overseer.getCodeAtCommit()/getCommitLog(). Advances
-   * when a chat's changes are accepted; subscribeToWorkpieces() delivers a fresh entry()
-   * whenever it does. Absent only while the gadget is still pending in a chat (see `chatId`):
-   * every permanent gadget has a head, even before it has any code (an empty initial commit),
-   * so a chat's first edit always has a commit to pin (see ChatGadgetPin).
+   * committed mainline code, readable via Overseer.listTree() / readFilesAtCommit() /
+   * getCommitLog(). Advances when a chat's changes are accepted; subscribeToWorkpieces()
+   * delivers a fresh entry() whenever it does. Absent only while the gadget is still pending in
+   * a chat (see `chatId`): every permanent gadget has a head, even before it has any code (an
+   * empty initial commit), so a chat's first edit always has a commit to pin (see ChatGadgetPin).
    */
   commitId?: string;
+
+  /**
+   * Where this gadget's code came from: the blueprint it follows, or that it was built from
+   * scratch (see GadgetUpstream). Absent if that is not known, as for a gadget made before it
+   * was recorded. Delivered only to subscribers with the "build" role: a blueprint id is a share
+   * link to the blueprint's code, which a "use" collaborator cannot otherwise read.
+   */
+  upstream?: GadgetUpstream;
 
   /**
    * If present, this workpiece exists only in the context of the given chat. The UI should display
@@ -3619,6 +5095,202 @@ export type WorkpieceSummary = {
    * reverted (or the chat is deleted).
    */
   chatId?: number;
+};
+
+/**
+ * The blueprint a gadget follows: the one it takes updates from, and how much of it the gadget
+ * already has. An update is available when the blueprint names a current release
+ * (`BlueprintMetadata.commitId`, from `PublicApi.getBlueprint()`) other than a known `commitId`.
+ *
+ * A gadget built from scratch in its workspace follows no blueprint, and its upstream says so
+ * by naming none. That differs from a gadget with no upstream at all, whose origin is unknown.
+ */
+export type GadgetUpstream = {
+  /**
+   * The blueprint's id. Absent if the gadget was built from scratch: there is then no blueprint
+   * to offer it updates from, and no `commitId` either. GadgetClient.applyBlueprint() treats
+   * such a gadget like one of unknown origin, and gives it a blueprint to follow if its
+   * proposal is accepted.
+   */
+  blueprintId?: string;
+
+  /**
+   * The release of that blueprint the gadget most recently merged: a release commit, and an
+   * ancestor of the gadget's head. For a blueprint stored before releases were commits, it is
+   * the commit that everyone who reads that content derives from its files.
+   *
+   * Absent if the gadget was created from the blueprint before gadgets recorded the release
+   * they took. Which release that was is then unknown: whether an update is available cannot
+   * be told, and applying the blueprint merges over a guessed base (see
+   * BlueprintMerge.unverifiedBase), as for a gadget that follows no blueprint. Accepting that
+   * proposal records the release.
+   */
+  commitId?: string;
+};
+
+/**
+ * A proposal to merge a release of a blueprint into a gadget (see
+ * AiChatMessageBody.blueprintMerges). It records everything about the proposal as it was made,
+ * so describing it needs no second look at a blueprint that may have been republished since.
+ */
+export type BlueprintMerge = {
+  /** The gadget the release is merged into. */
+  gadgetId: WorkpieceId;
+
+  /** The blueprint, which the gadget follows once the proposal is accepted. */
+  blueprintId: string;
+
+  /** The blueprint's title at this release. */
+  title: string;
+
+  /** The blueprint's version counter at this release (`BlueprintMetadata.version`). */
+  version: number;
+
+  /** The release: the commit that the gadget's history gains as a parent, if it lacks it. */
+  commitId: string;
+
+  /**
+   * What the proposal does to the gadget's files, as the result of the merge decides it:
+   * - "follow": nothing. Either the release is already in the gadget's history, or the gadget
+   *   already has every change the release made since the base.
+   * - "fastForward": they become the release's exactly. The gadget had no changes of its own
+   *   since the base, or was created from the release.
+   * - "merge": the gadget and the blueprint both changed files since the base, and the two
+   *   sets of changes were merged, three ways. A merge that conflicted is one even if no file
+   *   changes: a file the gadget changed and the release deleted is kept, but whether it
+   *   should stay is still to be decided.
+   */
+  kind: "follow" | "fastForward" | "merge";
+
+  /**
+   * The commit the merge took as the version the gadget and the release have in common. Absent
+   * if there was nothing to merge: the release was already in the gadget's history, or the
+   * gadget was created from it.
+   */
+  baseCommit?: string;
+
+  /**
+   * The files whose merge was not clean, as paths within the gadget, in sorted order. Each
+   * holds inline conflict markers, or for a file one side deleted and the other changed, the
+   * changed content with no markers (as for `mainlineMerge`). Empty unless `kind` is "merge".
+   */
+  conflictPaths: string[];
+
+  /**
+   * Present if the gadget and the release share no history, so that `baseCommit` is a guess at
+   * what the gadget was built from. A change the gadget's owner made that the guess happens to
+   * include looks like something the blueprint removed, and is undone with no conflict
+   * reported.
+   */
+  unverifiedBase?: true;
+
+  /**
+   * The bindings the release declares that the gadget had none named for, by binding name.
+   * Absent if there were none. A binding that exists only to feed an agent spawner
+   * (`spawnerOnly`) has no name in the gadget to look for, so it is listed only when a missing
+   * agent-spawner binding's agents get it.
+   */
+  missingBindings?: Record<string, BlueprintBinding>;
+};
+
+/**
+ * One gadget's part of an update from mainline (see AiChatMessageBody.mainlineMerge): the three
+ * sides of its merge, as commits, and what did not merge cleanly. The other two sides are on
+ * the message's pin declaration for the gadget: its `mergedCommit` is the head that was
+ * merged, and its `baseCommit` the merge commit, whose parents are that head and
+ * `chatCommit`. Where the chat had nothing of its own to merge, no merge commit was written,
+ * and the declaration's `baseCommit` is the head itself.
+ */
+export type MainlineMergeGadget = {
+  /** The pinned gadget that was brought up to date. */
+  gadgetId: WorkpieceId;
+
+  /**
+   * The base of the merge: the mainline commit the chat had last merged for this gadget, which
+   * is the pin's ChatGadgetPinState.mergedCommit as it was before the update. A revert of the
+   * update puts the pin's `mergedCommit` back to this.
+   */
+  baseCommit: string;
+
+  /**
+   * A commit of the chat's files for the gadget as they were before the update. Its parent is
+   * the pin's `baseCommit` as it was then, the commit the chat's changes were made on; where the
+   * files were that commit's own, it is that commit.
+   */
+  chatCommit: string;
+
+  /**
+   * The files whose merge was not clean, as paths within the gadget, in sorted order (see
+   * BlueprintMerge.conflictPaths).
+   */
+  conflictPaths: string[];
+};
+
+/** Result of GadgetClient.applyBlueprint(). */
+export type ApplyBlueprintResult = {
+  /** A new chat holds the proposal, to preview and then accept or discard. */
+  outcome: "proposed";
+
+  /** The new chat. */
+  chatId: number;
+} | {
+  /** The gadget already follows this blueprint at its current release. Nothing was proposed. */
+  outcome: "upToDate";
+} | {
+  /**
+   * The gadget and the blueprint share no history, and the caller did not allow for that.
+   * Nothing was proposed. Calling again with `allowUnrelated` proposes a merge over a guessed
+   * base (see BlueprintMerge.unverifiedBase), which the user should be warned of first.
+   */
+  outcome: "unrelated";
+} | {
+  /**
+   * The gadget and the blueprint share a version, but its files are not available to merge
+   * against. Nothing was proposed.
+   */
+  outcome: "baseUnavailable";
+};
+
+/**
+ * The WorkpieceSummary of a worktree: a checkout of an external git repository that an agent
+ * works in (see AiChatMessageBody.createdWorktrees). It has no app and no bindings; the UI shows
+ * only its code. Its three commits are the worktree's state as the chat sees it; the OT rows of
+ * the chat's current epoch compose on `pinBase`.
+ */
+export type WorktreeSummary = {
+  id: WorkpieceId;
+  type: "worktree";
+
+  /** Display title: the name the worktree was created under. */
+  title: string;
+
+  /**
+   * The chat this worktree belongs to, for its whole life (a worktree is never shared across
+   * chats). Always set: the UI displays the worktree only while this chat is selected, as it
+   * does a pending gadget, and the worktree is deleted with the chat.
+   */
+  chatId: number;
+
+  /**
+   * The accepted commit (40-hex hash): the worktree's content as of the chat's last accept, and
+   * the worktree analog of a gadget's `commitId`. While the worktree is unpinned in its chat, its
+   * content reads as this commit's tree (via Overseer.listTree()/readFilesAtCommit()), and a
+   * client's pin declaration (CodeChangeSubmission.pins) is accepted iff its `baseCommit` equals
+   * this. Advances when the chat's changes are accepted (to the accept's auto-commit of the
+   * changed content); subscribeToWorkpieces() delivers a fresh entry() whenever it does.
+   */
+  pinBase: string;
+
+  /**
+   * The last explicit commit the agent made (initially `baseCommit`): what the worktree's own
+   * API reports as HEAD. Header display only -- it plays no role in what the UI shows as changed,
+   * which is always relative to `pinBase`. Re-delivered whenever it advances, and rolled back
+   * with the changes that advanced it when they are reverted.
+   */
+  headCommit: string;
+
+  /** The commit the worktree was created at. Immutable; informational. */
+  baseCommit: string;
 };
 
 /** Callback interface used to receive workpiece-list updates. See Overseer.subscribeToWorkpieces(). */
@@ -3685,7 +5357,7 @@ export type PreApprovableAction = {
 export type GatekeeperCreationSpec = {
   type: "gatekeeper";
   vendorId: string;        // identifies the gatekeeper adapter (e.g. "google")
-  resourceUrl: string;
+  resourceUrl?: string;    // absent until a resource created by createExternalResource exists
   typeUrlPattern: string;  // URL pattern from the vendor's SupportedResource (not the specific URL)
 } | {
   type: "aiModel";
@@ -3694,7 +5366,11 @@ export type GatekeeperCreationSpec = {
   modelName: string;       // model name on the provider's API (e.g. "claude-sonnet-4-6")
 } | {
   type: "agentSpawner";
-  config: AgentSpawnerConfig;
+  /**
+   * The spawner's config, less `env`: its bindings change after creation, so they are binding
+   * edges of the spawner instead, added with the agent's setGadgetBinding tool.
+   */
+  config: Omit<AgentSpawnerConfig, "env">;
 
   /**
    * Denormalized from the creating user's model config at binding creation time.
@@ -3797,6 +5473,9 @@ export type BlueprintBinding = {
    * it up to the recipient.
    */
   suggestedModel?: {provider: string, modelName: string};
+
+  /** The source binding's model kind, so installers pick one of that kind; absent: `"language"`. */
+  modelKind?: ModelKind;
 } | {
   /** An agent spawner binding. */
   type: "agentSpawner";
@@ -3842,6 +5521,15 @@ export type BlueprintMetadata = {
   lastUpdated: Date;
 
   /**
+   * The git commit this version of the blueprint is: its *release commit*, whose tree holds the
+   * blueprint's files. The blueprint's content is a packfile of that commit.
+   *
+   * Absent on a blueprint stored before releases were commits, whose content is a snapshot of
+   * its files alone.
+   */
+  commitId?: string;
+
+  /**
    * If present, a screenshot is stored separately from the metadata. The server uses this
    * to decide when to include a derived screenshotUrl.
    */
@@ -3875,6 +5563,14 @@ export type BlueprintGadgetSummary = {
   codeVersionDate: Date;  // timestamp of the exported code version
   screenshotUrl?: string;
   dirty?: boolean;        // true if last publish failed and needs retry
+
+  /**
+   * Present if the gadget the blueprint is published from has committed files other than the
+   * ones the blueprint last published: Overseer.updateBlueprint() with `updateCode` would
+   * publish them. It goes by the files alone, so a gadget whose history has moved on but whose
+   * files are back as they were published has none.
+   */
+  unpublishedChanges?: true;
 };
 
 /**
@@ -3980,6 +5676,9 @@ export type GadgetExportFormat = {
 
   /** File extension, including the leading dot. */
   fileExtension: string;
+
+  /** Suggested download filename, including its extension. Defaults to the Gadget title plus fileExtension when unset. */
+  fileName?: string;
 };
 
 /**
@@ -4086,6 +5785,32 @@ export interface GadgetClient extends WorkpieceClient {
    * Overseer.updateBlueprint() etc.).
    */
   createBlueprint(title?: string, description?: string, screenshot?: BlueprintScreenshotUpload): Promise<BlueprintGadgetSummary>;
+
+  /**
+   * Propose merging the current release of a blueprint into this gadget: to take an update from
+   * the blueprint the gadget follows, or to switch it to another. The proposal is recorded in a
+   * new chat (see AiChatMessageBody.blueprintMerges), where it is previewed and then accepted
+   * or discarded like any other proposed change. Nothing about the gadget changes until it is
+   * accepted, including which blueprint it follows.
+   *
+   * The merge is three-way, against the newest version the gadget and the release have in
+   * common. If they share no history that version has to be guessed, which is only done if
+   * `allowUnrelated` is set (see ApplyBlueprintResult). Unless the release is already in the
+   * gadget's history, the merge is written as a commit, which the new chat is pinned at.
+   *
+   * A proposal of kind "merge" starts an agent turn in the new chat, to resolve what conflicted
+   * and to check that the two sets of changes work together. `modelId` is the model that runs
+   * it: as for Overseer.newChat(), one of the IDs in the result of `listModels()`, or null for
+   * no agent. No other proposal starts a turn.
+   *
+   * Throws if the blueprint does not exist, or if the gadget is still pending in a chat and so
+   * has no committed code to merge into. Throws too, creating no chat, if the gadget and the
+   * blueprint both changed a file and a version of it, or the merged text, is too large for a
+   * file to hold; the error names the file. Making it smaller, or undoing the gadget's own
+   * changes to it, lets the blueprint be applied.
+   */
+  applyBlueprint(blueprintId: string, options: {modelId: string | null, allowUnrelated?: boolean})
+      : Promise<ApplyBlueprintResult>;
 }
 
 /**

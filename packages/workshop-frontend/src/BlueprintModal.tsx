@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react'
-import { Dialog, useKumoToastManager } from '@cloudflare/kumo'
+import { Badge, Dialog, useKumoToastManager } from '@cloudflare/kumo'
 import { ArrowsClockwise, Check, Copy, ImageSquare, Pencil, Plus, Trash, Warning, X } from '@phosphor-icons/react'
 import { RpcStub } from 'capnweb'
 import { BlueprintGadgetSummary, GadgetClient, GadgetMetadata, Overseer, BlueprintBindingAnnotation, BlueprintScreenshotUpload } from '@gadgets/workshop-shared/api'
@@ -279,7 +279,7 @@ export default function BlueprintModal({ open, onClose, overseer, gadget, metada
 
   return (
     <Dialog.Root open={open} onOpenChange={(o) => { if (!o) onClose() }}>
-      <Dialog className="responsive-dialog !z-[1000] !flex !w-[min(640px,calc(100vw-32px))] flex-col overflow-hidden bg-kumo-base p-0 !top-[10%] !-translate-y-0" size="lg">
+      <Dialog className="responsive-dialog !z-[1000] !top-[clamp(24px,10vh,80px)] !flex !max-h-[calc(100vh-clamp(24px,10vh,80px)-24px)] !w-[min(640px,calc(100vw-32px))] !-translate-y-0 flex-col overflow-hidden bg-kumo-base p-0" size="lg">
           <div className="flex shrink-0 items-start justify-between gap-4 border-b border-kumo-line px-4 py-5 sm:px-6">
             <div className="flex min-w-0 items-start gap-3">
               <div className="min-w-0">
@@ -307,9 +307,8 @@ export default function BlueprintModal({ open, onClose, overseer, gadget, metada
             />
           </div>
 
-          <div className="min-h-0 flex-1">
-            {formMode !== 'list' ? (
-              <div className="flex h-full min-h-0 flex-col">
+          {formMode !== 'list' ? (
+              <div className="flex min-h-0 flex-1 flex-col">
                 <div className="chat-panel min-h-0 flex-1 space-y-5 overflow-y-auto px-4 py-5 sm:px-6">
                   <div className="space-y-3">
                     <WorkshopInput
@@ -452,7 +451,7 @@ export default function BlueprintModal({ open, onClose, overseer, gadget, metada
                 </div>
               </div>
             ) : (
-              <div className="h-full min-h-0 space-y-4 overflow-y-auto px-4 py-5 sm:px-6">
+              <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-5 sm:px-6">
               <button
                 type="button"
                 onClick={() => {
@@ -542,7 +541,6 @@ export default function BlueprintModal({ open, onClose, overseer, gadget, metada
             </section>
               </div>
             )}
-          </div>
       </Dialog>
     </Dialog.Root>
   )
@@ -624,6 +622,8 @@ function BlueprintRow({
         <p className="m-0 min-w-0 flex-1 truncate text-[15px] leading-5 font-semibold tracking-[-0.3px] text-kumo-default">
           {bp.title}
         </p>
+
+        {bp.unpublishedChanges && <Badge variant="warning">Unpublished changes</Badge>}
 
         <span
           className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] leading-4 font-semibold tracking-[-0.1px] ${

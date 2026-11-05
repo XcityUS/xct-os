@@ -1,14 +1,83 @@
+import type { RpcStub } from "cloudflare:workers";
+
 /**
  * A GitHub repository.
  *
  * A GitHub repo is a Git repo *plus* issues, pull requests, etc.
+ *
+ * Git-level access works in terms of commit ids: use `listBranches()`, `listTags()`,
+ * `listCommits()`, `resolveRef()`, or `getCommit()` to discover commit ids, then mount a commit
+ * as a worktree (see the `createWorktree` tool) to read or edit the files it contains. The
+ * repository's file *content* is not readable through this interface directly.
  */
 export interface GitHubRepo {
-  // TODO: Add methods to access code. Maybe represent that as `GitRepository`. For now we only
-  //   expose issues and PRs.
-
   /** Returns basic metadata about the repository. */
   getMetadata(): Promise<GitHubRepoMetadata>;
+
+  /**
+   * Lists branches in this repository.
+   *
+   * Results are streamed through the returned cursor. Call `next()` repeatedly on that
+   * same cursor until it returns `null`.
+   */
+  listBranches(options?: GitHubBranchFilter): Promise<Cursor<GitHubBranchSummary>>;
+
+  /**
+   * Lists tags in this repository.
+   *
+   * Results are streamed through the returned cursor. Call `next()` repeatedly on that
+   * same cursor until it returns `null`.
+   */
+  listTags(options?: GitHubPageOptions): Promise<Cursor<GitHubTagSummary>>;
+
+  /**
+   * Resolves a ref to a full commit id, without fetching the commit's details.
+   *
+   * `ref` may be a full commit id, an unambiguously truncated commit id, a branch name, or a tag
+   * name; it defaults to the default branch, so `resolveRef()` with no argument answers "what
+   * commit is the repository currently at?". This is much cheaper than `getCommit()` -- prefer
+   * it when all you need is the commit id, e.g. to mount a worktree or to resolve a truncated
+   * id mentioned in a code comment, a commit message, or a CI log.
+   */
+  resolveRef(ref?: string): Promise<string>;
+
+  /**
+   * Looks up a single commit.
+   *
+   * `ref` may be a full commit id, an unambiguously truncated commit id, a branch name, or a tag
+   * name; it defaults to the default branch, whose latest commit is then returned. If you only
+   * need the commit id, use `resolveRef()` instead, which is much cheaper.
+   */
+  getCommit(ref?: string): Promise<GitHubCommitDetails>;
+
+  /**
+   * Lists this repository's commit history, newest first, starting from `options.ref` (the
+   * default branch when omitted).
+   *
+   * Results are streamed through the returned cursor. Call `next()` repeatedly on that
+   * same cursor until it returns `null`.
+   */
+  listCommits(options?: GitHubCommitFilter): Promise<Cursor<GitHubCommitSummary>>;
+
+  /**
+   * Pushes a commit to a branch, setting the branch's head to `commitId` -- the way commits made
+   * in a worktree get to GitHub. The branch is created if it does not exist.
+   *
+   * `commitId` must be a full 40-character commit id (e.g. the result of a worktree `commit()`),
+   * and the commit's history must be locally available down to a commit that came from this
+   * repository -- which is automatic for commits authored in a worktree mounted from a commit of
+   * this repository.
+   *
+   * Without `force`, the push must be a fast-forward: the branch's current head must be an
+   * ancestor of `commitId`. If the branch has moved past the head your work was based on, the
+   * push fails with an error saying so; pull the new head and rebase, or pass `force: true` to
+   * overwrite the branch (which may discard others' commits -- prefer rebasing).
+   *
+   * To open a pull request for newly pushed work: `push(branch, commitId)` to a new branch, then
+   * `createPullRequest({head: branch, base: ...})` -- immediately is fine; the pull request will
+   * reflect the pushed commits.
+   */
+  push(branch: string, commitId: string, options?: { force?: boolean }): Promise<void>;
 
   /**
    * Creates a new issue in this repository.
@@ -29,6 +98,11 @@ export interface GitHubRepo {
    * number. You can reference it in other content using `#~1` syntax; these references
    * are automatically rewritten to the real `#number` once the PR is created. The
    * returned object is fully functional in the meantime.
+   *
+   * To create a pull request from a commit you made (e.g. in a worktree), first `push()` the
+   * commit to a new branch, then create the pull request with that branch as `head` -- the two
+   * calls may be made back to back. Both `head` and `base` must name branches that exist (or
+   * that you have just pushed); otherwise this call fails immediately.
    */
   createPullRequest(options: GitHubCreatePullRequestOptions): Promise<GitHubPullRequest>;
 
@@ -73,6 +147,56 @@ export interface GitHubRepo {
    * string; the remaining fields are structured filters.
    */
   searchPullRequests(query: GitHubPullRequestSearch): Promise<Cursor<GitHubPullRequestSummary>>;
+
+  /**
+   * Have `hook.receiveEvent()` called with each event of the kinds in `options.events` (by
+   * default, all of them) in this repository:
+   * - `issue`: an issue was opened, closed, or reopened;
+   * - `pullRequest`: a pull request was opened, closed, merged, reopened, marked ready for review,
+   *   or pushed to;
+   * - `comment`: a comment was posted on an issue or pull request, or on a pull request's diff;
+   * - `review`: a pull request review was submitted with a verdict or a summary;
+   * - `push`: a branch was pushed to, created, or deleted;
+   * - `tag`: a tag was created, moved, or deleted. GitHub reports nothing when a push changes
+   *   more than three tags at once.
+   *
+   * The connected account's own comments and reviews are never delivered. Every other event is,
+   * whoever caused it, including the writes a hook queues once they are approved. The hook starts
+   * disabled, and nothing is delivered until the user enables it. Every call creates a distinct
+   * hook, so subscribe once for each set of events to watch.
+   *
+   * GitHub delivers the events to a webhook that enabling the hook adds to the repository, which
+   * only the repository's admins may do: this throws unless the connected account is one, and if
+   * this deployment has not configured GitHub hooks.
+   *
+   * `hook` must be a persistent stub that restores through a Gadget's `[restore]()` method: inside
+   * the Gadget, create it with `this.ctx.restore(params)`; from `executeCode`, through the Gadget's
+   * binding, as "Persistent Stubs and `ctx.restore()`" in your instructions describes. The
+   * Gadget's `[restore]()` receives those `params` for every delivery, so they can tell its
+   * subscriptions apart. The restored target is a separate object; pass it what it needs from
+   * `[restore]()`, such as `this`, the Gadget.
+   *
+   * @example
+   * // server.js
+   * import { DurableObject, RpcTarget, restore } from "cloudflare:workers";
+   * export class Gadget extends DurableObject {
+   *   async [restore](params) {
+   *     if (params.type === "triage") return new Triage();
+   *     throw new TypeError(`Unknown restore type: ${params.type}`);
+   *   }
+   * }
+   * class Triage extends RpcTarget {
+   *   async receiveEvent(event) {
+   *     if (event.kind === "issue" && event.action === "opened" && /crash/i.test(event.info.title)) {
+   *       await event.issue.addLabels(["bug"]);
+   *     }
+   *   }
+   * }
+   *
+   * // executeCode, where `hook` is a persistent stub for the params `{ type: "triage" }`
+   * await env.GITHUB_REPO.subscribe(hook, { events: ["issue"] });
+   */
+  subscribe(hook: RpcStub<GitHubEventHook>, options?: GitHubSubscribeOptions): Promise<void>;
 }
 
 /** A single GitHub issue. */
@@ -111,6 +235,12 @@ export interface GitHubIssue {
 
   /** Posts a new Markdown comment to the discussion thread. */
   postComment(bodyMarkdown: string): Promise<void>;
+
+  /**
+   * As `GitHubRepo.subscribe()`, for this issue alone: its `issue` events and the `comment`s on
+   * it (by default, both). Throws while the issue's creation is pending.
+   */
+  subscribe(hook: RpcStub<GitHubEventHook>, options?: GitHubSubscribeOptions): Promise<void>;
 }
 
 /** A pull request. This extends the issue API with review-oriented metadata. */
@@ -153,8 +283,31 @@ export interface GitHubPullRequest extends GitHubIssue {
    */
   replyToDiffComment(commentId: string, bodyMarkdown: string): Promise<void>;
 
-  /** Merges the pull request. */
+  /**
+   * Lists the commits that make up this pull request, oldest first.
+   *
+   * Results are streamed through the returned cursor. Call `next()` repeatedly on that
+   * same cursor until it returns `null`.
+   */
+  listCommits(options?: GitHubPageOptions): Promise<Cursor<GitHubCommitSummary>>;
+
+  /**
+   * Returns the commit id of the pull request's merge base: the common ancestor of its head and
+   * base branches that its diff is computed against. To review the changes in a worktree, mount
+   * the pull request's head commit and diff it against this commit.
+   */
+  getMergeBase(): Promise<string>;
+
+  /** Merges the pull request at its current head (counting your queued pushes); the merge is
+   *  refused if new commits land on the pull request before it is applied. */
   merge(options?: GitHubPullRequestMergeOptions): Promise<void>;
+
+  /**
+   * As `GitHubRepo.subscribe()`, for this pull request alone: its `pullRequest` events, the
+   * `comment`s on it and on its diff, and its `review`s (by default, all three). Throws while the
+   * pull request's creation is pending.
+   */
+  subscribe(hook: RpcStub<GitHubEventHook>, options?: GitHubSubscribeOptions): Promise<void>;
 }
 
 /** Basic information about a GitHub user or bot that appears in issue or review metadata. */
@@ -177,6 +330,8 @@ export type GitHubRepoRef = {
 export type GitHubRepoMetadata = GitHubRepoRef & {
   description?: string;
   visibility: "public" | "private" | "internal";
+  /** Name of the repository's default branch (e.g. `"main"`). */
+  defaultBranch: string;
 }
 
 /** A GitHub label attached to an issue or pull request. */
@@ -231,7 +386,9 @@ export type GitHubPullRequestBranchRef = {
 }
 
 /** A compact pull request summary returned from list and search operations. */
-export type GitHubPullRequestSummary = GitHubIssueSummary & {
+export type GitHubPullRequestSummary = Omit<GitHubIssueSummary, "commentCount"> & {
+  /** Usually absent from list and search results: GitHub's pull request listing omits it. */
+  commentCount?: number;
   draft: boolean;
   merged: boolean;
   head: GitHubPullRequestBranchRef;
@@ -254,12 +411,71 @@ export type GitHubPullRequestDetails = GitHubIssueDetails & GitHubPullRequestSum
   changedFiles: number;
 }
 
+/** A branch returned by `GitHubRepo.listBranches()`. */
+export type GitHubBranchSummary = {
+  name: string;
+  /** Commit id of the branch's current head. */
+  headCommit: string;
+  /** Whether the branch is covered by a branch protection rule. */
+  protected: boolean;
+}
+
+/** A tag returned by `GitHubRepo.listTags()`. */
+export type GitHubTagSummary = {
+  name: string;
+  /** Commit id the tag points at. */
+  commit: string;
+}
+
+/** The author or committer of a commit, as recorded in the commit itself. */
+export type GitHubCommitIdentity = {
+  name?: string;
+  email?: string;
+  date?: Date;
+}
+
+/**
+ * A commit, as returned from commit lookups and history enumeration.
+ *
+ * `id` is the commit's full git commit id. Commit ids may be used anywhere the system accepts
+ * one -- most notably, a commit can be mounted as a worktree (see the `createWorktree` tool) to
+ * read or edit the files it contains, and commit ids created on such a worktree can be passed
+ * back into this gatekeeper's APIs.
+ */
+export type GitHubCommitSummary = {
+  /** The full git commit id (40 hex digits). */
+  id: string;
+  /** The full commit message. The first line is conventionally a short summary. */
+  message: string;
+  /** Who wrote the change, per the commit itself. */
+  author: GitHubCommitIdentity;
+  /** Who created the commit, per the commit itself (differs from `author` after e.g. a rebase). */
+  committer: GitHubCommitIdentity;
+  /** The GitHub account of the author, when GitHub can determine one. */
+  authorAccount: GitHubActor | null;
+  /** Commit ids of this commit's parents: empty for a root commit, two or more for a merge. */
+  parents: string[];
+  /** The github.com web page where this commit can be viewed in a browser. */
+  url: string;
+}
+
+/** Full commit details returned by `GitHubRepo.getCommit()`. */
+export type GitHubCommitDetails = GitHubCommitSummary & {
+  /** Line counts across the commit's whole diff, when GitHub reports them. */
+  stats?: {
+    additions: number;
+    deletions: number;
+    total: number;
+  };
+}
+
 /**
  * A pagination cursor.
  *
  * This is an RPC object. Call `next()` repeatedly on the same cursor to fetch
- * subsequent batches of results. `next()` returns `null` once exhausted. Dispose the
- * cursor when finished.
+ * subsequent batches of results. `next()` returns `null` once exhausted. A batch may be
+ * empty when one call scanned many upstream rows without a match (e.g. a selective search);
+ * that is not the end, so keep calling until `null`. Dispose the cursor when finished.
  */
 export interface Cursor<T> {
   next(): Promise<T[] | null>;
@@ -307,6 +523,29 @@ export type GitHubPullRequestSearch = GitHubPageOptions & {
   assignee?: string;
 }
 
+/** Filters for listing branches. */
+export type GitHubBranchFilter = GitHubPageOptions & {
+  /** When set, return only protected (`true`) or only unprotected (`false`) branches. */
+  protected?: boolean;
+}
+
+/** Filters for listing commit history. */
+export type GitHubCommitFilter = GitHubPageOptions & {
+  /**
+   * Where to start listing from: a branch name, tag name, or commit id. History is enumerated
+   * newest-first from here. Defaults to the repository's default branch.
+   */
+  ref?: string;
+  /** Only commits touching the given file or directory path. */
+  path?: string;
+  /** Only commits whose author matches the given GitHub login or email address. */
+  author?: string;
+  /** Only commits dated after this time. */
+  since?: Date;
+  /** Only commits dated before this time. */
+  until?: Date;
+}
+
 export type GitHubIssueState = "open" | "closed";
 
 export type GitHubReviewDecision = "comment" | "approve" | "requestChanges";
@@ -351,14 +590,22 @@ export type GitHubPullRequestDiffFile = {
   status: "added" | "modified" | "removed" | "renamed" | "copied";
   additions: number;
   deletions: number;
+  /** True when the patch is not included (e.g. binary files, very large files or diffs). */
   diffOmitted?: boolean;
   hunks: GitHubPullRequestDiffHunk[];
 }
 
 /** Identifies the specific revision of a pull request diff. */
 export type GitHubPullRequestRevision = {
+  /** Commit id of the base branch's head. Note that the diff is *not* computed against this
+   *  commit -- see `mergeBaseSha`. */
   baseSha: string;
+  /** Commit id of the pull request's head: the last commit in the pull request. */
   headSha: string;
+  /** Commit id of the merge base -- the common ancestor of `headSha` and `baseSha` that the
+   *  diff is computed against. To review the changes in a worktree, mount `headSha` and diff it
+   *  against this commit. Omitted only when the merge base could not be determined. */
+  mergeBaseSha?: string;
 }
 
 /** A pull request diff pinned to a specific revision. */
@@ -404,7 +651,8 @@ export type GitHubDiffCommentTarget =
 /**
  * An inline diff comment that was submitted as part of a specific pull request review.
  *
- * This appears nested under `GitHubDiscussionEntry` with `kind: "review"`.
+ * This appears nested under `GitHubDiscussionEntry` with `kind: "review"`, and as the `comment`
+ * of a `GitHubCommentEvent` on a pull request's diff.
  */
 export type GitHubSubmittedDiffComment = {
   id: string;
@@ -476,7 +724,146 @@ export type GitHubPullRequestMergeOptions = {
   method?: GitHubPullRequestMergeMethod;
   commitTitle?: string;
   commitMessage?: string;
-  /** Expected HEAD SHA of the pull request. If provided, the merge will fail if the
-   *  current HEAD doesn't match, preventing races with concurrent pushes. */
+  /** The head SHA you reviewed. Queuing the merge fails if the pull request's current head
+   *  (counting your queued pushes) differs. */
   expectedHeadSha?: string;
+}
+
+/** Implemented by a gadget to receive GitHub activity; see `GitHubRepo.subscribe()`. */
+export interface GitHubEventHook {
+  /**
+   * Called with each event the hook watches for. Its capabilities (`issue`, `pullRequest` or
+   * `repo`) can read and queue writes for approval, and are released when this call returns.
+   * An event may arrive more than once or out of order, so key any work on `event.id` to keep it
+   * idempotent. One this throws for is retried with backoff, eight attempts in all, and disabling
+   * the hook ends its retries. An event can also be missed, as when GitHub can't reach this
+   * deployment for hours, so a gadget that must see every change should also read the repository
+   * now and then.
+   */
+  receiveEvent(event: GitHubEvent): Promise<void>;
+}
+
+/** What `subscribe()` watches for. */
+export type GitHubSubscribeOptions = {
+  /** The kinds of event to deliver; by default, every kind the subscription can see. */
+  events?: GitHubEventKind[];
+}
+
+/** One event delivered to a `GitHubEventHook`, told apart by `kind`. */
+export type GitHubEvent =
+  | GitHubIssueEvent
+  | GitHubPullRequestEvent
+  | GitHubCommentEvent
+  | GitHubReviewEvent
+  | GitHubPushEvent
+  | GitHubTagEvent;
+
+/** The kinds of `GitHubEvent`, which `GitHubSubscribeOptions.events` picks among. */
+export type GitHubEventKind = GitHubEvent["kind"];
+
+/** What every `GitHubEvent` carries. */
+export type GitHubEventBase = {
+  /** The event's id: the same for each delivery of it. */
+  id: string;
+  /** Who caused the event, when GitHub names someone. */
+  actor: GitHubActor | null;
+}
+
+/** An issue was opened, closed, or reopened. */
+export type GitHubIssueEvent = GitHubEventBase & {
+  kind: "issue";
+  action: "opened" | "closed" | "reopened";
+  /** The issue as of the event. */
+  info: GitHubIssueDetails;
+  /** The issue, to read and to queue changes for approval. */
+  issue: GitHubIssue;
+}
+
+/** A pull request was opened, closed, merged, reopened, marked ready for review, or pushed to. */
+export type GitHubPullRequestEvent = GitHubEventBase & {
+  kind: "pullRequest";
+  /** `merged` is a close that merged it; `pushed` means its head branch moved, to `info.head.sha`. */
+  action: "opened" | "closed" | "merged" | "reopened" | "readyForReview" | "pushed";
+  /** The pull request as of the event. */
+  info: GitHubPullRequestDetails;
+  /** The pull request, to read and to queue changes for approval. */
+  pullRequest: GitHubPullRequest;
+}
+
+/**
+ * A comment was posted on an issue or a pull request, or on a pull request's diff. Exactly one
+ * of `issue` and `pullRequest` is set, to what it was posted on.
+ */
+export type GitHubCommentEvent = GitHubEventBase & {
+  kind: "comment";
+  /** The issue or pull request it was posted on. */
+  subject: GitHubEventSubject;
+  /**
+   * The comment, as `readDiscussion()` lists one: in the conversation (`kind: "comment"`), or
+   * with a `target` on the diff, as a review's `diffComments` are.
+   */
+  comment: Extract<GitHubDiscussionEntry, { kind: "comment" }> | GitHubSubmittedDiffComment;
+  issue?: GitHubIssue;
+  pullRequest?: GitHubPullRequest;
+}
+
+/**
+ * A pull request review was submitted with a verdict or a summary. Its diff comments arrive as
+ * `comment` events, and a review with nothing else, such as a reply to a diff thread, is
+ * delivered only as them.
+ */
+export type GitHubReviewEvent = GitHubEventBase & {
+  kind: "review";
+  /** The pull request reviewed. */
+  subject: GitHubEventSubject;
+  review: GitHubEventReview;
+  pullRequest: GitHubPullRequest;
+}
+
+/** A branch was pushed to, created, or deleted. A tag's changes are `GitHubTagEvent`s. */
+export type GitHubPushEvent = GitHubEventBase & {
+  kind: "push";
+  /** The branch's name, without `refs/heads/`. */
+  branch: string;
+  /** Its head commit before the push; absent when the push created it. */
+  before?: string;
+  /** Its head commit after the push; absent when the push deleted it. */
+  after?: string;
+  /** Whether the push rewrote the branch's history. */
+  forced: boolean;
+  /** The repository, to read what was pushed (e.g. `listCommits({ ref: after })`) and queue writes. */
+  repo: GitHubRepo;
+}
+
+/**
+ * A tag was created, moved, or deleted. `before` and `after` name what the tag pointed to: a
+ * commit, or for an annotated tag, its tag object.
+ */
+export type GitHubTagEvent = GitHubEventBase & {
+  kind: "tag";
+  /** The tag's name, without `refs/tags/`. */
+  tag: string;
+  /** What it pointed to before the push; absent when the push created it. */
+  before?: string;
+  /** What it points to after the push; absent when the push deleted it. */
+  after?: string;
+  /** The repository, to read what the tag marks (e.g. `listCommits({ ref: tag })`) and queue writes. */
+  repo: GitHubRepo;
+}
+
+/** The issue or pull request a comment or review event concerns. */
+export type GitHubEventSubject = GitHubIssueId & {
+  title: string;
+}
+
+/** The review a `GitHubReviewEvent` delivers. */
+export type GitHubEventReview = {
+  id: string;
+  author: GitHubActor | null;
+  decision: GitHubReviewDecision;
+  bodyMarkdown: string;
+  /** The head commit it reviewed. */
+  commitId?: string;
+  submittedAt?: Date;
+  url: string;
 }

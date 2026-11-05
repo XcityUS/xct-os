@@ -7,12 +7,21 @@ import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
 import { useRpcStub, useConnectionLost } from '../RpcContext'
 import { useAuth, CF_ACCESS_MODE } from '../useAuth'
 import { AuthProvider } from '../AuthContext'
+import { HANDOFF_PATH } from '../connectHandoff'
 import { FeatureFlagsProvider } from '../FeatureFlagsContext'
 import Header from '../components/Header'
 import AppShell from '../components/AppShell/AppShell'
 import LoginPage from '../LoginPage'
 import OnboardingWizard from '../OnboardingWizard'
 import AccountSelectionModal from '../components/billing/AccountSelectionModal'
+import { NotificationBridge } from '../features/notifications/NotificationBridge'
+import { BrowserPushBridge } from '../features/notifications/BrowserPushBridge'
+import {
+  DeviceSessionHandoff,
+  hasDeviceSessionParameters,
+} from '../features/native-app/DeviceSessionHandoff'
+import { NativeAppBridge } from '../features/native-app/NativeAppBridge'
+import { PageUpdateNotice } from '../features/stale-session/PageUpdateNotice'
 
 export const Route = createRootRoute({
   component: RootComponent,
@@ -27,11 +36,14 @@ function RootComponent() {
   // Routes that don't require auth (public routes)
   const isSignup = pathname === '/signup'
   const isBlueprint = pathname.startsWith('/blueprint/')
+  // The connect / sign-in handoff popup needs no shell and must not wait on auth: a sign-in popup
+  // has no session, and ConnectHandoffPage runs its own useAuth for connects.
+  const isHandoff = pathname === HANDOFF_PATH
 
-  // A standalone (no app shell) render is used only for signed-out visitors of public routes.
-  // Signed-in users get the full app chrome so public pages (esp. the blueprint detail) feel
-  // native — sidebar and all — instead of floating on a bare page.
-  const standalone = isSignup || (isBlueprint && !isAuthenticated)
+  // A standalone (no app shell) render is used for the handoff popup and for signed-out visitors
+  // of public routes. Signed-in users get the full app chrome so public pages (esp. the blueprint
+  // detail) feel native — sidebar and all — instead of floating on a bare page.
+  const standalone = isSignup || isHandoff || (isBlueprint && !isAuthenticated)
 
   // The workspace editor renders fullscreen (no app chrome). /gadget/ is the legacy URL, kept
   // here so the chrome doesn't flash in during the redirect to /workspace/.
@@ -86,10 +98,11 @@ function RootComponent() {
 
   // Signed-out visitors of public routes render without the auth wrapper / app shell.
   if (standalone) {
-    const showHeader = !isSignup
+    const showHeader = !isSignup && !isHandoff
     return (
       <TooltipProvider>
         <Toasty>
+          <PageUpdateNotice />
           <div className="flex h-full min-h-0 flex-col">
             {showHeader && <Header />}
             <main className="min-h-0 flex-1 overflow-y-auto">
@@ -105,11 +118,20 @@ function RootComponent() {
   // authenticatedApi is guaranteed non-null here: isLoading, error, and
   // !isAuthenticated branches all return early above.
   if (!authenticatedApi) return null
+  // The native handoff is a dedicated destination: never render the Workshop home page
+  // behind it while the browser is returning credentials to the app.
+  if (hasDeviceSessionParameters(window.location.search)) {
+    return <DeviceSessionHandoff authenticatedApi={authenticatedApi} />
+  }
   return (
     <AuthProvider authenticatedApi={authenticatedApi} onLogout={logout}>
       <FeatureFlagsProvider>
         <TooltipProvider>
           <Toasty>
+            <NotificationBridge authenticatedApi={authenticatedApi} />
+            <BrowserPushBridge />
+            <NativeAppBridge />
+            <PageUpdateNotice />
             <AuthenticatedShell
               authenticatedApi={authenticatedApi}
               isWorkspaceEditor={isWorkspaceEditor}

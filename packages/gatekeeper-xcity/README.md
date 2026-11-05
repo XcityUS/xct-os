@@ -9,6 +9,11 @@ resource for Gadgets and the OS agent:
 - **Sign-in:** when `xcity` is in the deployment's `AUTH_GATEKEEPERS` allowlist, "Continue with
   Xcity" appears on the login page. Sign-in requests `openid email profile` and accepts only a
   provider-verified email from `/oauth/userinfo`.
+- **Connect handoff and reconnect:** the OAuth flow ends on the gatekeeper-kit handoff page, which
+  delivers a single-use ticket to the Workshop; the new account is inert until the initiating
+  browser redeems it. Reconnect stages the new tokens (`stageCredentials`) and only
+  `commitReconnect(stageId)` makes them live, so a phished reconnect link never replaces live
+  credentials.
 - **Workshop-only account access:** the connected account exposes a refreshed GoTrue access token
   (`getUsableAccessToken`) and GoTrue user id (`getXcityUserId`) for later Xcity wallet/tokenhub
   integration. These are not exposed to gadgets or agents.

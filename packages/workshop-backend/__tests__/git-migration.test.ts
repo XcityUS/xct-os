@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 import * as Y from "yjs";
 import type { AiChatMessage, BlueprintMetadata } from "@gadgets/workshop-shared/api";
-import { HISTORY_COMMIT_GAP_MS, migrateCodeLogToGit } from "../src/git-migration";
-import { foldProposedChanges, legacyChatBaseVersion } from "../src/agent-compaction";
+import { HISTORY_COMMIT_GAP_MS, legacyChatBaseVersion, migrateCodeLogToGit }
+  from "../src/storage-schema/overseer-git-migration";
+import { foldProposedChanges } from "../src/agent-compaction";
 import {
   AGENT, LegacyWorkspace, MINUTE, OWNER, T0, USER, captureEdit, expectHeadsMatchDoc, setFile,
 } from "./legacy-workspace";
@@ -152,7 +153,9 @@ describe("migrateCodeLogToGit", () => {
     expect(conversion.pins).toEqual([{ gadgetId: 50, baseCommit: head }]);
     expect(ws.codeBase(5)).toMatchObject(
         { generation: 0, epoch: conversion.sequence, revision: 0 });
-    expect(ws.storage.chatMeta.get(5)!.hasProposedChanges).toBe(true);
+    // Proposed-ness is derived from the pin just asserted (see proposedChangeWorkpieceIds);
+    // the migration stamps no cached flag.
+    expect(ws.storage.chatMeta.get(5)!.hasProposedChanges).toBeUndefined();
 
     // The change re-creates the chat's uncommitted content on top of the pinned tree.
     expect(await ws.convertedContent(5)).toEqual(new Map([
@@ -269,7 +272,8 @@ describe("migrateCodeLogToGit", () => {
     expect(conversion.pins).toEqual([{ gadgetId: gadget.id, baseCommit: gadget.commitId }]);
     expect(ws.codeBase(1)!.pins).toEqual(
         [{ gadgetId: gadget.id, baseCommit: gadget.commitId, mergedCommit: gadget.commitId }]);
-    expect(ws.storage.chatMeta.get(1)!.hasProposedChanges).toBe(true);
+    // Proposed-ness is derived from the pin just asserted; no cached flag is stamped.
+    expect(ws.storage.chatMeta.get(1)!.hasProposedChanges).toBeUndefined();
     expect(await ws.convertedContent(1)).toEqual(new Map([
       [gadget.id, new Map([["server.js", "hello\n"], ["client.js", "world\n"]])],
     ]));
@@ -495,6 +499,38 @@ describe("migrateCodeLogToGit", () => {
     // would have dropped the user's (the pending-structs hazard this rule exists to prevent).
     expect(await ws.convertedContent(91)).toEqual(new Map([
       [80, new Map([["app.js", "base\nagent\n"], ["new.js", "fresh\nuser\n"]])],
+    ]));
+  });
+
+  it("anchors a compacted chat at its active checkpoint's stamp", async () => {
+    // Nothing in the chat's messages names a version, so the checkpoint's stamp is the only
+    // record of the mainline state the chat's update was built against.
+    let ws = new LegacyWorkspace();
+    ws.addGadget(80, "APP");
+    ws.edit(T0 + 1 * MINUTE, doc => setFile(doc, "80", "app.js", "base\n"));             // v2
+    ws.edit(T0 + 2 * MINUTE, doc => setFile(doc, "80", "new.js", "fresh\n"));            // v3
+
+    ws.addChat(1);
+    ws.addMessage(1, USER, { type: "message", message: "hi" });
+    let update = captureEdit(ws.docAt(2), doc =>
+        doc.getMap<Y.Text>("80").get("app.js")!.insert(5, "agent\n"));
+    ws.addMessage(1, AGENT, { type: "changes", update });
+    ws.storage.chatMeta.put({ ...ws.storage.chatMeta.get(1)!, compactedTo: 1 });
+    ws.storage.chatCompactions.put({
+      chatId: 1, compactedTo: 1, summary: "", chatBindings: [], nextChangeId: 0,
+      observedCodeVersion: 2,
+    });
+
+    await migrateCodeLogToGit(ws.host());
+
+    // The chat pins the version-2 commit, which exists only because the checkpoint names it,
+    // rather than the tip a chat that references no version anchors at.
+    let [pin] = ws.codeBase(1)!.pins;
+    expect(pin.baseCommit).not.toBe(ws.storage.gadgets.get(80)!.commitId);
+    expect(await ws.gitStore.readCommitFiles(pin.baseCommit))
+        .toEqual(new Map([["app.js", "base\n"]]));
+    expect(await ws.convertedContent(1)).toEqual(new Map([
+      [80, new Map([["app.js", "base\nagent\n"]])],
     ]));
   });
 

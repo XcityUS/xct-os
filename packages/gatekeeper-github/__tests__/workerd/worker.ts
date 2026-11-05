@@ -1,0 +1,768 @@
+// Test worker for the workerd suite. Re-exports the production entrypoints so miniflare can bind
+// the Durable Objects, and adds a hook Durable Object for the code that depends on `ctx.props`.
+//
+// `TestHooks` has to be a Durable Object rather than a WorkerEntrypoint: a `DurableObjectClass`
+// from `ctx.exports.X({props})` is only reachable through `ctx.facets`, which is the same way the
+// overseer instantiates a gatekeeper in production. And because a stub *to* a facet is not
+// serializable, TestHooks cannot hand the facet to the test; it forwards each call instead --
+// stubs the test passes (the fake approval queue and git cache) ride through to the facet, and
+// results ride back as plain data.
+
+import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint, restore } from "cloudflare:workers";
+import type {
+  AccountDescription, ActionDescription, ActionKind, ConnectHandoff, GatekeeperUser, GitCache, HookController,
+  HookDescription, GitPullHints, GitPullTransfer,
+} from "@gadgets/workshop-shared/gatekeeper";
+import { GitHubGatekeeperImpl, GitHubHookDriver as GitHubHookDriverImpl, type GitHubVerifierApi } from "../../src/github.js";
+import type { GitHubHookParams } from "../../src/github-hooks.js";
+import type {
+  Cursor,
+  GitHubBranchSummary,
+  GitHubCommitDetails,
+  GitHubCommitFilter,
+  GitHubCommitSummary,
+  GitHubCreatePullRequestOptions,
+  GitHubEvent,
+  GitHubIssue,
+  GitHubIssueDetails,
+  GitHubPullRequestDetails,
+  GitHubPullRequestDiffFile,
+  GitHubPullRequestMergeOptions,
+  GitHubPullRequestRevision,
+  GitHubRepo,
+  GitHubRepoMetadata,
+  GitHubSubscribeOptions,
+} from "../../src/types.js";
+
+export { default } from "../../src/github.js";
+export * from "../../src/github.js";
+// Named as well, since the pool builds `ctx.exports` entrypoints only from exports it can see
+// statically, and the account, the facet and TestHooks mint these.
+export {
+  GatekeeperUserImpl, GitHubHookController, GitHubVerifier,
+} from "../../src/github.js";
+
+/**
+ * The account's hook driver, whose revoke() fails while its storage has `test:unreachable`, as when
+ * disconnecting the account can't reach it; or, with `test:restartAfterRevoke`, which revoke()
+ * clears, restarts once it has done its work, before it can answer.
+ */
+export class GitHubHookDriver extends GitHubHookDriverImpl {
+  override async revoke(): Promise<boolean> {
+    const kv = this.ctx.storage.kv;
+    if (kv.get("test:unreachable")) throw new Error("The test hook driver can't be reached.");
+    const restart = kv.get("test:restartAfterRevoke");
+    const gone = await super.revoke();
+    if (restart) {
+      await this.ctx.storage.sync();
+      this.ctx.abort("The test hook driver restarted.");
+    }
+    return gone;
+  }
+}
+
+/** What each `TestConnectCallback` was told, by its `props.name`. */
+export const connectCallbackEvents = new Map<string, string[]>();
+
+/** Stands in for the Workshop's connect callback, recording each call it receives. */
+export class TestConnectCallback extends WorkerEntrypoint<Cloudflare.Env, { name: string }> {
+  #record(event: string): void {
+    const events = connectCallbackEvents.get(this.ctx.props.name) ?? [];
+    events.push(event);
+    connectCallbackEvents.set(this.ctx.props.name, events);
+  }
+
+  async complete(): Promise<ConnectHandoff> {
+    this.#record("complete");
+    return { targetOrigin: "https://workshop.example", ticket: "ticket" };
+  }
+
+  async reconnectComplete(stageId: string): Promise<ConnectHandoff> {
+    this.#record(`reconnectComplete:${stageId}`);
+    return { targetOrigin: "https://workshop.example", ticket: "ticket" };
+  }
+
+  async credentialsExpired(): Promise<void> {
+    this.#record("credentialsExpired");
+  }
+
+  async credentialsRestored(): Promise<void> {
+    this.#record("credentialsRestored");
+  }
+}
+
+/** Mirrors github.ts's (unexported) `GitHubGatekeeperImplProps`. */
+export type GatekeeperProps = {
+  userObjectId: string;
+  resourceKind: "repo" | "issue" | "pull";
+  owner: string;
+  repo: string;
+  issueNumber?: number;
+};
+
+/** Mirrors github.ts's (unexported) `PushAction` record, as the tests read it back. */
+export type PushActionData = {
+  type: "push";
+  approvalId: number;
+  submittedAt: number;
+  owner: string;
+  repo: string;
+  branch: string;
+  expectedOldSha: string;
+  newSha: string;
+  force: boolean;
+};
+
+/** Mirrors github.ts's (unexported) `CreatePullRequestAction` record. */
+export type CreatePullRequestActionData = {
+  type: "createPullRequest";
+  approvalId: number;
+  submittedAt: number;
+  owner: string;
+  repo: string;
+  provisionalId: string;
+  options: GitHubCreatePullRequestOptions;
+};
+
+/** github.ts's (unexported) `PostReviewAction` record, read off the real submit signature. */
+export type PostReviewActionData = Extract<
+  Parameters<GitHubGatekeeperImpl["submitActionForApproval"]>[1], { type: "postReview" }>;
+
+/** github.ts's (unexported) `MergePullRequestAction` record, read off the real submit signature. */
+export type MergePullRequestActionData = Extract<
+  Parameters<GitHubGatekeeperImpl["submitActionForApproval"]>[1], { type: "mergePullRequest" }>;
+
+/** github.ts's (unexported) `SetTitleAction`/`ChangeStateAction` records. */
+export type IssueEditActionData = Extract<
+  Parameters<GitHubGatekeeperImpl["submitActionForApproval"]>[1], { type: "setTitle" | "changeState" }>;
+
+/** Any of github.ts's (unexported) action records, read off the real submit signature. */
+export type GitHubActionData = Parameters<GitHubGatekeeperImpl["submitActionForApproval"]>[1];
+
+/** The listing methods `TestHooks.listingPages` drives. */
+export type ListingMethod = "listIssues" | "searchIssues" | "listPullRequests" | "searchPullRequests";
+
+type TestExports = {
+  GitHubGatekeeperImpl(options: { props: GatekeeperProps }):
+    DurableObjectClass<GitHubGatekeeperImpl>;
+  SeededGitHubGatekeeper(options: { props: GatekeeperProps }):
+    DurableObjectClass<SeededGitHubGatekeeper>;
+  GatekeeperUserImpl(options: { props: { userObjectId: string } }): Fetcher<GatekeeperUser>;
+  GitHubVerifier(options: { props: { userObjectId: string } }): Fetcher<GitHubVerifierApi>;
+};
+
+/**
+ * The production gatekeeper plus a way to write its storage directly, for records an earlier
+ * release stored that today's validated entry points can no longer produce.
+ */
+export class SeededGitHubGatekeeper extends GitHubGatekeeperImpl {
+  seed(entries: Record<string, unknown>): void {
+    for (const [key, value] of Object.entries(entries)) this.ctx.storage.kv.put(key, value);
+  }
+}
+
+type SeedFacet = { seed(entries: Record<string, unknown>): Promise<void> };
+
+// The facet methods TestHooks forwards to, spelled structurally: workers-types' `Fetcher<T>`
+// return-type inference collapses several of these returns to `never` (its `Serializable`
+// heuristic gives up on them), while the runtime objects are exactly the production ones.
+type GatekeeperFacet = Pick<GitHubGatekeeperImpl, "gitPull"> & {
+  preparePush(branch: string, commitId: string, force: boolean, cache: RpcStub<GitCache>)
+    : Promise<PushActionData | null>;
+  prepareCreatePullRequest(options: GitHubCreatePullRequestOptions)
+    : Promise<CreatePullRequestActionData>;
+  prepareMergePullRequest(pullId: string, options?: GitHubPullRequestMergeOptions)
+    : Promise<MergePullRequestActionData>;
+  submitActionForApproval(queue: unknown, action: GitHubActionData, description: ActionDescription): Promise<void>;
+  getAutoApprovableActions(): Promise<ActionKind[]>;
+  applyAction(actionId: number, cache: RpcStub<GitCache>): Promise<void>;
+  rejectAction(actionId: number): Promise<undefined | { restart?: boolean }>;
+  revertAction(actionId: number): Promise<undefined | { message?: string; canRetry?: boolean }>;
+  listBranches(filter: undefined, pageSize: number)
+    : Promise<{ next(): Promise<GitHubBranchSummary[] | null> }>;
+  isSimulatedCommitId(commitId: string): Promise<boolean>;
+  getCommit(ref: string | undefined, cache?: RpcStub<GitCache>)
+    : Promise<{ details: GitHubCommitDetails, fromCache: boolean }>;
+  resolveRef(ref: string | undefined, cache?: RpcStub<GitCache>)
+    : Promise<{ id: string, fromCache: boolean }>;
+  repoMetadata(): Promise<GitHubRepoMetadata>;
+  openPullRequest(id: string, cache?: RpcStub<GitCache>): Promise<GitHubPullRequestDetails>;
+  pullMergeBase(id: string, cache?: RpcStub<GitCache>): Promise<string>;
+  pullDiff(id: string, pageSize: number, cache?: RpcStub<GitCache>): Promise<{
+    revision: GitHubPullRequestRevision,
+    files: { next(): Promise<GitHubPullRequestDiffFile[] | null> },
+  }>;
+  pullCommits(id: string, pageSize: number, cache?: RpcStub<GitCache>)
+    : Promise<{ next(): Promise<GitHubCommitSummary[] | null> }>;
+  listCommits(filter: GitHubCommitFilter | undefined, pageSize: number, cache?: RpcStub<GitCache>)
+    : Promise<{ next(): Promise<GitHubCommitSummary[] | null> }>;
+  openIssue(id: string): Promise<GitHubIssueDetails>;
+  prepareSetTitle(kind: "issue" | "pull", id: string, title: string): Promise<IssueEditActionData>;
+  prepareChangeState(kind: "issue" | "pull", id: string, state: "open" | "closed")
+    : Promise<IssueEditActionData>;
+} & Record<ListingMethod, (query: never, pageSize: number) => Promise<Cursor<unknown>>>;
+
+async function drain<T>(cursor: { next(): Promise<T[] | null> }): Promise<T[]> {
+  const items: T[] = [];
+  for (let page = await cursor.next(); page !== null; page = await cursor.next()) {
+    items.push(...page);
+  }
+  return items;
+}
+
+/**
+ * A forwarded call's result as plain data. Failures ride back as data rather than as RPC
+ * rejections, because an expected rejection crossing the RPC boundary additionally surfaces as
+ * an unhandled-rejection report in vitest; the test-side wrapper rethrows `error` locally.
+ */
+export type Outcome<T> = { ok: T } | { error: string };
+
+async function outcome<T>(fn: () => Promise<T>): Promise<Outcome<T>> {
+  try {
+    return { ok: await fn() };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+export class TestHooks extends DurableObject<Cloudflare.Env> {
+  /**
+   * The gatekeeper facet for the given name, instantiating it with `props` on first use. Each
+   * distinct scenario should use a fresh facet name: a facet is cached per name, so reusing one
+   * silently reuses the first caller's props and storage.
+   */
+  #gatekeeper(facetName: string, props: GatekeeperProps): GatekeeperFacet {
+    return this.ctx.facets.get<GitHubGatekeeperImpl>(facetName, () => ({
+      class: (this.ctx.exports as unknown as TestExports).GitHubGatekeeperImpl({ props }),
+    })) as unknown as GatekeeperFacet;
+  }
+
+  /** `GatekeeperUser.describe()` for the account with id `userObjectId`. */
+  async describeAccount(userObjectId: string): Promise<Outcome<AccountDescription>> {
+    const user = (this.ctx.exports as unknown as TestExports)
+      .GatekeeperUserImpl({ props: { userObjectId } });
+    return await outcome(() => user.describe());
+  }
+
+  /** `GatekeeperUser.revoke()` for the account with id `userObjectId`, as disconnecting it does. */
+  async revokeAccount(userObjectId: string): Promise<Outcome<void>> {
+    const user = (this.ctx.exports as unknown as TestExports)
+      .GatekeeperUserImpl({ props: { userObjectId } });
+    return await outcome(() => user.revoke());
+  }
+
+  /** `GitHubVerifier.hasRepoAccess()` as the account with id `userObjectId`. */
+  async hasRepoAccess(userObjectId: string, owner: string, repo: string): Promise<Outcome<boolean>> {
+    const verifier = (this.ctx.exports as unknown as TestExports)
+      .GitHubVerifier({ props: { userObjectId } });
+    return await outcome(() => verifier.hasRepoAccess(owner, repo));
+  }
+
+  /** The `urlPattern` of the resource `GatekeeperUser.getGatekeeperClassFor(url)` resolves. */
+  async resourcePatternFor(url: string): Promise<Outcome<string>> {
+    const user = (this.ctx.exports as unknown as TestExports)
+      .GatekeeperUserImpl({ props: { userObjectId: "unused" } });
+    return await outcome(async () => (await user.getGatekeeperClassFor(url)).resource.urlPattern);
+  }
+
+  async preparePush(
+    facetName: string, props: GatekeeperProps,
+    branch: string, commitId: string, force: boolean, cache: RpcStub<GitCache>,
+  ): Promise<Outcome<PushActionData | null>> {
+    return await outcome(() =>
+      this.#gatekeeper(facetName, props).preparePush(branch, commitId, force, cache));
+  }
+
+  async submitPush(
+    facetName: string, props: GatekeeperProps,
+    queue: unknown, action: PushActionData, description: ActionDescription,
+  ): Promise<Outcome<void>> {
+    return await outcome(() =>
+      this.#gatekeeper(facetName, props).submitActionForApproval(queue, action, description));
+  }
+
+  async prepareCreatePullRequest(
+    facetName: string, props: GatekeeperProps, options: GitHubCreatePullRequestOptions,
+  ): Promise<Outcome<CreatePullRequestActionData>> {
+    return await outcome(() =>
+      this.#gatekeeper(facetName, props).prepareCreatePullRequest(options));
+  }
+
+  async submitCreatePullRequest(
+    facetName: string, props: GatekeeperProps,
+    queue: unknown, action: CreatePullRequestActionData, description: ActionDescription,
+  ): Promise<Outcome<void>> {
+    return await outcome(() =>
+      this.#gatekeeper(facetName, props).submitActionForApproval(queue, action, description));
+  }
+
+  async submitReview(
+    facetName: string, props: GatekeeperProps,
+    queue: unknown, action: PostReviewActionData, description: ActionDescription,
+  ): Promise<Outcome<void>> {
+    return await outcome(() =>
+      this.#gatekeeper(facetName, props).submitActionForApproval(queue, action, description));
+  }
+
+  async prepareMergePullRequest(
+    facetName: string, props: GatekeeperProps, pullId: string, options?: GitHubPullRequestMergeOptions,
+  ): Promise<Outcome<MergePullRequestActionData>> {
+    return await outcome(() =>
+      this.#gatekeeper(facetName, props).prepareMergePullRequest(pullId, options));
+  }
+
+  async submitMerge(
+    facetName: string, props: GatekeeperProps,
+    queue: unknown, action: MergePullRequestActionData, description: ActionDescription,
+  ): Promise<Outcome<void>> {
+    return await outcome(() =>
+      this.#gatekeeper(facetName, props).submitActionForApproval(queue, action, description));
+  }
+
+  /** Submits a hand-built `action` record, as a session does once it has prepared one. */
+  async submitAction(
+    facetName: string, props: GatekeeperProps,
+    queue: unknown, action: GitHubActionData, description: ActionDescription,
+  ): Promise<Outcome<void>> {
+    return await outcome(() =>
+      this.#gatekeeper(facetName, props).submitActionForApproval(queue, action, description));
+  }
+
+  async autoApprovableActions(facetName: string, props: GatekeeperProps): Promise<Outcome<ActionKind[]>> {
+    return await outcome(() => this.#gatekeeper(facetName, props).getAutoApprovableActions());
+  }
+
+  async rejectAction(
+    facetName: string, props: GatekeeperProps, actionId: number,
+  ): Promise<Outcome<undefined | { restart?: boolean }>> {
+    return await outcome(() => this.#gatekeeper(facetName, props).rejectAction(actionId));
+  }
+
+  async openPullRequest(
+    facetName: string, props: GatekeeperProps, id: string, cache?: RpcStub<GitCache>,
+  ): Promise<Outcome<GitHubPullRequestDetails>> {
+    return await outcome(() => this.#gatekeeper(facetName, props).openPullRequest(id, cache));
+  }
+
+  /** `pullDiff` with the file cursor drained inside the DO (cursor stubs cannot ride back). */
+  async pullDiffAll(
+    facetName: string, props: GatekeeperProps, id: string, cache?: RpcStub<GitCache>,
+  ): Promise<Outcome<{ revision: GitHubPullRequestRevision, files: GitHubPullRequestDiffFile[] }>> {
+    return await outcome(async () => {
+      const diff = await this.#gatekeeper(facetName, props).pullDiff(id, 20, cache);
+      return { revision: diff.revision, files: await drain(diff.files) };
+    });
+  }
+
+  /** `pullCommits`, drained. */
+  async pullCommitsAll(
+    facetName: string, props: GatekeeperProps, id: string, cache?: RpcStub<GitCache>,
+  ): Promise<Outcome<GitHubCommitSummary[]>> {
+    return await outcome(async () =>
+      await drain(await this.#gatekeeper(facetName, props).pullCommits(id, 50, cache)));
+  }
+
+  /** The first page of the repo-level `listCommits`. */
+  async listCommitsFirstPage(
+    facetName: string, props: GatekeeperProps,
+    filter: GitHubCommitFilter | undefined, pageSize: number, cache?: RpcStub<GitCache>,
+  ): Promise<Outcome<GitHubCommitSummary[] | null>> {
+    return await outcome(async () => {
+      const cursor = await this.#gatekeeper(facetName, props).listCommits(filter, pageSize, cache);
+      return await cursor.next();
+    });
+  }
+
+  async applyAction(
+    facetName: string, props: GatekeeperProps, actionId: number, cache: RpcStub<GitCache>,
+  ): Promise<Outcome<void>> {
+    return await outcome(() => this.#gatekeeper(facetName, props).applyAction(actionId, cache));
+  }
+
+  async revertAction(
+    facetName: string, props: GatekeeperProps, actionId: number,
+  ): Promise<Outcome<undefined | { message?: string; canRetry?: boolean }>> {
+    return await outcome(() => this.#gatekeeper(facetName, props).revertAction(actionId));
+  }
+
+  /** The first page of `listBranches`, drained inside the DO (cursor stubs cannot ride back). */
+  async listBranchesFirstPage(
+    facetName: string, props: GatekeeperProps, pageSize: number,
+  ): Promise<Outcome<GitHubBranchSummary[] | null>> {
+    return await outcome(async () => {
+      const cursor = await this.#gatekeeper(facetName, props).listBranches(undefined, pageSize);
+      return await cursor.next();
+    });
+  }
+
+  /**
+   * `listBranches` raced against a rejection: the cursor (and its injected-branch snapshot) is
+   * built first, `actionId` is rejected, and only then is the first page drained.
+   */
+  async listBranchesFirstPageAfterReject(
+    facetName: string, props: GatekeeperProps, pageSize: number, actionId: number,
+  ): Promise<Outcome<GitHubBranchSummary[] | null>> {
+    return await outcome(async () => {
+      const gatekeeper = this.#gatekeeper(facetName, props);
+      const cursor = await gatekeeper.listBranches(undefined, pageSize);
+      await gatekeeper.rejectAction(actionId);
+      return await cursor.next();
+    });
+  }
+
+  /**
+   * `listBranches` paged (page size 1) with a rejection *between* pages: the first page is
+   * drained, `actionId` is rejected, then the second page is drained -- catching rows that were
+   * already buffered ahead of the first page when the rejection landed.
+   */
+  async listBranchesPagedRejectBetween(
+    facetName: string, props: GatekeeperProps, actionId: number,
+  ): Promise<Outcome<{
+    first: GitHubBranchSummary[] | null, second: GitHubBranchSummary[] | null,
+  }>> {
+    return await outcome(async () => {
+      const gatekeeper = this.#gatekeeper(facetName, props);
+      const cursor = await gatekeeper.listBranches(undefined, 1);
+      const first = await cursor.next();
+      await gatekeeper.rejectAction(actionId);
+      const second = await cursor.next();
+      return { first, second };
+    });
+  }
+
+  async isSimulatedCommitId(
+    facetName: string, props: GatekeeperProps, commitId: string,
+  ): Promise<Outcome<boolean>> {
+    return await outcome(() => this.#gatekeeper(facetName, props).isSimulatedCommitId(commitId));
+  }
+
+  async gitPull(facetName: string, props: GatekeeperProps, oids: string[], options: GitPullHints):
+      Promise<Outcome<GitPullTransfer>> {
+    return await outcome(() => this.#gatekeeper(facetName, props).gitPull(oids, options));
+  }
+
+  async getCommit(
+    facetName: string, props: GatekeeperProps, ref: string | undefined, cache?: RpcStub<GitCache>,
+  ): Promise<Outcome<{ details: GitHubCommitDetails, fromCache: boolean }>> {
+    return await outcome(() => this.#gatekeeper(facetName, props).getCommit(ref, cache));
+  }
+
+  async resolveRef(
+    facetName: string, props: GatekeeperProps, ref: string | undefined, cache?: RpcStub<GitCache>,
+  ): Promise<Outcome<{ id: string, fromCache: boolean }>> {
+    return await outcome(() => this.#gatekeeper(facetName, props).resolveRef(ref, cache));
+  }
+
+  async repoMetadata(
+    facetName: string, props: GatekeeperProps,
+  ): Promise<Outcome<GitHubRepoMetadata>> {
+    return await outcome(() => this.#gatekeeper(facetName, props).repoMetadata());
+  }
+
+  async pullMergeBase(
+    facetName: string, props: GatekeeperProps, id: string, cache?: RpcStub<GitCache>,
+  ): Promise<Outcome<string>> {
+    return await outcome(() => this.#gatekeeper(facetName, props).pullMergeBase(id, cache));
+  }
+
+  async openIssue(
+    facetName: string, props: GatekeeperProps, id: string,
+  ): Promise<Outcome<GitHubIssueDetails>> {
+    return await outcome(() => this.#gatekeeper(facetName, props).openIssue(id));
+  }
+
+  /** Prepares and queues a `setTitle` (given `title`) or `changeState` (given `state`). */
+  async queueEdit(
+    facetName: string, props: GatekeeperProps, queue: unknown,
+    kind: "issue" | "pull", id: string, edit: { title: string } | { state: "open" | "closed" },
+  ): Promise<Outcome<number>> {
+    return await outcome(async () => {
+      const gatekeeper = this.#gatekeeper(facetName, props);
+      const action = "title" in edit
+        ? await gatekeeper.prepareSetTitle(kind, id, edit.title)
+        : await gatekeeper.prepareChangeState(kind, id, edit.state);
+      await gatekeeper.submitActionForApproval(
+        queue, action, { title: action.type, description: action.type, implementsRevert: true });
+      return action.approvalId;
+    });
+  }
+
+  /**
+   * One listing cursor's `next()` results, for up to `calls` calls or through its `null`. A call
+   * that throws is recorded as its message and retried on the same cursor; a second throw in a
+   * row ends the drain with it.
+   */
+  async listingPages(
+    facetName: string, props: GatekeeperProps,
+    method: ListingMethod, query: unknown, pageSize: number, calls = Infinity,
+  ): Promise<Outcome<(unknown[] | null | string)[]>> {
+    return await outcome(async () => {
+      const cursor = await this.#gatekeeper(facetName, props)[method](query as never, pageSize);
+      const pages: (unknown[] | null | string)[] = [];
+      while (pages.length < calls && pages.at(-1) !== null) {
+        try {
+          pages.push(await cursor.next());
+        } catch (error) {
+          if (typeof pages.at(-1) === "string") throw error;
+          pages.push(String(error));
+        }
+      }
+      return pages;
+    });
+  }
+
+  /** Restarts the gatekeeper facet: in-memory state is lost, storage (and its caches) kept. */
+  async restartGatekeeper(facetName: string): Promise<void> {
+    this.ctx.facets.abort(facetName, new Error("test: restart"));
+  }
+
+  /**
+   * Writes `entries` into a gatekeeper's storage. Must be the facet's first use: the facet is
+   * instantiated as `SeededGitHubGatekeeper`, and later calls reuse it.
+   */
+  async seedGatekeeper(
+    facetName: string, props: GatekeeperProps, entries: Record<string, unknown>,
+  ): Promise<void> {
+    // Spelled structurally, like GatekeeperFacet: `Fetcher<T>` inference loses `seed`.
+    const facet = this.ctx.facets.get<SeededGitHubGatekeeper>(facetName, () => ({
+      class: (this.ctx.exports as unknown as TestExports).SeededGitHubGatekeeper({ props }),
+    })) as unknown as SeedFacet;
+    await facet.seed(entries);
+  }
+
+  // ── Hooks, with this object standing in for the Overseer ─────────────
+  //
+  // One hook per TestHooks object: subscribing stores the controller it binds, enabling hands it
+  // an initiator whose firings reach `startHook()` here, and those firings deliver to a
+  // RecordingHook over `#firingQueue`.
+
+  #hook: HookState = { received: [], failures: 0, admissionFailures: 0 };
+  #firingQueue = new FiringQueue();
+
+  /**
+   * Subscribe through the binding's session, or one of its issues or pull requests, as
+   * executeCode would; returns what the hook was bound with.
+   */
+  async subscribeHook(
+    facetName: string, props: GatekeeperProps, options?: GitHubSubscribeOptions,
+    target?: { kind: "issue" | "pull"; id: string },
+  ): Promise<Outcome<HookDescription>> {
+    return await outcome(async () => {
+      const facet = this.#hookFacet(facetName, props);
+      await facet.testRestoreThrough(this.ctx.id.toString(), facetName, props);
+      using queue = new RpcStub(new BindingQueue(this.ctx.storage));
+      using session = await facet.startSession(queue as never) as unknown as (GitHubRepo & GitHubIssue) & Disposable;
+      using hook = new RpcStub(new RecordingHook(this.#hook));
+      if (target === undefined) {
+        await session.subscribe(hook as never, options);
+      } else {
+        using capability = (target.kind === "issue"
+          ? await session.getIssue(target.id)
+          : await session.getPullRequest(target.id)) as GitHubIssue & Disposable;
+        await capability.subscribe(hook as never, options);
+      }
+      return this.ctx.storage.kv.get<HookDescription>("hookDescription")!;
+    });
+  }
+
+  async enableHook(): Promise<Outcome<void>> {
+    const initiator = (this.ctx.exports as unknown as HookExports)
+      .TestHookInitiator({ props: { hooks: this.ctx.id.toString() } });
+    return await outcome(() => this.#controller().enable(initiator, { workspaceId: "test-workspace" }));
+  }
+
+  async disableHook(): Promise<void> {
+    await this.#controller().disable();
+  }
+
+  /** The Overseer's `HookInitiator.startHook()`, for this object's hook. */
+  startHook() {
+    if (this.#hook.admissionFailures > 0) {
+      this.#hook.admissionFailures--;
+      throw new Error("The test Workshop failed to start the firing.");
+    }
+    return { callback: new RecordingHook(this.#hook), approvalQueue: new RpcStub(this.#firingQueue) };
+  }
+
+  /**
+   * Deliver `event` to a firing of this object's hook through the facet's `[restore](params)`
+   * target, as a delivery stub minted with any `params` would.
+   */
+  async deliverDirectly(facetName: string, props: GatekeeperProps, params: GitHubHookParams, event: unknown) {
+    const { callback, approvalQueue } = this.startHook();
+    using callbackStub = new RpcStub(callback);
+    await this.#hookFacet(facetName, props).testDeliver(params, callbackStub, approvalQueue, event);
+    approvalQueue[Symbol.dispose]();
+  }
+
+  /** What a delivery stub the facet minted reaches: the facet's own `[restore]()` target. */
+  async deliverHook(
+    facetName: string, props: GatekeeperProps, params: GitHubHookParams,
+    callback: RpcStub<RpcTarget>, approvalQueue: RpcStub<RpcTarget>, event: unknown,
+  ): Promise<void> {
+    await this.#hookFacet(facetName, props).testDeliver(params, callback, approvalQueue, event);
+  }
+
+  setHookBehavior(behavior: Partial<Omit<HookState, "received">>): void {
+    Object.assign(this.#hook, behavior);
+  }
+
+  /** What the hook received, and what its firings observed, queued and advertised. */
+  readHook() {
+    return { received: this.#hook.received, failures: this.#hook.failures, ...this.#firingQueue.read() };
+  }
+
+  #controller(): HookController<RpcTarget> {
+    const controller = this.ctx.storage.kv.get<HookController<RpcTarget>>("hookController");
+    if (!controller) throw new Error("No hook has been bound.");
+    return controller;
+  }
+
+  #hookFacet(facetName: string, props: GatekeeperProps): HookFacet {
+    return this.ctx.facets.get<GitHubGatekeeperImpl>(facetName, () => ({
+      class: (this.ctx.exports as unknown as TestExports).GitHubGatekeeperImpl({ props }),
+    })) as unknown as HookFacet;
+  }
+}
+
+/** A gadget's hook, sharing its state with the TestHooks object that fires it. */
+type HookState = {
+  /** Each event received, without its capabilities. */
+  received: Omit<GitHubEvent, "issue" | "pullRequest" | "repo">[];
+  /** Fail this many more deliveries. */
+  failures: number;
+  /** Fail this many more `startHook()` calls, as the Workshop refusing a firing would. */
+  admissionFailures: number;
+  /** Queue this comment through each event's issue or pull request. */
+  reply?: string;
+};
+
+/** The facet methods the hook harness calls, two of them installed below for the tests. */
+type HookFacet = {
+  startSession(queue: never): Promise<unknown>;
+  testRestoreThrough(hooks: string, facetName: string, props: GatekeeperProps): Promise<void>;
+  testDeliver(params: GitHubHookParams, callback: unknown, queue: unknown, event: unknown): Promise<void>;
+};
+
+type TestHookDeliveryProps = {
+  hooks: string; facetName: string; props: GatekeeperProps; params: GitHubHookParams;
+};
+
+/** This worker's hook entrypoints, which the gatekeeper's generated `Cloudflare.Exports` omits. */
+type HookExports = {
+  TestHooks: DurableObjectNamespace<TestHooks>;
+  TestHookInitiator(options: { props: { hooks: string } }): Fetcher<TestHookInitiator>;
+  TestHookDelivery(options: { props: TestHookDeliveryProps }): Fetcher<TestHookDelivery>;
+};
+
+function testHooks(exports: Cloudflare.Exports, id: string) {
+  const namespace = (exports as unknown as HookExports).TestHooks;
+  return namespace.get(namespace.idFromString(id));
+}
+
+/** The Overseer's HookInitiator: each firing reaches the TestHooks object that enabled the hook. */
+export class TestHookInitiator extends WorkerEntrypoint<Cloudflare.Env, { hooks: string }> {
+  startHook() {
+    return testHooks(this.ctx.exports, this.ctx.props.hooks).startHook();
+  }
+}
+
+/**
+ * Stands in for the stub the facet mints with ctx.restore(), which this pool cannot do (its
+ * Durable Object wrappers don't forward `[restore]`): it reaches the facet's real `[restore]`
+ * target through TestHooks.
+ */
+export class TestHookDelivery extends WorkerEntrypoint<Cloudflare.Env, TestHookDeliveryProps> {
+  deliver(callback: RpcStub<RpcTarget>, approvalQueue: RpcStub<RpcTarget>, event: unknown) {
+    const { hooks, facetName, props, params } = this.ctx.props;
+    return testHooks(this.ctx.exports, hooks).deliverHook(facetName, props, params, callback, approvalQueue, event);
+  }
+}
+
+/** The queue a subscription binds its hook on: keeps the controller, as the Overseer would. */
+class BindingQueue extends RpcTarget {
+  constructor(private readonly storage: DurableObjectStorage) {
+    super();
+  }
+
+  async bindHook(controller: unknown, _callback: unknown, description: HookDescription): Promise<void> {
+    this.storage.kv.put("hookController", controller);
+    this.storage.kv.put("hookDescription", description);
+  }
+}
+
+class RecordingGitCache extends RpcTarget {
+  constructor(private readonly advertised: string[]) {
+    super();
+  }
+
+  async advertiseCommit(commitId: string): Promise<void> {
+    this.advertised.push(commitId);
+  }
+}
+
+/** The approval queue of every firing: records what the deliveries observed, queued and advertised. */
+class FiringQueue extends RpcTarget {
+  #observations: { title: string; description: string }[] = [];
+  #submissions: { actionId: number; title: string }[] = [];
+  #advertised: string[] = [];
+
+  async authorizeObservation(observation: { title: string; description: string }): Promise<void> {
+    this.#observations.push({ title: observation.title, description: observation.description });
+  }
+
+  async submitAction(actionId: number, description: { title: string }): Promise<void> {
+    this.#submissions.push({ actionId, title: description.title });
+  }
+
+  async getGitCache() {
+    return new RecordingGitCache(this.#advertised);
+  }
+
+  read() {
+    return { observations: this.#observations, submissions: this.#submissions, advertised: this.#advertised };
+  }
+}
+
+/** A gadget's event hook: records each event, and fails or replies as its state says. */
+class RecordingHook extends RpcTarget {
+  constructor(private readonly state: HookState) {
+    super();
+  }
+
+  async receiveEvent(event: GitHubEvent): Promise<void> {
+    const { issue, pullRequest, repo, ...received } =
+      event as GitHubEvent & { issue?: GitHubIssue; pullRequest?: GitHubIssue; repo?: GitHubRepo };
+    try {
+      if (this.state.failures > 0) {
+        this.state.failures--;
+        throw new Error("The test hook failed.");
+      }
+      this.state.received.push(received);
+      if (this.state.reply !== undefined) await (issue ?? pullRequest)?.postComment(this.state.reply);
+    } finally {
+      for (const capability of [issue, pullRequest, repo]) {
+        (capability as Partial<Disposable> | undefined)?.[Symbol.dispose]?.();
+      }
+    }
+  }
+}
+
+type TestGitHub = GitHubGatekeeperImpl & HookFacet;
+const testPrototype = GitHubGatekeeperImpl.prototype as TestGitHub;
+
+/**
+ * Make this facet's ctx.restore() mint TestHookDelivery stubs that route back to `[restore]`,
+ * disposable as a restored stub is.
+ */
+testPrototype.testRestoreThrough = async function(hooks, facetName, props) {
+  const { ctx } = this as unknown as { ctx: DurableObjectState };
+  const exports = ctx.exports as unknown as HookExports;
+  ctx.restore = async (params: GitHubHookParams) => Object.assign(
+    exports.TestHookDelivery({ props: { hooks, facetName, props, params } }), { [Symbol.dispose]() {} });
+};
+
+/** Deliver through the target the facet's `[restore]()` returns for a hook's delivery stub. */
+testPrototype.testDeliver = function(params, callback, queue, event) {
+  return this[restore](params).deliver(callback as never, queue as never, event as never);
+};

@@ -3,14 +3,10 @@ import {
   AGENT_CATALOG_MAX_ID_LENGTH, AGENT_CATALOG_MAX_TITLE_LENGTH,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type { AgentCatalog } from "@gadgets/workshop-shared/gatekeeper";
+import type { AiChatMessage, AlwaysAvailableResource } from "@gadgets/workshop-shared/api";
 import { createWorkshopLogger } from "./observability";
 
 const logger = createWorkshopLogger("workshop.agent.catalog");
-
-export type AgentCatalogSnapshot = {
-  gatekeeperId: number;
-  catalog: AgentCatalog | null;
-};
 
 function normalizeText(value: string, maxLength: number): string {
   return value.replace(/\p{Cc}/gu, " ").replace(/\s+/g, " ").trim().slice(0, maxLength);
@@ -46,39 +42,6 @@ export function normalizeAgentCatalog(catalog: AgentCatalog): AgentCatalog {
   };
 }
 
-export async function completeAgentCatalogSnapshot(
-    existing: AgentCatalogSnapshot[] | undefined,
-    gatekeeperIds: number[],
-    loadCatalog: (gatekeeperId: number) => Promise<AgentCatalog | null>):
-    Promise<{snapshots: AgentCatalogSnapshot[], changed: boolean}> {
-  let activeIds = new Set(gatekeeperIds);
-  let existingCount = existing?.length ?? 0;
-  let catalogs = new Map(
-      existing
-          ?.filter(entry => activeIds.has(entry.gatekeeperId))
-          .map(entry => [entry.gatekeeperId, entry.catalog]));
-  let removedStaleEntries = catalogs.size !== existingCount;
-  let missing = gatekeeperIds.filter(gatekeeperId => !catalogs.has(gatekeeperId));
-  await Promise.all(missing.map(async gatekeeperId => {
-    // Isolate per entry: one failing loader must not reject the whole snapshot (it would lose every
-    // other catalog and abort the turn). A failed/empty load is recorded as null, like any other.
-    try {
-      catalogs.set(gatekeeperId, await loadCatalog(gatekeeperId));
-    } catch (error) {
-      logger.warn("failed to load agent catalog", {
-        event: "agent.catalog.load.failed", gatekeeperId, error,
-      });
-      catalogs.set(gatekeeperId, null);
-    }
-  }));
-  return {
-    snapshots: [...catalogs]
-        .toSorted(([left], [right]) => left - right)
-        .map(([gatekeeperId, catalog]) => ({gatekeeperId, catalog})),
-    changed: missing.length > 0 || removedStaleEntries,
-  };
-}
-
 /** The catalog as a JSON blob for inclusion in a prompt, on its own line, or "" if empty. */
 export function formatAgentCatalogPrompt(catalog: AgentCatalog | null): string {
   if (!catalog?.entries.length) return "";
@@ -91,11 +54,7 @@ export function formatAgentCatalogPrompt(catalog: AgentCatalog | null): string {
  * describes the agent's environment rather than anything the user said, so it lives in the system
  * prompt alongside the bindings list rather than as a synthetic user turn.
  */
-export function formatAlwaysAvailableResourcesPrompt(resources: Array<{
-  title: string;
-  name: string;
-  catalog: AgentCatalog | null;
-}>): string {
+export function formatAlwaysAvailableResourcesPrompt(resources: AlwaysAvailableResource[]): string {
   let lines = resources.map(resource =>
     `- ${resource.title}: \`env.${resource.name}\`${formatAgentCatalogPrompt(resource.catalog)}`);
   return `The following resources are always available as bindings in your env for use with the ` +
@@ -103,4 +62,67 @@ export function formatAlwaysAvailableResourcesPrompt(resources: Array<{
     `When one is relevant, use describeBinding with the binding's name to learn its API before ` +
     `using it. If a Gadget's persistent code needs one, wire it into that gadget with ` +
     `setGadgetBinding.`;
+}
+
+/**
+ * Each always-available resource as the agent last saw it before `sequence`: `listed`, as the system
+ * prompt lists them, updated by each "catalogChange" message before that point.
+ */
+export function seenAlwaysAvailableResources(
+    listed: AlwaysAvailableResource[], messages: AiChatMessage[], sequence: number)
+    : Map<string, AlwaysAvailableResource> {
+  let seen = new Map(listed.map(resource => [resource.name, resource]));
+  for (let message of messages) {
+    if (message.type === "catalogChange" && message.sequence < sequence) {
+      for (let resource of message.resources) seen.set(resource.name, resource);
+    }
+  }
+  return seen;
+}
+
+/**
+ * The resources in `current` to tell the agent about: those it hasn't seen, and those whose catalog
+ * would show differently from the one it last saw. A null catalog failed to load (or there is
+ * none), so it says nothing about what changed.
+ */
+export function findCatalogChanges(
+    seen: ReadonlyMap<string, AlwaysAvailableResource>, current: AlwaysAvailableResource[])
+    : AlwaysAvailableResource[] {
+  return current.filter(resource => {
+    let before = seen.get(resource.name);
+    return before === undefined || (resource.catalog !== null &&
+        formatAgentCatalogPrompt(resource.catalog) !== formatAgentCatalogPrompt(before.catalog));
+  });
+}
+
+const serializedEntries = (catalog: AgentCatalog | null) =>
+    new Set(catalog?.entries.map(entry => JSON.stringify(entry)));
+
+/**
+ * What the agent is told about a resource that changed since it last saw it (`before`), or that it
+ * hasn't seen: the entries added and those no longer listed, as JSON like the system prompt shows
+ * them.
+ */
+export function formatCatalogChange(
+    resource: AlwaysAvailableResource, before: AlwaysAvailableResource | undefined): string {
+  let binding = `\`env.${resource.name}\` (${resource.title})`;
+  if (before === undefined) {
+    return `${binding} is now always available in your env. Use ` +
+        `describeBinding("${resource.name}") to learn its API before using it.` +
+        formatAgentCatalogPrompt(resource.catalog);
+  }
+  let was = serializedEntries(before.catalog);
+  let now = serializedEntries(resource.catalog);
+  let added = [...now].filter(entry => !was.has(entry));
+  let dropped = [...was].filter(entry => !now.has(entry));
+  let lines = [`The catalog of ${binding} changed outside this conversation.`];
+  if (added.length > 0) lines.push(`Added: [${added.join(",")}]`);
+  if (dropped.length > 0) lines.push(`No longer listed: [${dropped.join(",")}]`);
+  let truncated = resource.catalog?.truncated === true;
+  if (truncated !== (before.catalog?.truncated === true)) {
+    lines.push(truncated
+        ? "The list is now partial: there are more entries than it shows."
+        : "The list is now complete.");
+  }
+  return lines.join("\n");
 }

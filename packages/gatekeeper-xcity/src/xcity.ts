@@ -2,9 +2,11 @@ import { WorkerEntrypoint, DurableObject, RpcStub, RpcTarget } from "cloudflare:
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
   GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, GatekeeperUserVerifier, VendorDescription,
-  GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription,
+  GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription, ConnectHandoff,
   ApprovalQueue, SupportedResource, ResourceConfiguratorFrame, ResourceDescription, stripTrailingSlashes,
 } from "@gadgets/workshop-shared/gatekeeper";
+import { errorPageHtml, connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
+import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import { XcityGatekeeperUser } from "@gadgets/workshop-shared/xcity-gatekeeper";
 import {
   getOAuthConfig, getAuthBaseUrl, buildAuthorizeUrl, generatePkce, exchangeCode, refreshTokens,
@@ -56,6 +58,9 @@ type StoredNonce = {
   stage: "initiation" | "oauth";
   verifier?: string;
   scopes?: string[];
+  // Set when the link was minted by reconnect(). Decided at mint time and carried through both
+  // stages, so the flow's outcome (stage vs. live write) can never be chosen by the browser.
+  reconnect?: boolean;
   // While at the "oauth" stage, the still-unexpired initiation link that started this flow. Auth
   // frontends can bounce the browser back to the initiation URL after their own login step; keeping
   // this lets that visit restart the authorize redirect instead of dead-ending on the "link
@@ -65,6 +70,10 @@ type StoredNonce = {
 
 // A cached access token plus its absolute expiry (unix ms).
 type StoredAccessToken = { token: string; expires: number };
+
+// The OAuth grant a reconnect flow stages (see stageCredentials) until commitReconnect() makes it
+// live: the refresh token plus the access token it was exchanged with.
+type XcityGrant = { refreshToken: string; accessToken: string; expires: number };
 
 // A short-lived userinfo result bound to the exact access token used to fetch it.
 type StoredIdentity = { accessToken: string; identity: XcityIdentity; expires: number };
@@ -136,25 +145,13 @@ function getMediaResource(env: Env): SupportedResource | null {
   };
 }
 
-const SELF_CLOSING_HTML = `<!DOCTYPE html>
-<html lang="en"><body>
-<script type="text/javascript">window.close();</script>
-<p>Authorization complete. You may close this tab and return to Xcity OS.
-</body></html>`;
+const INVALID_LINK_HTML = errorPageHtml(
+  "Authorization Link Expired",
+  "This authorization link is invalid or has expired. Please return to Xcity OS and try again.");
 
-const INVALID_LINK_HTML = `<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>Authorization Link Expired</title></head>
-<body style="font-family: system-ui, sans-serif; text-align: center; padding: 3rem;">
-<h1 style="color:#d97706;">Authorization Link Expired</h1>
-<p>This authorization link is invalid or has expired. Please return to Xcity OS and try again.</p>
-<button onclick="window.close()">Close</button></body></html>`;
-
-const NOT_CONFIGURED_HTML = `<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>Configuration Required</title></head>
-<body style="font-family: system-ui, sans-serif; text-align: center; padding: 3rem;">
-<h1 style="color:#d97706;">Xcity Gatekeeper Not Configured</h1>
-<p>Please see the README.md for instructions on configuring an OAuth client ID and secret.</p>
-</body></html>`;
+const NOT_CONFIGURED_HTML = errorPageHtml(
+  "Xcity Gatekeeper Not Configured",
+  "Please see the README.md for instructions on configuring an OAuth client ID and secret.");
 
 /** Main HTTP entrypoint — used only to initiate and complete the OAuth flow. */
 export default {
@@ -169,14 +166,14 @@ export default {
 
     if (path.length === 2 && path[0].length === 64 && path[1].length === NONCE_BYTES * 2) {
       if (!env.CLIENT_ID || !env.CLIENT_SECRET) {
-        return new Response(NOT_CONFIGURED_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+        return htmlResponse(NOT_CONFIGURED_HTML);
       }
       const doId = path[0];
       const initiationNonce = path[1];
       const stub = ctx.exports.UserAccount.get(ctx.exports.UserAccount.idFromString(doId));
       const begun = await stub.beginOAuthFlow(initiationNonce);
       if (begun === null) {
-        return new Response(INVALID_LINK_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+        return htmlResponse(INVALID_LINK_HTML);
       }
       const config = getOAuthConfig(env.CLIENT_ID, env.CLIENT_SECRET, getBaseUrl(env), env.XCITY_AUTH_URL)!;
       const authUrl = buildAuthorizeUrl(config, `${doId}:${begun.oauthNonce}`, begun.challenge, begun.scopes);
@@ -184,7 +181,11 @@ export default {
     } else if (relPath === "/oauth") {
       const error = url.searchParams.get("error");
       if (error) {
-        return new Response(`${error}: ${url.searchParams.get("error_description")}`);
+        // Provider-supplied text is deliberately not reflected back.
+        return new Response("Xcity authorization failed. Please restart the connection flow from Xcity OS.", {
+          status: 400,
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+        });
       }
       const state = url.searchParams.get("state");
       if (!state) return new Response("Error: no 'state' provided");
@@ -196,10 +197,11 @@ export default {
       if (!code) return new Response("Error: no 'code' provided");
 
       const stub = ctx.exports.UserAccount.get(ctx.exports.UserAccount.idFromString(doId));
-      if (!await stub.acceptAuthCode(code, oauthNonce)) {
-        return new Response(INVALID_LINK_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
-      }
-      return new Response(SELF_CLOSING_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+      const handoff = await stub.acceptAuthCode(code, oauthNonce);
+      if (!handoff) return htmlResponse(INVALID_LINK_HTML);
+      // The final page delivers the handoff to the Workshop, which redeems it from the initiating
+      // browser; until then the connection is inert (and revoked if never redeemed).
+      return htmlResponse(connectHandoffPageHtml(handoff));
     }
     return new Response("Not Found", { status: 404 });
   },
@@ -275,11 +277,11 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async prepareReconnect(initiationNonce: string) {
-    this.ctx.storage.kv.put<boolean>("reconnecting", true);
     this.ctx.storage.kv.put<StoredNonce>("nonce", {
       value: initiationNonce,
       expiresAt: Date.now() + INITIATION_NONCE_LIFETIME_MS,
       stage: "initiation",
+      reconnect: true,
     });
   }
 
@@ -306,16 +308,23 @@ export class UserAccount extends DurableObject<Env> {
       stage: "oauth",
       verifier,
       initiation,
+      reconnect: stored?.reconnect,
     });
     const scopes = this.ctx.storage.kv.get<string[]>("scopes") ?? FULL_SCOPES;
     return { oauthNonce, challenge, scopes };
   }
 
-  async acceptAuthCode(code: string, oauthNonce: string): Promise<boolean> {
+  /**
+   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on, or
+   * null when the callback's nonce doesn't match. A first connect writes the credentials live but
+   * inert (the Workshop revokes the account unless the handoff is redeemed); a reconnect only
+   * stages them, and commitReconnect() activates them.
+   */
+  async acceptAuthCode(code: string, oauthNonce: string): Promise<ConnectHandoff | null> {
     const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
     if (!stored || stored.stage !== "oauth" || !stored.verifier ||
         Date.now() >= stored.expiresAt || !constantTimeEqual(stored.value, oauthNonce)) {
-      return false;
+      return null;
     }
     this.ctx.storage.kv.delete("nonce");
 
@@ -328,33 +337,55 @@ export class UserAccount extends DurableObject<Env> {
     if (!tokens || !tokens.refreshToken) {
       throw new Error("Xcity OAuth exchange failed or returned no refresh token.");
     }
-
-    this.ctx.storage.kv.put<string>("refreshToken", tokens.refreshToken);
-    this.ctx.storage.kv.put<StoredAccessToken>("accessToken", {
-      token: tokens.accessToken,
+    const grant: XcityGrant = {
+      refreshToken: tokens.refreshToken,
+      accessToken: tokens.accessToken,
       expires: Date.now() + tokens.expiresIn * 1000,
+    };
+
+    if (stored.reconnect) {
+      // The reconnect URL is a bearer capability, so the new grant is only staged until the
+      // Workshop has confirmed the browser that finished the flow is the owner's (see
+      // commitReconnect). Bound gadgets keep reading the current token meanwhile, and the stage id
+      // ties the Workshop's ticket to this grant so an overlapping reconnect cannot commit it.
+      const stageId = stageCredentials(this.ctx.storage.kv, grant, Date.now());
+      return await callback.reconnectComplete(stageId);
+    }
+
+    this.#writeGrant(grant);
+    let handoff: ConnectHandoff;
+    try {
+      handoff = await callback.complete(
+          this.ctx.exports.GatekeeperUserImpl({ props: { userObjectId: this.ctx.id.toString() } }));
+    } catch (err) {
+      this.ctx.storage.kv.delete("refreshToken");
+      this.ctx.storage.kv.delete("accessToken");
+      throw err;
+    }
+    // Auth-only sign-in grants are transient: the caller read the email via complete(), so
+    // schedule a prompt self-destruct. We do NOT call a provider revoke endpoint; we just drop
+    // our local copy.
+    if (this.ctx.storage.kv.get<boolean>("ephemeral")) {
+      this.ctx.storage.setAlarm(Date.now() + 2 * 60 * 1000);
+    }
+    return handoff;
+  }
+
+  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
+  async commitReconnect(stageId: string): Promise<void> {
+    const grant = commitStagedCredentials<XcityGrant>(this.ctx.storage.kv, Date.now(), stageId);
+    if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    this.#writeGrant(grant);
+  }
+
+  /** Replaces the live credentials. Drops cached identity: the new grant may be another user. */
+  #writeGrant(grant: XcityGrant) {
+    this.ctx.storage.kv.put<string>("refreshToken", grant.refreshToken);
+    this.ctx.storage.kv.put<StoredAccessToken>("accessToken", {
+      token: grant.accessToken,
+      expires: grant.expires,
     });
     this.ctx.storage.kv.delete("identity");
-
-    const reconnecting = this.ctx.storage.kv.get<boolean>("reconnecting");
-    if (reconnecting) {
-      this.ctx.storage.kv.delete("reconnecting");
-      await callback.credentialsRestored();
-    } else {
-      try {
-        await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props: { userObjectId: this.ctx.id.toString() } }));
-      } catch (err) {
-        this.ctx.storage.kv.delete("refreshToken");
-        throw err;
-      }
-      // Auth-only sign-in grants are transient: the caller read the email via complete(), so
-      // schedule a prompt self-destruct. We do NOT call a provider revoke endpoint; we just drop
-      // our local copy.
-      if (this.ctx.storage.kv.get<boolean>("ephemeral")) {
-        this.ctx.storage.setAlarm(Date.now() + 2 * 60 * 1000);
-      }
-    }
-    return true;
   }
 
   hasRefreshToken() {
@@ -375,6 +406,11 @@ export class UserAccount extends DurableObject<Env> {
     }
 
     const refreshed = await refreshTokens(this.#config(), refreshToken);
+    if (this.ctx.storage.kv.get<string>("refreshToken") !== refreshToken) {
+      // A reconnect was committed (or the account revoked) while this refresh was in flight. The
+      // result belongs to the replaced grant: neither store it nor report it as expired.
+      return this.ctx.storage.kv.get<string>("refreshToken") ? this.getAccessToken() : null;
+    }
     if (!refreshed) {
       const callback = this.ctx.storage.kv.get<Fetcher<GatekeeperConnectCallback>>("callback");
       callback?.credentialsExpired().catch(err =>
@@ -566,6 +602,10 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     const initiationNonce = generateNonce();
     await this.#account().prepareReconnect(initiationNonce);
     return { url: `${getBaseUrl(this.env)}/${this.ctx.props.userObjectId}/${initiationNonce}` };
+  }
+
+  async commitReconnect(stageId: string): Promise<void> {
+    await this.#account().commitReconnect(stageId);
   }
 
   /**

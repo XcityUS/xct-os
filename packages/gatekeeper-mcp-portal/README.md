@@ -60,7 +60,7 @@ The portal must expose upstream tools directly. Use a portal where Code Mode is 
 append `?codemode=off` when its policy is default-on. Enforced Code Mode is unsupported. Do not add
 an `optimize_context` parameter or opt in to Code Mode on `MCP_PORTAL_URL`.
 
-Only `MCP_ALLOW_INSECURE` is set in the repo's `wrangler.jsonc`, pinned to `"false"` so the default
+Only `MCP_ALLOW_INSECURE` is set in the repo's `cloudflare.config.ts`, pinned to `"false"` so the default
 is explicit rather than merely absent. None of the others is, and a portal URL committed there would
 become the default for every deployment of this repo and would send their users' OAuth flows to
 whichever host it named, so it belongs in the deployment's own configuration — for Cloudflare's
@@ -113,8 +113,7 @@ Tools · Choose how much of this server the Gadget may call.
 ( ) Choose tools   Only the tools you tick. Anything else is refused, including tools added later.
 
 Allowed tools · Read-only tools return data straight away. The rest queue for your approval.
-[ 🔍 Filter tools... ]
-12 of 12 selected                                                                     Clear
+[ 🔍 Filter tools...                                                   ]  12 of 12 selected
 ☑ List issues                                                                     read-only
 ☑ Create issue                                                               needs approval
 ```

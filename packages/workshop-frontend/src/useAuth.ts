@@ -2,6 +2,8 @@ import { useState, useEffect, useRef } from 'react'
 import { RpcStub } from 'capnweb'
 import { PublicApi, AuthenticatedApi } from '@gadgets/workshop-shared/api'
 import { setReportedUserId } from './errorReporting'
+import { NativeConnectSession } from './features/native-app/connectSession'
+import { browserPushSupport, disableBrowserPush } from './features/notifications/browserPush'
 
 const CF_ACCESS_MODE = import.meta.env.VITE_CF_ACCESS_MODE === 'true'
 
@@ -15,6 +17,7 @@ interface AuthState {
 export { CF_ACCESS_MODE }
 
 export function useAuth(publicApi: RpcStub<PublicApi>) {
+  const [nativeConnectSession] = useState(() => new NativeConnectSession())
   const [authState, setAuthState] = useState<AuthState>({
     token: null,
     authenticatedApi: null,
@@ -48,12 +51,14 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
     const authenticatedApi = authState.authenticatedApi
     if (!authenticatedApi) return
     let cancelled = false
-    authenticatedApi.whoami().then((info) => {
+    const identity = authenticatedApi.whoami()
+    const untrack = nativeConnectSession.track(authenticatedApi, identity)
+    identity.then((info) => {
       // Only a real user account names a person: for a gadget author `id` is its owner's id.
       if (!cancelled && info.type === 'user') setReportedUserId(info.id)
     }).catch(() => {})
-    return () => { cancelled = true }
-  }, [authState.authenticatedApi])
+    return () => { cancelled = true; untrack() }
+  }, [authState.authenticatedApi, nativeConnectSession])
 
   useEffect(() => {
     if (CF_ACCESS_MODE) {
@@ -124,9 +129,14 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
 
   const logout = () => {
     setReportedUserId(undefined)
+    // On a shared computer, signing out is how the user stops this browser showing their chats.
+    const releasePush = browserPushSupport() === 'supported'
+      ? disableBrowserPush().catch(error =>
+          console.error('Failed to stop browser notifications:', error))
+      : Promise.resolve()
 
     if (CF_ACCESS_MODE) {
-      window.location.assign('/cdn-cgi/access/logout')
+      void releasePush.then(() => window.location.assign('/cdn-cgi/access/logout'))
       return
     }
 

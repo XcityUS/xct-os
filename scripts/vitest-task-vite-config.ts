@@ -5,11 +5,15 @@
  * `gatekeeper-configurator-vite-config.ts` takes that shape. The task types below are structural
  * copies of Vite+'s rather than imports of them, which is what keeps that true.
  *
- * TypeScript, unlike the `.mjs`/`.js` around it in this directory, because nothing here is ever run
- * by `node` -- both modules are imported only from `vite.config.ts` files, which vite bundles -- and
- * being TS means a malformed task or a mistyped `base` is a compile error rather than a glob that
- * silently never matches. Importers still write the `.js` extension in the specifier; TS and vite
- * both resolve it to the `.ts`.
+ * Being TypeScript means a malformed task or a mistyped `base` is a compile error rather than a glob
+ * that silently never matches.
+ *
+ * Reached as `@gadgets/scripts/vitest-task`, an `exports` subpath of this directory's package, not
+ * as a relative path. A relative specifier only resolves for a consumer at `packages/<name>/` of
+ * this workspace, which is not true of the forks that vendor this repo as a submodule. Note that
+ * this module is loaded by `node` as well as by vite -- vp resolves it through the `exports` map
+ * when it loads a consumer's task graph -- so intra-directory imports must name the file on disk
+ * (`./vitest-task-vite-config.ts`); the `.js` specifier only vite remaps would not resolve.
  *
  * `test` is a task rather than a package.json script so the scratch paths every `vitest run` writes
  * and then reads back can be kept out of the fingerprint: vp declines to cache a task that reads a
@@ -27,8 +31,12 @@ export type GlobWithBase = {
 /** The subset of a Vite+ task this factory produces. */
 export type VitestTask = {
   command: string | string[]
-  input: (GlobWithBase | { auto: boolean })[]
-  output: (GlobWithBase | { auto: boolean })[]
+  cache: {
+    input: (GlobWithBase | { auto: boolean })[]
+    output: (GlobWithBase | { auto: boolean })[]
+    env: string[]
+    untrackedEnv: string[]
+  }
 }
 
 /** A Vite+ config carrying a `run.tasks` map. */
@@ -39,8 +47,8 @@ export type RunTasksConfig = {
 }
 
 /**
- * Paths vitest generates and reads back on the next run, excluded from both the fingerprint and the
- * archived outputs:
+ * Paths vitest itself generates and reads back on the next run, excluded from both the fingerprint
+ * and the archived outputs:
  *
  * - `node_modules/.vite/vitest/<project-hash>/results.json` -- per-file durations and pass/fail,
  *   read by vitest's `BaseSequencer` to order failed-first and slowest-first. Distinct from the
@@ -48,10 +56,6 @@ export type RunTasksConfig = {
  * - `node_modules/.vite-temp/*.config.ts.timestamp-*.mjs` -- vite's default `bundle` config loader
  *   compiles a TS config to a temp module here, imports it, then unlinks it. The name carries a
  *   timestamp, so every run writes a fresh path and no run could ever match a previous fingerprint.
- * - `.wrangler/validate/**` -- the capnweb-validate build tree, regenerated and then loaded by any
- *   suite that starts a worker under `@cloudflare/vitest-pool-workers`. It is derived from sources
- *   that are tracked, so dropping it from the fingerprint loses no invalidation. `build:app`
- *   excludes the same tree, for the same reason.
  *
  * These are tool-managed scratch paths that Vite+'s own cooperative tracking already excludes for
  * `vp build` (`guide/automatic-data-tracking.md` names `node_modules/.vite-temp` as a path that
@@ -65,12 +69,152 @@ export type RunTasksConfig = {
  * This list is unlikely to be closed. When a test task stops caching, `vp run --last-details` names
  * the path it read and wrote -- add it here if it is shared, or at the call site if it is one
  * package's own (as `workshop-frontend`'s `dist/**` is).
+ *
+ * Not named `VITE_...`: `scripts/env-passthrough.test.ts` discovers env reads by matching
+ * `.VITE_<NAME>` property access, and a spread of a constant with that prefix reads as one.
  */
-const VITEST_SCRATCH_EXCLUSIONS: GlobWithBase[] = [
+export const VITEST_TOOL_SCRATCH_EXCLUSIONS: GlobWithBase[] = [
   { pattern: '!**/node_modules/.vite/**', base: 'workspace' },
   { pattern: '!**/node_modules/.vite-temp/**', base: 'workspace' },
+]
+
+/**
+ * The randomly-named scratch trees wrangler writes while a worker runs: `tmp/` holds each boot's
+ * bundle, `state/` the local Durable Object and KV storage. Neither is derived from anything
+ * tracked and both differ on every run, so a suite that starts a worker cannot cache without them
+ * excluded. A survey of every package's `.wrangler` shows these and `validate/` are its only
+ * children.
+ */
+export const WRANGLER_RUNTIME_SCRATCH_EXCLUSIONS: GlobWithBase[] = [
+  { pattern: '!**/.wrangler/tmp/**', base: 'workspace' },
+  { pattern: '!**/.wrangler/state/**', base: 'workspace' },
+]
+
+/**
+ * The default set: the vitest scratch paths plus the whole of `.wrangler`.
+ *
+ * `.wrangler/validate/**` is the capnweb-validate build tree, regenerated and then loaded by any
+ * suite that starts a worker under `@cloudflare/vitest-plugin`. For these packages it is
+ * derived from sources the same task already tracks, so dropping it from the fingerprint loses no
+ * invalidation -- and it must be dropped, because a task that reads a path it also wrote never
+ * caches. `build:app` excludes the same tree, for the same reason.
+ *
+ * `integration-tests` is the one package where that reasoning does not hold -- it reads another
+ * package's tree and never writes one -- so it opts out via `vitestTaskWithExclusions`.
+ */
+const DEFAULT_SCRATCH_EXCLUSIONS: GlobWithBase[] = [
+  ...VITEST_TOOL_SCRATCH_EXCLUSIONS,
   { pattern: '!**/.wrangler/**', base: 'workspace' },
 ]
+
+/**
+ * A command for one of the builders below: the bare string for the default watchdog thresholds, or
+ * the object form for a suite whose healthy silences run longer than `IDLE_TIMEOUT_SECONDS`.
+ *
+ * Overriding via the command keeps `withTestTimeout` unary, which it must be:
+ * `vitestTaskWithExclusions` passes it to `Array.prototype.map`, so a second positional parameter
+ * would silently receive the index.
+ */
+export type TestCommand = string | { command: string; idleSeconds: number }
+
+/**
+ * Seconds of silence after which a command is considered wedged. A healthy `vitest run` prints a
+ * line per completed test file, so silence -- not wall clock -- is what distinguishes a hang from a
+ * slow suite.
+ *
+ * Import-heavy suites can raise their idle allowance with `TestCommand`; slower environments can
+ * override both thresholds through the watchdog's declared environment variables.
+ */
+const IDLE_TIMEOUT_SECONDS = 60
+
+/** Wall-clock backstop, for a command that stays chatty while looping forever. */
+const TOTAL_TIMEOUT_SECONDS = 600
+
+/**
+ * Nothing under vitest bounds a wedged run -- its own timeouts are enforced inside the test worker
+ * that died, and Vite+ has no task timeout -- so a hung suite stalls the whole `vp run` until
+ * something outside kills it
+ *
+ * The watchdog is reached by *bin name*, not by path. The command string is part of the cache
+ * fingerprint, so an absolute path derived from `import.meta.url` would differ per checkout and per
+ * CI runner and destroy cache portability. A relative `../../scripts/with-timeout.ts` is portable
+ * but assumes the consumer sits at `packages/<name>/` of *this* workspace -- untrue for a fork that
+ * vendors this repo as a submodule, where it silently resolves to a `scripts/` that holds none of
+ * these builders. A bin name is both: fingerprint-stable and position-independent. vp puts the
+ * consuming package's `node_modules/.bin` on the task's PATH, so it resolves wherever the package
+ * lives, and a rename fails loudly with "Failed to find executable" rather than silently.
+ *
+ * Defaults are baked into the command; runtime overrides and the off switch are passed and
+ * fingerprinted through `TESTS_WITH_TIMEOUT_ENV`, so cached runs retain the requested policy.
+ */
+export const withTestTimeout = (command: TestCommand): string => {
+  const { command: argv, idleSeconds } =
+    typeof command === 'string' ? { command, idleSeconds: IDLE_TIMEOUT_SECONDS } : command
+  return `gadgets-with-timeout --idle ${idleSeconds} --max ${TOTAL_TIMEOUT_SECONDS} -- ${argv}`
+}
+
+/**
+ * The `cache.env` every task wrapping `withTestTimeout` must declare, if it is cached.
+ *
+ * The watchdog accepts positive-second idle/total overrides, or a non-empty disable switch.
+ * `cache.env` passes and fingerprints all three, so a run never replays a different timeout policy.
+ * Hand-declared watchdogged tasks must use this list too (or be uncached).
+ */
+export const TESTS_WITH_TIMEOUT_ENV: string[] = [
+  'TESTS_WITH_TIMEOUT_DISABLE',
+  'TESTS_WITH_TIMEOUT_IDLE_SECONDS',
+  'TESTS_WITH_TIMEOUT_MAX_SECONDS',
+]
+
+/**
+ * The worker budget `scripts/vp/run.ts` sets (see `scripts/vp/concurrency.ts`). Defined here
+ * because every package's task graph loads this module, which must not pull in that one.
+ */
+export const VITEST_MAX_WORKERS = 'VITEST_MAX_WORKERS'
+
+/**
+ * Forwards the worker budget to cached runs. Untracked: it changes the schedule, not the result,
+ * and fingerprinting it would stop `pnpm test` and a hand-typed `vp run -F <package> test` from
+ * sharing cache entries.
+ */
+export const VITEST_WORKERS_ENV: string[] = [VITEST_MAX_WORKERS]
+
+/**
+ * Whether a vitest command line sets its own worker count: `--maxWorkers`, or the one worker that
+ * `--no-file-parallelism`, `--fileParallelism false` and `--inspect` imply. vitest applies
+ * `VITEST_MAX_WORKERS` over all of them, so the budget is withheld from such a command.
+ */
+export const pinsVitestWorkerCount = (args: string): boolean =>
+  /(^|\s)--(max-?workers|inspect(-?brk)?|no-file-?parallelism)(=|\s|$)/i.test(args) ||
+  /(^|\s)--file-?parallelism(=|\s+)false(\s|$)/i.test(args)
+
+const pinsWorkerCount = (command: TestCommand): boolean =>
+  pinsVitestWorkerCount(typeof command === 'string' ? command : command.command)
+
+/**
+ * Pins vitest's `default` reporter unless the command names one. Under a coding agent vitest would
+ * pick its `agent` reporter, which prints nothing until the run ends, and the idle watchdog would
+ * kill any suite that outlasts `IDLE_TIMEOUT_SECONDS`.
+ */
+const withProgressReporter = (command: TestCommand): TestCommand =>
+  withVitestFlag(command, '--reporter=default', /(^|\s)--reporters?(=|\s)/)
+
+/**
+ * Turns off Vitest 5's `fsModuleCache` unless the command sets it. vp already caches the whole task,
+ * and every package's vitest shares the one cache under the workspace root's `node_modules`, so
+ * parallel tasks race on it: a run that invalidates the cache deletes the directory while another
+ * is writing into it, and that run fails to start with ENOTEMPTY.
+ */
+const withoutModuleCache = (command: TestCommand): TestCommand =>
+  withVitestFlag(command, '--no-fsModuleCache', /(^|\s)--(no-)?fs-?module-?cache(=|\s|$)/i)
+
+/** Appends `flag` to a vitest command whose arguments don't already match `alreadySet`. */
+const withVitestFlag = (command: TestCommand, flag: string, alreadySet: RegExp): TestCommand => {
+  const argv = typeof command === 'string' ? command : command.command
+  if (!/^vitest(\s|$)/.test(argv) || alreadySet.test(argv)) return command
+  const flagged = `${argv} ${flag}`
+  return typeof command === 'string' ? flagged : { ...command, command: flagged }
+}
 
 /**
  * The `test` task for a package, given the vitest invocation its `test` script used to hold.
@@ -79,16 +223,43 @@ const VITEST_SCRATCH_EXCLUSIONS: GlobWithBase[] = [
  *
  * `extraExclusions` adds package-specific patterns to the shared ones. Only `workshop-frontend`
  * needs any: nothing else here writes a build artifact into a directory its own tests track.
+ *
+ * Every command is wrapped in the watchdog above, including the codegen steps some packages bundle
+ * into this task (`workshop-backend`'s `node scripts/build-browser-runtime.ts`) -- those are equally
+ * unbounded.
  */
 export function vitestTask(
-  command: string | string[],
+  command: TestCommand | TestCommand[],
   extraExclusions: GlobWithBase[] = [],
 ): VitestTask {
-  const exclusions = [...VITEST_SCRATCH_EXCLUSIONS, ...extraExclusions]
+  return vitestTaskWithExclusions(command, [...DEFAULT_SCRATCH_EXCLUSIONS, ...extraExclusions])
+}
+
+/**
+ * Like `vitestTask`, but `exclusions` *replaces* the shared list instead of extending it, for a
+ * suite that needs a different `.wrangler` policy than the default above.
+ *
+ * Only `integration-tests` does: its worker is a prebuilt artifact under another package's
+ * `.wrangler/validate`, which is the only fingerprint that carries backend source into this suite.
+ * Excluding it would leave the task with no backend information at all.
+ */
+export function vitestTaskWithExclusions(
+  command: TestCommand | TestCommand[],
+  exclusions: GlobWithBase[],
+): VitestTask {
+  // One `cache` covers every command in the task, so a single pinned command forgoes the budget for
+  // its siblings too.
+  const pinned = [command].flat().some(pinsWorkerCount)
+  const wrap = (one: TestCommand): string =>
+    withTestTimeout(withoutModuleCache(withProgressReporter(one)))
   return {
-    command,
-    input: [{ auto: true }, ...exclusions],
-    output: [{ auto: true }, ...exclusions],
+    command: Array.isArray(command) ? command.map(wrap) : wrap(command),
+    cache: {
+      input: [{ auto: true }, ...exclusions],
+      output: [{ auto: true }, ...exclusions],
+      env: TESTS_WITH_TIMEOUT_ENV,
+      untrackedEnv: pinned ? [] : VITEST_WORKERS_ENV,
+    },
   }
 }
 
@@ -97,7 +268,7 @@ export function vitestTask(
  * Packages that do use `withVitestTask()` or `vitestTask()` instead.
  */
 export default function vitestTaskViteConfig(
-  command: string | string[],
+  command: TestCommand | TestCommand[],
   extraExclusions: GlobWithBase[] = [],
 ): { run: { tasks: { test: VitestTask } } } {
   return {
@@ -115,7 +286,7 @@ export default function vitestTaskViteConfig(
  */
 export function withVitestTask<T extends RunTasksConfig>(
   config: T,
-  command: string | string[],
+  command: TestCommand | TestCommand[],
 ): T & { run: { tasks: Record<string, unknown> } } {
   return {
     ...config,

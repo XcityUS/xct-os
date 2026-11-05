@@ -1,11 +1,29 @@
 import { Autocomplete, Field, h, RadioCards, Section, type ConfiguratorUISpec } from "@gadgets/configurator-ui";
 import type { CalendarConfiguratorRpc, CalendarConfiguratorValues } from "./calendar-configurator-types";
 
+/** The suggested calendar if the account can write it, with `primary` resolved to a stable ID. */
+async function writableCalendarId(suggested: string, ui: CalendarConfiguratorRpc) {
+  if (suggested === "primary") return ui.getPrimaryCalendarId();
+  return suggested && await ui.canWriteCalendar(suggested) ? suggested : undefined;
+}
+
 export default {
   initial: { availabilityMode: "thisCalendar" },
 
   isReady({ values }) {
-    return typeof values.calendarId === "string" && values.calendarId.length > 0;
+    return typeof values.calendarId === "string" &&
+      values.calendarId.length > 0 && values.calendarId !== "primary";
+  },
+
+  async initialValuesFromResourceUrl({ resourceUrl, ui }) {
+    const parsed = new URL(resourceUrl);
+    const availabilityMode = parsed.searchParams.get("availability") === "allVisible"
+      ? "allVisible" : "thisCalendar";
+    // A failed lookup leaves the calendar for the user to choose, without dropping the mode.
+    const calendarId = await writableCalendarId(
+      decodeURIComponent(parsed.pathname.split("/")[2] ?? ""), ui,
+    ).catch(() => undefined);
+    return { ...(calendarId ? { calendarId } : {}), availabilityMode };
   },
 
   resourceUrl({ values }) {

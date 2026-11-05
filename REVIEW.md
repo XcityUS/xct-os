@@ -1,8 +1,10 @@
 # Review Guidelines
 
-Guidance for AI reviewers reading pull requests in this repository. For how to build, test and
-work in the repo, see [AGENTS.md](./AGENTS.md); for what changes are accepted at all, see
-[CONTRIBUTING.md](./CONTRIBUTING.md).
+Guidance for AI reviewers reading pull requests in this repository. For what changes are
+accepted at all, see [CONTRIBUTING.md](./CONTRIBUTING.md).
+
+Before reviewing, read the package guide (`AGENTS.md` › Package guides) for every directory the diff
+touches. Cite a rule from the file you read it in.
 
 Review priority, highest first: the kernel bar, capability-security invariants, secret leakage
 through logs and errors, then everything else.
@@ -26,25 +28,35 @@ through logs and errors, then everything else.
 
 - A resource becomes "ambient" (auto-injected) only through user or admin configuration. A
   gatekeeper must never assert its own ambience.
-- `getGatekeeperClassFor()` in `packages/workshop-backend/src/user.ts` (not the same-named vendor
-  method each gatekeeper implements) is the single chokepoint where disabled gatekeepers and
-  resources are enforced before a capability is minted. Flag any new path that mints a gatekeeper
-  capability without going through it.
+- `#assertResourceEnabled()` in `packages/workshop-backend/src/user.ts` is the single chokepoint
+  where disabled gatekeepers and resources are enforced before a capability is minted, called by
+  both of that file's mints: `getGatekeeperClassFor()` (not the same-named vendor method each
+  gatekeeper implements) and `createResourceGatekeeper()`. Flag any new path that mints a
+  gatekeeper capability without going through it.
 - Authentication and authorization config (`AUTH_GATEKEEPERS`, `DISABLE_PASSWORD_AUTH`) is
   deliberately env-var driven in `auth/config.ts` and must **not** move into `AdminConfig`, so a
   compromised admin session cannot change it. Reject changes that relocate it.
 - `AdminSettings` is the only writer of the authoritative `AdminConfig`. Other code reads through
-  `readAdminConfig(env)`.
+  `readAdminConfig(env)`. The admin-settings conventions are in `packages/workshop-backend/AGENTS.md`.
 - In `packages/mcp-shared/`, `tools.ts` is the trust boundary: nothing outside it may read a tool's
   annotations, a tool is an observation only when the server declares `readOnlyHint: true`, and
   auto-applying a write additionally requires a `vetted` endpoint. Every SDK OAuth operation must be
-  given `sdkFetch(...)` so endpoint and SSRF checks survive redirects.
-- `format-blueprints/`: a `blueprintId` is never edited after deploy — installs and promotion are
+  given `sdkFetch(...)` so endpoint and SSRF checks survive redirects. Full rule:
+  `packages/mcp-shared/AGENTS.md`.
+- `packages/bundled-blueprints/blueprints/`: a `blueprintId` is never edited after deploy — installs and promotion are
   keyed on it, so a rename orphans the old entry.
+
+## Gatekeepers
+
+Correctness is not enough. Pressure-test the agent-facing API
+(`packages/gatekeeper-*/src/*types.d.ts`): does the shape make sense, does it cover the most common
+user stories, what would you do differently? Check that the seams (resource granularities, bindings,
+sessions) partition authority along the lines users actually grant. The checklist is "Reviewing a
+gatekeeper" in `.agents/skills/write-gatekeeper/SKILL.md`.
 
 ## Logging, errors and secrets
 
-- Server code logs through `@gadgets/backend-utils/logger` with a module-scoped logger and a stable
+- Server code logs through `@gadgets/observability/logger` with a module-scoped logger and a stable
   dot-separated `component` (plus `vendorId` for gatekeepers). Caught values are passed as `error`.
 - Never log or report secrets, prompts, headers, tokens, or request/response bodies. Exception
   messages and stacks reach the external Reporter, so the same rule applies to anything thrown or
@@ -57,6 +69,9 @@ through logs and errors, then everything else.
   than trimmed: a share link's fragment is a bearer capability and an `href` retains credentials.
 - Automatic error capture belongs only in trusted first-party surfaces, never in gadget or
   user-authored code.
+
+The full rules are in `packages/observability/AGENTS.md` (server) and
+`packages/error-reporting/AGENTS.md` (frontend).
 
 ## Cap'n Web RPC
 
@@ -83,13 +98,15 @@ These break silently rather than loudly, so they are worth flagging even when th
 - Do not add `incremental` to a tsconfig, do not reintroduce a root script calling
   `pnpm run --recursive`, and do not remove `scripts/assert-workerd.ts` from a package's
   `setupFiles` to make a suite green.
-- `pnpm test`'s `--filter '!cloudflare-os'` hardcodes the root package name; renaming the root
-  silently doubles the scripts suite.
+- `pnpm test`'s `--filter=!cloudflare-os` hardcodes the root package name; renaming the root
+  silently doubles the scripts suite. Keep it spelled with `=` and unquoted: `cmd.exe` keeps single
+  quotes literal, so a quoted filter matches nothing on Windows and the script exits 0 having run
+  nothing.
 - After an intentional release-manifest change, the golden file must be regenerated
   (`UPDATE_GOLDEN=1 node --test scripts/release/manifest-lib.test.ts`) and its diff reviewed.
 - A new installable gatekeeper that takes no third-party OAuth credentials belongs in
   `NO_DEFAULT_CRED_INPUTS`; a spurious default secret input makes it uninstallable in the deploy
-  wizard.
+  wizard. See `scripts/release/AGENTS.md`.
 
 ## Outside contributions
 
@@ -111,7 +128,10 @@ contributor to broaden scope, add refactors, or take on adjacent cleanup.
 ## Ignore during review
 
 - Generated files, which are gitignored and rebuilt: `packages/*/src/generated/**` (`app.txt`,
-  `*-configurator-ui.*`, `format-blueprints.ts`, `browser-export-runtime.txt`) and any `dist/`.
+  `*-configurator-ui.*`, `bundled-blueprints.ts`, `browser-export-runtime.txt`) and any `dist/`.
 - `pnpm-lock.yaml`, unless the change is itself a dependency change — then check it against the
   `minimumReleaseAge` supply-chain policy in `pnpm-workspace.yaml`.
-- Committed `format-blueprints/*.gadget` archives, which are opaque data.
+- Committed `*.gadget` archives in a blueprint directory, which are opaque data.
+- `packages/*/wrangler.jsonc`, generated from the `cloudflare.config.ts` beside it and checked by
+  `pnpm configs:check`; review the config instead.
+- `packages/*/worker-configuration.d.ts`, which is `wrangler types` output.

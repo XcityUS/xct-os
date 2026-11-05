@@ -1,5 +1,9 @@
-import { abortAllDurableObjects, runInDurableObject } from "cloudflare:test";
-import { exports } from "cloudflare:workers";
+import {
+  abortAllDurableObjects,
+  createExecutionContext,
+  runInDurableObject,
+} from "cloudflare:test";
+import { env, exports } from "cloudflare:workers";
 import { newWebSocketRpcSession, type RpcStub } from "capnweb";
 import {
   createOpenGadgetError,
@@ -9,6 +13,7 @@ import {
   type OpenGadgetErrorCode,
   type PublicApi,
 } from "@gadgets/workshop-shared/api";
+import server from "../src/server";
 import { describe, expect, it } from "vitest";
 
 type CodedError = Error & { code?: unknown };
@@ -20,6 +25,9 @@ const USER_DO_ABORT_REASON = "user-DO reset injected by test";
 const EXPECTED_MESSAGES: Record<OpenGadgetErrorCode, string> = {
   [OPEN_GADGET_ERROR_CODES.workspaceNotFound]: "Workspace not found.",
   [OPEN_GADGET_ERROR_CODES.workspaceAccessDenied]: "You don't have access to this workspace.",
+  [OPEN_GADGET_ERROR_CODES.shareLinksDisabled]:
+      "Share links are disabled for this workspace because it contains sensitive data. " +
+      "The owner must add each person directly.",
 };
 
 function username(prefix: string): string {
@@ -46,9 +54,11 @@ function expectRpcCode(error: CodedError, code: OpenGadgetErrorCode): void {
 }
 
 async function connect(): Promise<RpcStub<PublicApi>> {
-  const response = await exports.default.fetch(new Request("https://workshop.invalid/api", {
+  // A service-binding fetch context ends with the upgrade response, before the socket callbacks.
+  // Invoke the handler directly so the WebSocket session shares the test's execution context.
+  const response = await server.fetch(new Request("https://workshop.invalid/api", {
     headers: { Upgrade: "websocket" },
-  }));
+  }), env, createExecutionContext());
 
   expect(response.status).toBe(101);
   const socket = response.webSocket;
@@ -139,7 +149,7 @@ describe.skip("openGadget errors across native RPC and Cap'n Web", () => {
 });
 
 // In production, workerd tags rejections from a reset DO with the structured flags
-// do-retry.ts reads. Locally, vitest-pool-workers aborts reject FLAGLESS — this test pins that, so if a
+// do-retry.ts reads. Locally, `@cloudflare/vitest-plugin` aborts reject FLAGLESS — this test pins that, so if a
 // future pool upgrade starts attaching the production flags, it fails and the flag paths can
 // graduate from synthetic unit tests to real-reset integration tests. abortAllDurableObjects()
 // is the non-graceful teardown (deliberately not evictDurableObject(), which never breaks a
@@ -187,7 +197,7 @@ describe("user-DO reset flags", () => {
 // The asymmetric reset a retained-stub design can't absorb: the USER DO resets while the
 // workspace (Overseer) DO keeps running. The Overseer used to mint its owner/clientUser stubs
 // once at open(); after the user DO's incarnation died, every user-DO-carrying call on the
-// still-open session — newChat, listModels, createGadget, setPinned — failed against the
+// still-open session — newChat, listModels, createGadget — failed against the
 // poisoned stub until the WebSocket reconnected. The session capabilities now mint a fresh stub
 // per call, so the first post-reset call simply restarts the object — no reset flags needed,
 // which is also why this is testable despite local aborts rejecting flagless (see above).
@@ -218,22 +228,5 @@ describe("workspace session across a user-DO-only reset", () => {
     // GadgetClient capability that must also be born with the fresh-stub design.
     using gadget = await workspace.createGadget("post-reset gadget");
     expect(await gadget.getTitle()).toBe("post-reset gadget");
-  });
-});
-
-// Smoke the paged action-log read against a real workspace DO: proves the @validateRpc wiring
-// accepts the option shape (the semantics live in __tests__/action-log-pagination.test.ts).
-// Runs after the reset tests so this session's DOs aren't torn down by abortAllDurableObjects().
-describe("paged action-log reads", () => {
-  it("answers listActions on a fresh workspace", async () => {
-    using publicApi = await connect();
-    const account = await createAccount(publicApi, "actionlog");
-    using authenticated = await publicApi.authenticate(account.token);
-    using workspace = await authenticated.newGadget();
-
-    expect(await workspace.listActions({ filter: "action" })).toEqual({ entries: [] });
-    // The pending filter is a distinct union member; this proves the regenerated validator
-    // accepts it end to end.
-    expect(await workspace.listActions({ filter: "pending" })).toEqual({ entries: [] });
   });
 });

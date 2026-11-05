@@ -1,8 +1,8 @@
-import { Cursor } from "@gadgets/workshop-shared/gatekeeper";
-
 /** Forward-only paginated results. Call `next()` until it returns `null`; dispose the cursor when
  *  finished, including when stopping early. */
-export type { Cursor };
+export interface Cursor<T> {
+  next(): Promise<T[] | null>;
+}
 
 // ── Plain data types ────────────────────────────────────────────────
 
@@ -133,11 +133,11 @@ export interface SlackWorkspaceSession {
   /** List the members of the workspace. */
   listUsers(): Promise<Cursor<SlackUser>>;
 
-  /** Look up a single user by their Slack user ID. */
+  /** Look up a workspace member by their Slack user ID. Throws for users outside this directory. */
   getUser(userId: string): Promise<SlackUser>;
 
   /** Get a capability to a specific conversation (channel or DM) by its Slack ID. Dispose it when
-   *  finished. Throws if the connected user cannot access it. */
+   *  finished. Throws if it is outside this workspace or the connected user cannot access it. */
   getConversation(conversationId: string): Promise<SlackConversation>;
 
   /** Search messages across the workspace using Slack search syntax (e.g.

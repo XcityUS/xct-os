@@ -5,11 +5,13 @@ import {
   ApprovalQueue, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions,
   AccountDescription, SupportedResource, ResourceConfiguratorFrame, ActionKind, Cursor,
   GatekeeperUserVerifier, ObservationDescription,
-  stripTrailingSlashes,
+  stripTrailingSlashes, workerVersionTag, type ConnectHandoff,
 } from "@gadgets/workshop-shared/gatekeeper";
+import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
+import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import {
-  SlackApi, SlackApiError, SlackAccessToken, SlackConversationTypeFilter, exchangeAuthCode,
-  refreshAccessToken, revokeToken,
+  SlackApi, SlackApiError, SlackAccessToken, SlackConversationTypeFilter, SlackOAuthGrant,
+  exchangeAuthCode, refreshAccessToken, revokeToken, isWorkspaceId, type SlackInstallation,
 } from "./slack-api";
 import {
   SlackConversation, SlackConversationEntry, SlackConversationInfo, SlackMessage,
@@ -31,6 +33,12 @@ type StoredNonce = {
   value: string;
   expiresAt: number;
   stage: "initiation" | "oauth";
+  /**
+   * Set when this flow reconnects an existing account, so its grant is staged rather than made
+   * live. The mode travels with the flow instead of living on the account: committing one
+   * reconnect while another is in flight must not change how that other flow lands.
+   */
+  reconnect?: true;
 };
 
 const NONCE_BYTES = 32;
@@ -108,7 +116,7 @@ const WORKSPACE_RESOURCE: SupportedResource = {
   title: "Slack Workspace",
   description:
       "Read channels, direct messages, members, and search across the whole connected workspace. " +
-      "The workspace is auto-detected from the connected account — no URL or ID need be supplied.",
+      "Choose a workspace the connected user and Slack app can access.",
   grantable: true,
 };
 
@@ -133,18 +141,26 @@ const CONVERSATION_READ_SCOPES = [
   "mpim:read", "mpim:history",
 ];
 
-const RESOURCE_SCOPES: { resource: SupportedResource; scopes: string[] }[] = [
+const RESOURCE_SCOPES: {
+  resource: SupportedResource;
+  scopes: string[];
+  /** Prior consent to these scopes can be upgraded through a new OAuth consent, never a read. */
+  legacyScopes?: string[];
+}[] = [
   {
     resource: WORKSPACE_RESOURCE,
     scopes: ["team:read", ...CONVERSATION_READ_SCOPES, "search:read"],
   },
   {
     resource: CONVERSATION_RESOURCE,
-    scopes: [...CONVERSATION_READ_SCOPES, "search:read"],
+    scopes: ["team:read", ...CONVERSATION_READ_SCOPES, "search:read"],
+    legacyScopes: [...CONVERSATION_READ_SCOPES, "search:read"],
   },
   {
     resource: THREAD_RESOURCE,
-    scopes: ["channels:history", "groups:history", "im:history", "mpim:history"],
+    // Workspace resolution and channel membership verification also need metadata read scopes.
+    scopes: ["team:read", ...CONVERSATION_READ_SCOPES],
+    legacyScopes: CONVERSATION_READ_SCOPES.filter(scope => scope.endsWith(":history")),
   },
 ];
 
@@ -171,25 +187,18 @@ function resourceUrlPatternsToScopes(resourceUrlPatterns?: string[]): string[] {
   return [...scopes];
 }
 
-function grantedResourcesFromScopes(grantedScopes: string[]): string[] {
+function grantedResourcesFromScopes(grantedScopes: string[], forReconnect = false): string[] {
   let granted = new Set(grantedScopes);
-  // Expose a resource only when every required Slack scope was granted.
+  // Reads need all current scopes. Reconnect may retain a legacy resource only to request consent.
   return RESOURCE_SCOPES
-      .filter(entry => entry.scopes.every(scope => granted.has(scope)))
+      .filter(entry => (forReconnect ? entry.legacyScopes ?? entry.scopes : entry.scopes)
+          .every(scope => granted.has(scope)))
       .map(entry => entry.resource.urlPattern);
 }
 
 const SLACK_LOGO_URL = `data:image/svg+xml,${encodeURIComponent(SLACK_LOGO_SVG)}`;
 
 // ── HTML shown in the OAuth popup ───────────────────────────────────
-
-const SELF_CLOSING_HTML = `<!DOCTYPE html>
-<html lang="en">
-  <body>
-    <script type="text/javascript">window.close();</script>
-    <p>Authorization complete. You may close this tab and return to Xcity OS.
-  </body>
-</html>`;
 
 const INVALID_LINK_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -263,12 +272,12 @@ export default {
       if (!code) return new Response("Error: no 'code' provided");
 
       let stub = ctx.exports.UserAccount.get(ctx.exports.UserAccount.idFromString(doId));
-      if (!await stub.acceptAuthCode(code, oauthNonce)) {
+      let handoff = await stub.acceptAuthCode(code, oauthNonce);
+      if (!handoff) {
         return new Response(INVALID_LINK_HTML,
             { headers: { "Content-Type": "text/html; charset=utf-8" } });
       }
-      return new Response(SELF_CLOSING_HTML,
-          { headers: { "Content-Type": "text/html; charset=utf-8" } });
+      return htmlResponse(connectHandoffPageHtml(handoff));
     } else {
       return new Response("Not Found", { status: 404 });
     }
@@ -291,6 +300,10 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
           "channels, direct messages, and threads you can see. Build agents that summarize " +
           "conversations, monitor channels, or search across your Slack history.",
     };
+  }
+
+  async versionTag(): Promise<string | undefined> {
+    return workerVersionTag(this.env);
   }
 
   async connectAccount(callback: Fetcher<GatekeeperConnectCallback>,
@@ -347,16 +360,16 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   /**
-   * Prepare for a reconnect/expansion flow: the next acceptAuthCode() replaces credentials and
-   * notifies via credentialsRestored() instead of complete().
+   * Prepare for a reconnect/expansion flow: the next acceptAuthCode() stages the new credentials
+   * and notifies via reconnectComplete() instead of complete(); commitReconnect() makes them live.
    */
   async prepareReconnect(initiationNonce: string, requestedScopes: string[]) {
-    this.ctx.storage.kv.put<boolean>("reconnecting", true);
     this.ctx.storage.kv.put<string[]>("requestedScopes", requestedScopes);
     this.ctx.storage.kv.put<StoredNonce>("nonce", {
       value: initiationNonce,
       expiresAt: Date.now() + INITIATION_NONCE_LIFETIME_MS,
       stage: "initiation",
+      reconnect: true,
     });
   }
 
@@ -364,6 +377,13 @@ export class UserAccount extends DurableObject<Env> {
     let granted = this.ctx.storage.kv.get<string[]>("grantedScopes");
     if (granted === undefined) return SUPPORTED_RESOURCES.map(resource => resource.urlPattern);
     return grantedResourcesFromScopes(granted);
+  }
+
+  /** Preserve legacy narrow grants when requesting new consent for metadata scopes. */
+  async getResourceUrlPatternsForReconnect(): Promise<string[]> {
+    let granted = this.ctx.storage.kv.get<string[]>("grantedScopes");
+    return granted === undefined ? SUPPORTED_RESOURCES.map(resource => resource.urlPattern)
+        : grantedResourcesFromScopes(granted, true);
   }
 
   async beginOAuthFlow(initiationNonce: string)
@@ -378,19 +398,25 @@ export class UserAccount extends DurableObject<Env> {
       value: oauthNonce,
       expiresAt: Date.now() + OAUTH_NONCE_LIFETIME_MS,
       stage: "oauth",
+      reconnect: stored.reconnect,
     });
     let scopes = this.ctx.storage.kv.get<string[]>("requestedScopes") ?? resourceUrlPatternsToScopes();
     return { oauthNonce, scopes };
   }
 
-  async acceptAuthCode(code: string, oauthNonce: string): Promise<boolean> {
+  /**
+   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on, or
+   * null when the callback's nonce doesn't match.
+   */
+  async acceptAuthCode(code: string, oauthNonce: string): Promise<ConnectHandoff | null> {
     let stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
     if (!stored || stored.stage !== "oauth" ||
         Date.now() >= stored.expiresAt || !constantTimeEqual(stored.value, oauthNonce)) {
-      return false;
+      return null;
     }
     // Consume OAuth state before the network exchange to prevent callback replay.
     this.ctx.storage.kv.delete("nonce");
+    let reconnect = stored.reconnect;
 
     let completion = await this.#updateCredentials(async () => {
       if (!this.env.CLIENT_ID || !this.env.CLIENT_SECRET) {
@@ -405,27 +431,25 @@ export class UserAccount extends DurableObject<Env> {
       let grant = await exchangeAuthCode(
           code, this.env.CLIENT_ID, this.env.CLIENT_SECRET, getBaseUrl(this.env) + "/oauth");
 
-      this.ctx.storage.kv.put<SlackAccessToken>("accessToken", grant.accessToken);
-      if (grant.refreshToken) this.ctx.storage.kv.put<string>("refreshToken", grant.refreshToken);
-      this.ctx.storage.kv.put<string[]>("grantedScopes", grant.grantedScopes);
-      this.ctx.storage.kv.put<string>("userId", grant.userId);
-      this.ctx.storage.kv.put<string>("teamId", grant.teamId);
-      if (grant.teamName) this.ctx.storage.kv.put<string>("teamName", grant.teamName);
+      // The reconnect URL is a bearer capability, so the new grant is only staged until the Workshop
+      // has confirmed the browser that finished the flow is the owner's (see commitReconnect). Bound
+      // gadgets keep reading the current token meanwhile.
+      let stageId = reconnect
+          ? stageCredentials(this.ctx.storage.kv, grant, Date.now())
+          : undefined;
+      if (stageId === undefined) this.#writeGrant(grant);
       this.ctx.storage.kv.delete("requestedScopes");
-
-      let reconnecting = this.ctx.storage.kv.get<boolean>("reconnecting");
-      if (reconnecting) {
-        this.ctx.storage.kv.delete("reconnecting");
-      }
-      return { callback, grant, reconnecting: !!reconnecting };
+      return { callback, grant, stageId };
     });
 
-    if (completion.reconnecting) {
-      await completion.callback.credentialsRestored(completion.grant.accessToken.expires);
+    let handoff: ConnectHandoff;
+    if (completion.stageId !== undefined) {
+      handoff = await completion.callback.reconnectComplete(
+          completion.stageId, completion.grant.accessToken.expires);
     } else {
       try {
         let props: SlackUserImplProps = { userObjectId: this.ctx.id.toString() };
-        await completion.callback.complete(
+        handoff = await completion.callback.complete(
             this.ctx.exports.SlackUserImpl({ props }), completion.grant.accessToken.expires);
       } catch (err) {
         await this.#updateCredentials(async () => {
@@ -438,7 +462,34 @@ export class UserAccount extends DurableObject<Env> {
         throw err;
       }
     }
-    return true;
+    return handoff;
+  }
+
+  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
+  async commitReconnect(stageId: string): Promise<void> {
+    await this.#updateCredentials(async () => {
+      let grant = commitStagedCredentials<SlackOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
+      if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+      this.#writeGrant(grant);
+    });
+  }
+
+  #writeGrant(grant: SlackOAuthGrant) {
+    this.ctx.storage.kv.put<SlackAccessToken>("accessToken", grant.accessToken);
+    if (grant.refreshToken) this.ctx.storage.kv.put<string>("refreshToken", grant.refreshToken);
+    this.ctx.storage.kv.put<string[]>("grantedScopes", grant.grantedScopes);
+    this.ctx.storage.kv.put<string>("userId", grant.userId);
+    this.ctx.storage.kv.put<string>("teamId", grant.teamId);
+    if (grant.teamName) this.ctx.storage.kv.put<string>("teamName", grant.teamName);
+    else this.ctx.storage.kv.delete("teamName");
+    // A reconnect staged before this version may not contain the installation flag.
+    if (typeof grant.isEnterpriseInstall === "boolean") {
+      this.ctx.storage.kv.put("isEnterpriseInstall", grant.isEnterpriseInstall);
+    } else {
+      this.ctx.storage.kv.delete("isEnterpriseInstall");
+    }
+    if (grant.enterpriseId) this.ctx.storage.kv.put("enterpriseId", grant.enterpriseId);
+    else this.ctx.storage.kv.delete("enterpriseId");
   }
 
   async getUserId(): Promise<string> {
@@ -447,6 +498,15 @@ export class UserAccount extends DurableObject<Env> {
 
   async getTeamId(): Promise<string> {
     return this.ctx.storage.kv.get<string>("teamId") ?? "";
+  }
+
+  /** Installation identity is distinct from the workspace selected by a resource binding. */
+  async getInstallation(): Promise<SlackInstallation> {
+    return {
+      teamId: await this.getTeamId(),
+      isEnterpriseInstall: this.ctx.storage.kv.get<boolean>("isEnterpriseInstall"),
+      enterpriseId: this.ctx.storage.kv.get<string>("enterpriseId"),
+    };
   }
 
   /** Refresh rotating tokens shortly before expiry. */
@@ -519,6 +579,48 @@ function createAccessTokenGetter(
   };
 }
 
+function accountApi(account: DurableObjectStub<UserAccount>): SlackApi {
+  return new SlackApi(createAccessTokenGetter(() => account), {
+    installation: () => account.getInstallation(),
+  });
+}
+
+// Legacy facets did not retain the workspace from their URL. Recover only a known workspace or
+// an unambiguous selection, then persist it independently of credentials/reconnects.
+async function boundWorkspaceId(
+    ctx: DurableObjectState, account: DurableObjectStub<UserAccount>, selected?: string,
+    domain?: string): Promise<string> {
+  let pinned = ctx.storage.kv.get<string>("boundTeamId");
+  if (pinned) return pinned;
+  let teamId = selected;
+  if (!teamId) {
+    let legacyTeam = await account.getTeamId();
+    if (isWorkspaceId(legacyTeam)) teamId = legacyTeam;
+    else if (domain) teamId = await accountApi(account).workspaceIdForDomain(domain);
+    else {
+      let workspaces = await accountApi(account).listWorkspaces();
+      if (workspaces.length === 1) teamId = workspaces[0].id;
+    }
+  }
+  if (!isWorkspaceId(teamId)) {
+    throw new Error("This legacy Slack connection has no unambiguous workspace. Add it again and choose a workspace.");
+  }
+  // Another concurrent invocation may have completed recovery while the provider calls awaited.
+  pinned = ctx.storage.kv.get<string>("boundTeamId");
+  if (pinned) return pinned;
+  ctx.storage.kv.put("boundTeamId", teamId);
+  return teamId;
+}
+
+function boundApi(
+    ctx: DurableObjectState, account: DurableObjectStub<UserAccount>, teamId?: string,
+    domain?: string): SlackApi {
+  return new SlackApi(createAccessTokenGetter(() => account), {
+    installation: () => account.getInstallation(),
+    teamId: () => boundWorkspaceId(ctx, account, teamId, domain),
+  });
+}
+
 // ── SlackUserImpl: maps resource URLs to gatekeeper classes ─────────
 
 type SlackUserImplProps = {
@@ -534,16 +636,17 @@ export class SlackUserImpl extends WorkerEntrypoint<Env, SlackUserImplProps>
   }
 
   #api(): SlackApi {
-    return new SlackApi(createAccessTokenGetter(() => this.#account()));
+    return accountApi(this.#account());
   }
 
   async describe(): Promise<AccountDescription> {
     let account = this.#account();
     let userIdPromise = account.getUserId();
-    let teamIdPromise = account.getTeamId();
+    let installationPromise = account.getInstallation();
     let grantedPromise = account.getGrantedResourceUrlPatterns();
+    let installation = await installationPromise;
     let description = await this.#api().getAccountDescription(
-        await userIdPromise, await teamIdPromise);
+        await userIdPromise, installation);
     description.grantedResourceUrlPatterns = await grantedPromise;
     return description;
   }
@@ -575,6 +678,7 @@ export class SlackUserImpl extends WorkerEntrypoint<Env, SlackUserImplProps>
         conversationId,
         threadTs,
         permalink: url,
+        teamId: await this.#api().workspaceIdForDomain(parsed.hostname.slice(0, -".slack.com".length)),
       };
       return {
         class: this.ctx.exports.SlackThreadGatekeeperImpl({ props }),
@@ -584,18 +688,21 @@ export class SlackUserImpl extends WorkerEntrypoint<Env, SlackUserImplProps>
 
     if (parsed.hostname === "app.slack.com" && parsed.pathname.startsWith("/client/")) {
       let segments = parsed.pathname.split("/").filter(Boolean);
+      let teamId = decodeURIComponent(segments[1] ?? "");
+      if (!isWorkspaceId(teamId)) throw new Error("Select a Slack workspace, not an enterprise.");
       let conversationId = segments[2];
       if (conversationId) {
         let props: SlackConversationGatekeeperImplProps = {
           userObjectId: this.ctx.props.userObjectId,
           conversationId: decodeURIComponent(conversationId),
+          teamId,
         };
         return {
           class: this.ctx.exports.SlackConversationGatekeeperImpl({ props }),
           resource: CONVERSATION_RESOURCE,
         };
       }
-      let props: SlackWorkspaceGatekeeperImplProps = { userObjectId: this.ctx.props.userObjectId };
+      let props: SlackWorkspaceGatekeeperImplProps = { userObjectId: this.ctx.props.userObjectId, teamId };
       return {
         class: this.ctx.exports.SlackWorkspaceGatekeeperImpl({ props }),
         resource: WORKSPACE_RESOURCE,
@@ -613,10 +720,9 @@ export class SlackUserImpl extends WorkerEntrypoint<Env, SlackUserImplProps>
       };
     }
     if (resourceUrlPattern === CONVERSATION_RESOURCE.urlPattern) {
-      let teamId = await this.#account().getTeamId();
       return {
         iframeHtml: CONVERSATION_CONFIGURATOR_HTML,
-        ui: new RpcStub(new ConversationConfiguratorUI(this.#api(), teamId)),
+        ui: new RpcStub(new ConversationConfiguratorUI(this.#api())),
       };
     }
     if (resourceUrlPattern === THREAD_RESOURCE.urlPattern) {
@@ -631,9 +737,13 @@ export class SlackUserImpl extends WorkerEntrypoint<Env, SlackUserImplProps>
   async reconnect(): Promise<{ url: string }> {
     let account = this.#account();
     let initiationNonce = generateNonce();
-    let requestedScopes = resourceUrlPatternsToScopes(await account.getGrantedResourceUrlPatterns());
+    let requestedScopes = resourceUrlPatternsToScopes(await account.getResourceUrlPatternsForReconnect());
     await account.prepareReconnect(initiationNonce, requestedScopes);
     return { url: `${getBaseUrl(this.env)}/${this.ctx.props.userObjectId}/${initiationNonce}` };
+  }
+
+  async commitReconnect(stageId: string): Promise<void> {
+    await this.#account().commitReconnect(stageId);
   }
 
   async ensureResources(resourceUrlPatterns: string[]): Promise<{ url?: string }> {
@@ -641,7 +751,7 @@ export class SlackUserImpl extends WorkerEntrypoint<Env, SlackUserImplProps>
     let granted = new Set(await account.getGrantedResourceUrlPatterns());
     if (resourceUrlPatterns.every(pattern => granted.has(pattern))) return {};
 
-    let union = new Set([...granted, ...resourceUrlPatterns]);
+    let union = new Set([...await account.getResourceUrlPatternsForReconnect(), ...resourceUrlPatterns]);
     let requestedScopes = resourceUrlPatternsToScopes([...union]);
     let initiationNonce = generateNonce();
     await account.prepareReconnect(initiationNonce, requestedScopes);
@@ -671,11 +781,11 @@ export class SlackUserImpl extends WorkerEntrypoint<Env, SlackUserImplProps>
 // (each is one conversation, and a thread inherits its conversation's ACL), and "data-set tracking
 // (by conversation)" for workspace bindings (see the gatekeeper impls' observer methods). Both
 // reduce to per-observer access questions answered against the observer's *own* token:
-//   - getTeamId(): the workspace the observer's token belongs to, gating workspace membership.
+//   - hasWorkspaceAccess(id): the app is deployed there and the observer belongs to that workspace.
 //   - hasConversationAccess(id): conversations.info succeeds for the observer. Public channels
 //     resolve for any workspace member; private channels, DMs, and group DMs resolve only for
-//     members/participants — honoring Slack's ACL. Conversation IDs are globally unique, so this
-//     also rejects a conversation in a different workspace.
+//     members/participants — honoring Slack's ACL. The selected workspace is checked independently
+//     because an org token may resolve conversations in several workspaces.
 // The overseer only ever hands this verifier back to a Slack gatekeeper, which may therefore trust
 // the boolean results.
 
@@ -688,8 +798,8 @@ type SlackVerifierProps = {
  * part of the generic GatekeeperUserVerifier contract.
  */
 export interface SlackVerifierApi extends GatekeeperUserVerifier {
-  getTeamId(): Promise<string | null>;
-  hasConversationAccess(conversationId: string): Promise<boolean>;
+  hasWorkspaceAccess(teamId: string): Promise<boolean>;
+  hasConversationAccess(conversationId: string, teamId: string): Promise<boolean>;
 }
 
 @validateRpc()
@@ -698,26 +808,25 @@ export class SlackVerifier extends WorkerEntrypoint<Env, SlackVerifierProps>
   #api(): SlackApi {
     let account = this.ctx.exports.UserAccount.get(
         this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
-    return new SlackApi(createAccessTokenGetter(() => account));
+    return accountApi(account);
   }
 
   /**
-   * The observer's workspace team id, or null if their token is broken/expired (a token that can't
-   * demonstrate access is treated as "no access" rather than failing the whole open; the observer is
-   * re-checked on their next open).
+   * The observer's membership in a selected workspace, or false if their token cannot demonstrate
+   * access. The observer is re-checked on their next open.
    */
-  async getTeamId(): Promise<string | null> {
+  async hasWorkspaceAccess(teamId: string): Promise<boolean> {
     try {
-      return (await this.#api().authedTeamId()) || null;
+      return await this.#api().hasWorkspaceAccess(teamId);
     } catch (error) {
-      if (error instanceof SlackApiError && error.isAuthError) return null;
+      if (error instanceof SlackApiError && (error.isAuthError || error.isAccessError)) return false;
       throw error;
     }
   }
 
-  async hasConversationAccess(conversationId: string): Promise<boolean> {
+  async hasConversationAccess(conversationId: string, teamId: string): Promise<boolean> {
     try {
-      await this.#api().getConversationInfo(conversationId);
+      await this.#api().forWorkspace(teamId).getConversationInfo(conversationId);
       return true;
     } catch (error) {
       if (error instanceof SlackApiError && (error.isAccessError || error.isAuthError)) return false;
@@ -856,6 +965,7 @@ function unreachableAction(): never {
 
 type SlackWorkspaceGatekeeperImplProps = {
   userObjectId: string;
+  teamId?: string;
 };
 
 // A tracked conversation is "pending" while an observation revealing it is in flight, and "observed"
@@ -865,7 +975,6 @@ type TrackedConversationState = "pending" | "observed";
 @validateRpc()
 export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorkspaceGatekeeperImplProps>
     implements Gatekeeper<SlackWorkspaceSession> {
-  #apiInstance?: SlackApi;
 
   #account(): DurableObjectStub<UserAccount> {
     return this.ctx.exports.UserAccount.get(
@@ -873,7 +982,7 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
   }
 
   #api(): SlackApi {
-    return this.#apiInstance ??= new SlackApi(createAccessTokenGetter(() => this.#account()));
+    return boundApi(this.ctx, this.#account(), this.ctx.props.teamId);
   }
 
   async describe(): Promise<ResourceDescription> {
@@ -947,8 +1056,9 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
       }
     }
     let excluded: string[] = [];
+    let teamId = await this.#api().workspaceTeamId();
     for (let [id, verifier] of this.#listObservers()) {
-      let access = await mapWithConcurrency(pending, cid => verifier.hasConversationAccess(cid));
+      let access = await mapWithConcurrency(pending, cid => verifier.hasConversationAccess(cid, teamId));
       if (!access.every(hasAccess => hasAccess)) excluded.push(id);
     }
     return {
@@ -978,9 +1088,8 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
 
   async addObserver(id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
     let verifier = user as unknown as Fetcher<SlackVerifierApi>;
-    let boundTeamId = await this.#account().getTeamId();
-    let observerTeamId = await verifier.getTeamId();
-    if (!observerTeamId || observerTeamId !== boundTeamId) {
+    let boundTeamId = await this.#api().workspaceTeamId();
+    if (!(await verifier.hasWorkspaceAccess(boundTeamId))) {
       throw new Error(
           "This collaborator is not a member of the connected Slack workspace, so they cannot be " +
           "allowed to observe it.");
@@ -994,7 +1103,7 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
         return;
       }
       let access = await mapWithConcurrency(
-          conversationIds, cid => verifier.hasConversationAccess(cid));
+          conversationIds, cid => verifier.hasConversationAccess(cid, boundTeamId));
       if (access.some(hasAccess => !hasAccess)) {
         throw new Error(
             "This collaborator does not have access to a Slack conversation whose data this workspace " +
@@ -1016,13 +1125,13 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
 type SlackConversationGatekeeperImplProps = {
   userObjectId: string;
   conversationId: string;
+  teamId?: string;
 };
 
 @validateRpc()
 export class SlackConversationGatekeeperImpl
     extends DurableObject<Env, SlackConversationGatekeeperImplProps>
     implements Gatekeeper<SlackConversation> {
-  #apiInstance?: SlackApi;
 
   #account(): DurableObjectStub<UserAccount> {
     return this.ctx.exports.UserAccount.get(
@@ -1030,13 +1139,13 @@ export class SlackConversationGatekeeperImpl
   }
 
   #api(): SlackApi {
-    return this.#apiInstance ??= new SlackApi(createAccessTokenGetter(() => this.#account()));
+    return boundApi(this.ctx, this.#account(), this.ctx.props.teamId);
   }
 
   async describe(): Promise<ResourceDescription> {
-    let teamIdPromise = this.#account().getTeamId();
-    let info = await this.#api().getConversationInfo(this.ctx.props.conversationId);
-    let teamId = await teamIdPromise;
+    let api = this.#api();
+    let info = await api.getConversationInfo(this.ctx.props.conversationId);
+    let teamId = await api.workspaceTeamId();
     let title = info.name ? `#${info.name}` : conversationLabel(info);
     return {
       url: `https://app.slack.com/client/${teamId}/${info.id}`,
@@ -1070,7 +1179,8 @@ export class SlackConversationGatekeeperImpl
    */
   async addObserver(_id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
     let verifier = user as unknown as Fetcher<SlackVerifierApi>;
-    if (!(await verifier.hasConversationAccess(this.ctx.props.conversationId))) {
+    let teamId = await this.#api().workspaceTeamId();
+    if (!(await verifier.hasConversationAccess(this.ctx.props.conversationId, teamId))) {
       throw new Error(
           "This collaborator does not have access to the connected Slack conversation, so they " +
           "cannot be allowed to observe data this workspace read from it.");
@@ -1089,12 +1199,12 @@ type SlackThreadGatekeeperImplProps = {
   conversationId: string;
   threadTs: string;
   permalink: string;
+  teamId?: string;
 };
 
 @validateRpc()
 export class SlackThreadGatekeeperImpl extends DurableObject<Env, SlackThreadGatekeeperImplProps>
     implements Gatekeeper<SlackThread> {
-  #apiInstance?: SlackApi;
 
   #account(): DurableObjectStub<UserAccount> {
     return this.ctx.exports.UserAccount.get(
@@ -1102,7 +1212,8 @@ export class SlackThreadGatekeeperImpl extends DurableObject<Env, SlackThreadGat
   }
 
   #api(): SlackApi {
-    return this.#apiInstance ??= new SlackApi(createAccessTokenGetter(() => this.#account()));
+    let domain = new URL(this.ctx.props.permalink).hostname.slice(0, -".slack.com".length);
+    return boundApi(this.ctx, this.#account(), this.ctx.props.teamId, domain);
   }
 
   async describe(): Promise<ResourceDescription> {
@@ -1145,7 +1256,8 @@ export class SlackThreadGatekeeperImpl extends DurableObject<Env, SlackThreadGat
    */
   async addObserver(_id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
     let verifier = user as unknown as Fetcher<SlackVerifierApi>;
-    if (!(await verifier.hasConversationAccess(this.ctx.props.conversationId))) {
+    let teamId = await this.#api().workspaceTeamId();
+    if (!(await verifier.hasConversationAccess(this.ctx.props.conversationId, teamId))) {
       throw new Error(
           "This collaborator does not have access to the Slack conversation containing this " +
           "thread, so they cannot be allowed to observe data this workspace read from it.");
@@ -1219,7 +1331,7 @@ class SlackWorkspaceSessionImpl extends RpcTarget implements SlackWorkspaceSessi
   }
 
   async getUser(userId: string): Promise<SlackUser> {
-    let user = await this.#ctx.api.getUser(userId);
+    let user = await this.#ctx.api.getWorkspaceUser(userId);
     await authorizeConversationObservation(this.#ctx, [], {
       title: `Read Slack user ${user.username}`,
       description: `Read profile for user ${user.username} (${user.id}).`,

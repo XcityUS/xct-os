@@ -34,22 +34,108 @@ what persists a usable connected account. `GatekeeperVendor.connectAccount` take
 
 ## Sign-in flow
 
-1. The client calls `PublicApi.startGatekeeperLogin(vendorId)`. The backend creates a short-lived
-   `PendingLogin` DO, hands the gatekeeper a `LoginConnectCallbackImpl`, and returns the gatekeeper's
-   OAuth `url` plus an `attempt` stub (a capability wrapping the `PendingLogin` DO — no login id is
-   exposed to the client).
-2. The client opens `url` in a pop-up (the gatekeeper's self-closing OAuth window) and calls
-   `attempt.wait()`, which blocks on the `PendingLogin` DO.
+1. The client calls `PublicApi.startGatekeeperLogin(vendorId)`. The backend mints a per-flow
+   nonce, creates a short-lived `PendingLogin` DO named by the nonce's hash, hands the gatekeeper a
+   `LoginConnectCallbackImpl`, and returns the gatekeeper's OAuth `url`, the `nonce`, and an
+   `attempt` stub (a capability wrapping the `PendingLogin` DO — no login id is exposed to the
+   client). The handoff that follows is the same one every connect flow uses; see
+   [connect-handoff.md](connect-handoff.md).
+2. The client opens `url` as a disowned pop-up, writing the nonce into the pop-up's own
+   sessionStorage before navigating it (`openDisownedPopup` in `connectHandoff.ts`). No page in the
+   flow ever holds `window.opener`.
 3. When the gatekeeper finishes, it calls `complete(user)`. The callback reads
    `user.getAuthenticatedEmail()`, resolves/creates the email-keyed `UserDurableObject`, mints a
-   session, and delivers the `"<email>:<secret>"` token to the `PendingLogin` DO — which resolves the
-   awaiting RPC.
-4. The client stores the token and authenticates as usual.
+   session, and parks the `"<email>:<secret>"` token in the `PendingLogin` DO under the hash of a
+   fresh handoff ticket. `complete()` returns that ticket, and the gatekeeper's final page
+   (`connectHandoffPageHtml` in gatekeeper-kit) navigates the pop-up to the Workshop's
+   `/connect/handoff` page with the ticket in the URL fragment.
+4. That page calls `PublicApi.confirmLogin(ticket, nonce)`, which finds the `PendingLogin` DO by the
+   nonce's hash and marks the delivered token confirmed if the ticket matches. The login tab polls
+   `attempt.receive()`, which releases the token only once it is confirmed, once. This is what binds
+   the session to the browser that started the attempt: the sign-in URL is a bearer capability, so
+   whoever holds `attempt` without the pop-up holding the nonce (an attacker who phished a victim
+   into finishing the flow) gets nothing, and the unreceived token is wiped after two minutes. The
+   pop-up never sees the token.
+5. The client stores the token and authenticates as usual.
 
 Sign-in does **not** persist a connected account: the minimal-scope grant is only used to read the
 email and is then discarded by the gatekeeper. To use a gatekeeper's capabilities (repos, Gmail/Docs)
 or Cloudflare AI Gateway billing, the user explicitly **connects** it afterward (which requests the
 full scopes and persists the connection).
+
+## Native app return after installation sign-in
+
+The native Cloudflare OS shell uses a system authentication session, rather than an embedded web
+view, to sign in to an installation. This is required for identity-provider and security-key flows
+that reject or cannot complete in embedded browsers. The app opens the installation with a fresh
+opaque `cfos_native_state` value and a fresh, non-extractable P-256 key pair, passing only the
+public key as `cfos_native_key`. That uncompressed 65-byte public key is encoded as 87 characters
+of unpadded base64url.
+
+Once the browser is authenticated, the Workshop presents an explicit **Continue in Cloudflare
+OS** confirmation. It does not mint a transfer merely because a specially formed URL was loaded.
+After confirmation:
+
+1. `AuthenticatedApi.beginDeviceSessionHandoff()` stages an encrypted transfer in the authenticated
+   user's Durable Object. Page JavaScript receives its routing `userDoId` and a single-use, 256-bit
+   hex `ticket`; only the ticket's SHA-256 hash is stored with the transfer. It never receives the
+   encrypted envelope or its credential. Retrying a staged state reissues the ticket without
+   minting another credential, invalidating the earlier ticket.
+2. The page performs a same-origin, top-level form POST containing `userDoId`, `state`, and `ticket`
+   to `/api/device-session/callback`. The ticket is required to redeem the transfer, while the
+   navigation headers are CSRF checks, not authentication. In Access mode the route also verifies
+   the Access JWT and requires its user to own the `userDoId`, including when the backend Worker
+   is reached directly. The endpoint rejects fetches, frames, cross-origin requests, duplicate
+   fields, malformed values, and wrong owners before it consumes anything.
+3. The endpoint atomically consumes the staged record and returns a `303` to the fixed claimed HTTPS
+   app link `https://os.cloudflare.app/oauthredirect?cfos_callback=install-connected&…` for mobile
+   (see below for desktop callback delivery). The native
+   app verifies the state, decrypts the envelope with its per-attempt private key, and validates the
+   credential before storing it in platform secure storage. A web page cannot claim this callback;
+   the app-domain association controls which installed native app receives it.
+
+The transfer is server-enforced as single-use and expires after two minutes, independently of the
+credential encrypted inside it. A password or gatekeeper-authenticated installation gets a new
+Workshop device session which remains unusable until the callback consumes the transfer and which
+the server expires after 30 days. A Cloudflare Access installation transfers its current Access
+JWT; that credential retains the Access policy and JWT `exp` chosen by the installation's Access
+configuration. The native app cannot refresh or extend it, and the user must complete Access again
+after it expires. The app also needs to preserve any Access binding cookie required by that
+installation's policy.
+
+The encrypted wire payload is a `DeviceSessionTransfer`: a discriminated credential plus the
+two-minute transfer deadline. Its `workshop` token is `<user-id>:<standard-base64-secret>` (the
+32-byte session secret is padded standard base64); its `cloudflare-access` token is the Access
+application JWT. The envelope's P-256 public key, salt, IV, and ciphertext are all unpadded
+base64url. Encryption uses ephemeral P-256 ECDH, HKDF-SHA-256, and AES-GCM with the opaque state as
+additional authenticated data. There is no central native-login relay, poller, or cross-install
+session store; each installation owns and consumes its transfers.
+
+Inside an installation's embedded web view, the native shell exposes the versioned
+`window.cloudflareOSNative` capability. The Workshop calls `loginReady()` only after its normal
+`whoami()` call confirms authentication. It may call `loginReady()` again after a reconnect, so the
+app treats that notification as idempotent. The Workshop offers **Back to installs** through
+`returnToInstalls()`.
+Notification enrollment is an optional capability on the same object. The legacy notification
+globals remain temporarily as a fallback for the currently distributed TestFlight build; new
+navigation and login behavior uses only the versioned object. These native hooks are available in
+every installation and are not conditioned on Cloudflare Access mode.
+
+### Desktop callback delivery
+
+Desktop clients use the same encrypted device-session protocol and explicit browser confirmation.
+They bind a fresh IPv4 loopback listener before opening the system browser and use state of the
+form `desktop-v1.<port>.<43-character-base64url-nonce>`. The callback route recognizes only this
+reserved form, a port in 1024–65535, and the fixed destination
+`http://127.0.0.1:<port>/oauthredirect`; malformed desktop state fails before ticket consumption.
+All other state retains the claimed HTTPS mobile callback. No arbitrary redirect URL, host,
+scheme, or path is accepted. Only ciphertext crosses loopback, authenticated against the complete
+state and decryptable by that attempt's private key. Desktop listeners validate their exact Host,
+state, envelope and deadline, consume one response, and close on completion/cancellation/timeout.
+Like mobile shells, desktop clients commit the credential only after their origin-bound main-frame
+native bridge reports authenticated `loginReady`. App sign-in is separate from any local Computer
+Operator registration or permission grant. Access policies requiring an additional binding cookie
+still need that cookie; encrypted JWT transfer does not bypass those policies.
 
 ## Configuration
 
@@ -73,10 +159,11 @@ In local dev, `run-dev-server.ts` seeds each gatekeeper's `CLIENT_ID`/`CLIENT_SE
 
 ## Storage / bindings
 
-- `PendingLogin` (DO) — short-lived bridge between a gatekeeper login pop-up and the waiting browser,
-  reached via `ctx.exports` (no explicit binding). Holds no durable storage: the in-flight
-  `attempt.wait()` keeps it alive, and it's evicted once the login completes or the client disposes
-  the `attempt` stub.
+- `PendingLogin` (DO) — short-lived bridge between a gatekeeper login pop-up and the browser that
+  started the attempt, reached via `ctx.exports` (no explicit binding) and named by the hash of the
+  attempt's nonce. Stores the delivered token under the ticket's hash until the pop-up's
+  `confirmLogin()` confirms it and the login tab's `receive()` consumes it; an alarm wipes an
+  unreceived result after two minutes.
 
 ## Code layout
 
@@ -88,4 +175,5 @@ auth/
 ```
 
 Client-side: `ServerConfigContext` exposes `authVendors` and `passwordAuthEnabled`;
-`components/auth/OAuthButtons` renders the sign-in options (pop-up + `attempt.wait()`).
+`components/auth/OAuthButtons` renders the sign-in options (disowned pop-up carrying the nonce, polled
+`attempt.receive()`); `ConnectHandoffPage` is the pop-up's landing page (`confirmLogin(ticket, nonce)`).

@@ -21,7 +21,7 @@ Read `packages/workshop-shared/src/gatekeeper.ts` for the canonical interfaces a
 
 3. **Fine-grained resource granting** — Enable the end user to grant access to agents at fine granularities, in addition to coarse-grained access. For example, a user may want to give an agent access to a specific Google Doc or GitHub repo, rather than granting broad access to everything they can do. This should be straightforward given a capability-based API. That said, broad access should also be allowed when it makes sense. Consider carefully which granularities are meaningful — a Jira gatekeeper might support "whole service", "project", and "issue" granularities, but it would be silly to support granting access to a single field of an issue separately.
 
-4. **Logging & approvals** — Every action the agent or gadget performs must be logged via the `ApprovalQueue` API. Every action with an externally-visible side effect must be submitted via `submitAction()`, and must not actually be performed until `applyAction()` has been called. Read-only observations must call `authorizeObservation()` before returning data to the caller.
+4. **Logging & approvals** — Every action the agent or gadget performs must be logged via the `ApprovalQueue` API. Every action with an externally-visible side effect must be submitted via `submitAction()`, and must not actually be performed until `applyAction()` has been called. Read-only observations must call `authorizeObservation()` before returning data to the caller. Reads the gatekeeper makes for its own purposes, returning nothing to the caller, are not observations (see [What counts as an observation](#what-counts-as-an-observation)).
 
 5. **Caching** — When it makes sense, cache remote content in the gatekeeper's DO storage to improve performance when agents or gadgets repeatedly read the same data. Caching also enables a better TypeScript API when the service's underlying API has an inconvenient data shape. For example, Gmail's API for listing threads returns only thread IDs without metadata, requiring a callback for each thread; with caching, the gatekeeper can provide an API that returns rich thread summaries directly, reading from local content synchronized with Gmail as needed. See Phase 2 for implementation guidance.
 
@@ -60,13 +60,15 @@ This JSDoc is the agent's sole documentation for the API, so keep it **narrowly 
 
 Do NOT leak details the caller doesn't need to use the API — the approval queue (never mention `submitAction`/`applyAction`/approvals; correct simulation keeps this invisible), or gatekeeper internals (caching, DO storage, OAuth, syncing). Document those in the `.ts` implementation or PR, never in the agent-facing `.d.ts`.
 
+The agent receives the `.d.ts` text **verbatim** (via the `types.txt` symlink), and nothing resolves its imports — so it must be **self-contained**. Don't import types from other packages or files (e.g. `Cursor` from `@gadgets/workshop-shared/gatekeeper`); copy the definition into the `.d.ts` instead. TypeScript's structural typing means the implementation can still return the shared type. The only exception is `cloudflare:workers` (e.g. `import type { RpcTarget } from "cloudflare:workers"`), which the agent's environment provides. `pnpm lint` enforces this with the `gadgets/self-contained-agent-types` rule on every `packages/gatekeeper-*/src/*types.d.ts`. Also keep the file free of comments aimed at maintainers (such as "keep in sync with X"), since the agent reads those too.
+
 ### Step 3: STOP — Present API for review
 
 **Do not proceed without operator approval.**
 
 Present the proposed `types.d.ts` and explain the design: what resource granularities are supported, what Session methods do, and what trade-offs were made. The API is the most important and delicate part of a gatekeeper — getting it wrong means rebuilding. Wait for the operator to review and approve (or request changes) before continuing.
 
-Also confirm the JSDoc follows [Documenting the API](#documenting-the-api-typesdts) — no approval-queue or implementation details leaked in.
+Also confirm the JSDoc follows [Documenting the API](#documenting-the-api-typesdts) — no approval-queue or implementation details leaked in, and run the [API review](#reviewing-a-gatekeeper) on your own design first.
 
 ### Step 4: Implement
 
@@ -81,44 +83,41 @@ packages/gatekeeper-<name>/
 │   ├── types.d.ts             # Session/Hook types (compile-time)
 │   ├── types.txt -> types.d.ts  # Symlink (runtime, for getTypeScriptTypes())
 │   └── <name>-api.ts          # (optional) Helper wrapping the service's HTTP API
-├── wrangler.jsonc
+├── cloudflare.config.ts      # wrangler.jsonc is generated from it
 ├── package.json
 └── tsconfig.json
 ```
 
-### Step 5: Configure and register
+### Step 5: Register
 
-Add a service binding to `packages/workshop-backend/wrangler.jsonc`:
-```jsonc
-{
-  "binding": "GATEKEEPER_<NAME>",
-  "service": "gatekeeper-<name>",
-  "entrypoint": "GatekeeperVendor"
-}
-```
-
-The backend auto-discovers vendors from `GATEKEEPER_`-prefixed bindings (see `packages/workshop-backend/src/user.ts`).
+There is no binding to add. `run-dev-server.ts` binds every `packages/gatekeeper-*` that has a `wrangler.jsonc` to the backend as `GATEKEEPER_<NAME>`, and the deploy service does the same for installed gatekeepers. The backend auto-discovers vendors from `GATEKEEPER_`-prefixed bindings (see `packages/workshop-backend/src/user.ts`).
 
 ### Step 6: Add resource selection UI
 
-Add a resource selection UI for each resource type returned in `getSupportedResources()`. This will be used by users to select the specific resource.
+Add a resource selection UI for each connect card. A card is one resource type returned in `getSupportedResources()`, together with any types whose `groupedWith` names it. This will be used by users to select the specific resource.
 
-- Workshop calls `GatekeeperUser.startResourceConfigurator(resourceUrlPattern)` with the selected resource's `urlPattern`.
+- Workshop calls `GatekeeperUser.startResourceConfigurator(resourceUrlPattern)` with the `urlPattern` of a type on the card: the card's own type from the connect dialog, or a binding's own type from a blueprint. Return the card's configurator for every type on it.
 - Return `iframeHtml` of the selection UI and `ui` for any RPCs that UI needs.
 - When the user selects "Add connection", Workshop asks the iframe for the selected resource URL.
+- Group types (`SupportedResource.groupedWith`) when they are one choice at different granularities, such as a whole drive, a folder or a file. Each type is still granted separately, and a grouped card asks for the missing ones in one consent request, so group only types that need the same authorization. The gatekeeper's `getGatekeeperClassFor` decides which type a returned URL is, while Workshop's grant check takes the first type in declaration order whose pattern matches it, so declare a narrower type before a broader one whose pattern also matches its URLs. A whole-instance `https://*` type is the exception: the check skips it and uses it only for a URL no other type on the card matches, so it can be declared anywhere.
 
 Keep the iframe-facing capability narrow, only what's necessary to provide desired interface to help user find and select the resource.
 
 #### Optional helper: `@gadgets/configurator-ui`
 
-For simple configuration UIs, consider using `@gadgets/configurator-ui`. It provides the basic form components that look consistent to the Gadget Workshop and a build script that turns `src/configurator/*-ui.tsx` into `iframeHtml`. Gatekeepers with more specialized UI needs can produce their own `iframeHtml`.
+For configuration UIs, use `@gadgets/configurator-ui`. It provides form components built on Kumo (rendered with Preact standing in for React inside the frame) that look and behave like the rest of the Workshop, and a build that turns `src/configurator/*-ui.tsx` into `iframeHtml`. Gatekeepers whose needs the components cannot meet can produce their own `iframeHtml`.
+
+Components: `Section`, `Field`, `TextInput`, `RadioCards`, `CheckboxList` (multi-select; refuses more than 200 options rather than truncating), `Autocomplete` (search-as-you-type, one result), `HierarchyPicker` (choose the whole hierarchy from a card above the list, or an open container or a leaf from its own row; as in a file dialog, a choice lasts while it is in view; a container's `choice` says what connecting it grants, since only the gatekeeper knows whether that is its whole subtree; breadcrumbs, optional search, paging and `loadItem`, which pre-filling anything but the root needs; nodes name icons the configurator supplies in `icons`; a location that cannot be listed yet, such as one waiting on a grant, returns a page with `unavailable` set to why, shown with Retry like a failed load but not reported as an error), `Button` (an action in the form; call the render context's `ensureResources` from its click to ask for access the next step needs) and `Notice` (an inline info or error message, announced to screen readers). The runtime strips control and bidi-formatting characters from titles, subtitles and meta it shows, since those come from third parties.
 
 If you use this:
 
 - UI modules live in `src/configurator/*-ui.tsx`.
 - `resourceUrl()` returns the selected resource URL.
+- A module that can return several types reads `acceptedResourceUrlPatterns` from the context every callback receives (`render`, `isReady`, `resourceUrl`, `initialValuesFromResourceUrl`): the types Workshop will take, which leave out a grouped type the account hasn't granted and anything a blueprint binding doesn't want. Show other types if that helps the user find their way, but don't let them be chosen, and keep `isReady` false while one is. It is `undefined` from an older Workshop, which takes any type. The list is read when the frame starts, and Workshop restarts the frame when it changes.
 - `src/configurator/*-types.d.ts` describes the iframe-facing `ui` API.
-- `scripts/build-gatekeeper-configurator.ts` generates `src/generated/*.txt`.
+- Each module is compiled on its own: it may import only `@gadgets/configurator-ui` and types. URL grammar it shares with the server is copied, and a test keeps the copies in step.
+- The frame's content security policy allows exactly the scripts the build wrote (by hash) and no network access; anything the UI needs goes through `ui`.
+- `scripts/build-gatekeeper-configurator.ts` generates `src/generated/*.txt`, using the runtime and build in `packages/configurator-ui` (`src/runtime/`, `build/`).
 - Nothing invokes `build-gatekeeper-configurator.ts` by hand. `vite.config.ts` re-exports the
   shared `build` and `build:configurator` Vite+ tasks from
   `scripts/gatekeeper-configurator-vite-config.ts`; `build` is just `tsc` and depends on
@@ -142,7 +141,7 @@ When something already knows the exact resource — most importantly an AI agent
   },
   ```
 
-  The runtime seeds these values before first render and reflects them in `Autocomplete`/`TextInput`/`RadioCards` inputs. Make sure your `resourceUrl(values)` and `initialValuesFromResourceUrl(url)` are inverses so a prefilled form round-trips to the same URL. **Every gatekeeper with selectable resources should support this** so agents can fully pre-configure a connection.
+  The runtime seeds these values before first render and reflects them in `Autocomplete`/`TextInput`/`RadioCards`/`HierarchyPicker` inputs. Make sure your `resourceUrl(values)` and `initialValuesFromResourceUrl(url)` are inverses so a prefilled form round-trips to the same URL. **Every gatekeeper with selectable resources should support this** so agents can fully pre-configure a connection.
 
 ### Step 7: STOP — Ask operator whether to proceed to phase 2
 
@@ -156,10 +155,27 @@ In this phase, we focus on responsibilities 4-7. These are typically added as a 
 
 Go through all the API methods and decide where to insert calls to the `ApprovalQueue`.
 
-- Any operation which reads external data (but with no side effects) must call authorizeObservation().
+- Any operation which reads external data and returns it to the caller (but with no side effects) must call authorizeObservation().
 - Any operation which has visible side effects on the world must call submitAction(), and must not actually apply the action until approved.
 
 Study the `ApprovalQueue` API in `gatekeeper.ts` for details.
+
+#### What counts as an observation
+
+The observation log records what the **caller** (agent or gadget) learned, not what the gatekeeper read. Deciding this correctly keeps the log readable for the user. Ask: *what information did this call hand back to the caller?* If the answer is "nothing", don't log an observation, however much the gatekeeper fetched internally.
+
+Do **not** call `authorizeObservation()` for:
+
+- **Reads that only prepare an action.** A mutation that fetches current state to build the action description, bind an expected old value, capture revert information, or validate the request, and then calls `submitAction()`, returns `void` (or a provisional stub or a freshly generated ID). The action description the user approves already shows what was read. Don't log "Read X before mutation".
+- **Session setup.** `startSession()` resolving the account, a bound label, and so on returns only a session stub.
+- **Creating a cursor or stub that returns no data itself**, provided its later reads (cursor pages, `getDetails()`, …) log their own observations. Log wherever the data actually crosses to the caller; if a cursor logs once up front and not per page, that up-front log is the real one and must stay.
+- **Information that leaks only through a validation error** ("label already exists", "branch is not a fast-forward").
+
+**Existence checks are a judgment call, but usually not an observation.** A method like `getIssue(id)` that confirms an item exists and returns a stub tells the caller one bit. When the ID is an unguessable, high-entropy value (a Gmail message ID, a commit SHA, a UUID), that bit is no information at all: a caller that already holds the ID knows the item exists, and the ID itself encodes nothing. Sequential numbers and human-readable names are more ambiguous, but an agent leaking information by probing whether titles exist is far-fetched, so the default is not to log. Log the stub's real reads instead. Don't put fetched details (such as the item's title) into a log entry for data the caller never received.
+
+Returning a boolean or count *is* data when that is the answer the caller asked for (`isFollowing()`, `areTracksSaved()`, a `null` from `getArea()` meaning "no area"). Log those.
+
+**Exception: observer tracking.** Under observer strategy C (below), `authorizeObservation()` does more than log. Its `excludeObservers` and set-tracking side effects gate which collaborators may see the workspace, and `containsRestrictedData` / `ownerInvitesOnly` change workspace state. A call that carries any of these is a security control, and removing it is a security decision, not a logging cleanup (see the Drive session's "Check Google Drive folder" fences).
 
 It's critically important that you add `ApprovalQueue` to all API operations that interact with the outside world, otherwise the gatekeeper security model is broken.
 
@@ -243,7 +259,7 @@ async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
 
 Strategy is chosen **per `Gatekeeper` DO class / binding**, not per package — one package may use several (e.g. Google: Gmail=A, Doc=B, BigQuery=C).
 
-- **A — Private-only.** `addObserver()` always throws; `removeObserver()` is a no-op. `getVerifier()` must still exist (the overseer mints it) but is never consulted. Use when the resource is too sensitive to share and there is no per-observer access oracle (e.g. a personal Gmail mailbox).
+- **A — Private-only.** `addObserver()` always throws; `removeObserver()` is a no-op. `getVerifier()` must still exist (the overseer mints it) but is never consulted. Use when the resource is too sensitive to share and there is no per-observer access oracle (e.g. a personal Gmail mailbox). For truly sensitive data, also mark each observation with `ObservationDescription.containsRestrictedData: true`: because nobody can open the workspace without passing `addObserver()`, and with strategy A nobody ever does, the first such observation makes the workspace effectively unshareable — and it permanently sets the workspace's `containsRestrictedData` flag, whose restricted mode blocks all actions and public web fetches, so the data cannot leak back out through other gatekeepers.
 - **B — ACL check (single unit).** The binding is one atomic resource; sub-resources inherit its ACL. `addObserver()` calls a verifier method to confirm the observer can access it and throws otherwise; `removeObserver()` is a no-op; nothing is tracked and no `excludeObservers` is ever needed. Use for repo / document / page / team / single-project bindings.
 - **C — Data-set tracking.** The binding spans sub-resources with **distinct ACLs**, and there is a **per-observer access oracle** for each. The DO logs the data sets actually observed and the current observers; `addObserver()` verifies the observer against **every** logged set (plus a coarse membership baseline) and **stores their verifier**; each later observation that first touches a **new** set re-checks all stored observers and sets `excludeObservers` for any who fail. Use for workspace / organization / dataset-spanning bindings.
 - **D — Low-stakes.** `addObserver()` / `removeObserver()` are no-ops; `getVerifier()` returns a trivial verifier with a no-op public method such as `verify(): void {}` (an empty `WorkerEntrypoint` is not registered in `ctx.exports`). Use when any collaborator may observe (personal, low-stakes services).
@@ -320,15 +336,27 @@ Because the callback is a persistent stub tied to a session, the gatekeeper neve
 
 When defining a session interface with hooks, it's important to include comments that clearly state when a method expects to be passed a *persistent* stub created with `ctx.restore()`, as opposed to a regular RpcStub. The caller needs to do extra work to make sure the stub they provide you is persistent.
 
+## Reviewing a gatekeeper
+
+Reviews tend to stop at general correctness. The most important review is of the agent-facing API, so pressure-test it:
+
+- **Shape.** Read `types.d.ts` as the agent does, as its only documentation. Does the shape make sense? What would you do differently?
+- **User stories.** List the most common things a user would ask an agent to do with this service and walk each through the API. Flag any that are impossible, need sequential round trips that promise pipelining can't remove, or need knowledge the JSDoc doesn't give. Flag dead ends too: anything the grant includes that the agent can't navigate to, such as child pages it can list but not open.
+- **Seams.** Check that resource types, bindings and sessions partition authority along the lines users actually grant:
+  - Each `getSupportedResources()` granularity is a grant a user would make, and together they cover the common ones (broad and narrow).
+  - A narrow binding's session reaches nothing outside its resource: sub-resources come from stubs on their parent, and no method or option field (`parentId`, `projectId`) takes an ID that escapes the binding.
+  - Each method sits on the object whose authority it needs. A cross-resource operation (move, copy, link) must not quietly require, or grant, a broader binding than the user picked.
+  - Each binding's types expose only what that binding can do and stay small, and its observer strategy fits how the binding is partitioned (see [Choosing a strategy](#choosing-a-strategy-per-resource-type--binding)).
+
 ## Tips
 
-- `types.txt` must be a **symlink** to `types.d.ts`, never a copy.
+- `types.txt` must be a **symlink** to `types.d.ts`, never a copy. Because it is delivered verbatim, `types.d.ts` must not import from other modules — inline any shared types (see [Documenting the API](#documenting-the-api-typesdts)).
 - Call `.dup()` on `approvalQueue` stubs before storing in a session, since Cap'n Web automatically disposes all stubs in parameters to an RPC call when the call returns.
 - `suggestedBindingName` in `describe()` reflects the resource **type** (e.g. `"GMAIL_INBOX"`), not the specific instance.
 - For read-only or push-only gatekeepers, `applyAction()` / `rejectAction()` / `revertAction()` can simply throw (they'll never be called since the gatekeeper never submits actions).
 - For `WorkerEntrypoint` and `DurableObject` subclasses, pass credentials and resource IDs via `ctx.props`, not constructor arguments. RPC stubs pointing to these types can be stored in long-term storage and restored later, creating a new instance based on the same `props`.
 - If the gatekeeper implements multiple unrelated resource types with disjoint APIs, each may have its own `.d.ts` file, so that the `getTypeScriptTypes()` method of the specific `Gatekeeper` implementation only returns the types that matter for it. The `getTypeScriptTypes()` method on the top-level `GatekeeperVendor` should return the concatenation of all of these.
-- All DO classes must appear in `wrangler.jsonc` under `migrations[].new_sqlite_classes`.
+- All DO classes must appear in `cloudflare.config.ts`'s `migrations` export under `new_sqlite_classes`.
 - Set a self-destruct alarm in `UserAccount.setCallback()` in case the OAuth flow is never completed.
 - `authorizeObservation()` may be called *after* fetching data (so the description can include details about what was fetched) but must be awaited *before* returning anything to the caller.
 - `getVerifier()` / `addObserver()` / `removeObserver()` are **mandatory** — the gatekeeper won't type-check without them. Even a read-only or push-only gatekeeper needs them (sharing is independent of whether the gatekeeper has actions). Pick a strategy per [Observers](#observer-verification): a low-stakes one can be A or D; otherwise B/C.
@@ -338,6 +366,7 @@ When defining a session interface with hooks, it's important to include comments
 - `packages/gatekeeper-google/` — OAuth, multiple resource types (Gmail, Google Docs, BigQuery), actions, caching/simulation examples, multiple Session types. **Observers:** all three strategies in one package — Gmail=A (always throw), Doc=B (single-unit ACL via `GoogleVerifier.hasDocAccess`), BigQuery=C (dataset tracking via `hasDatasetAccess`).
 - `packages/gatekeeper-email/` — Hook-based push notifications, no actions, email address claiming. **Observers:** strategy D (low-stakes no-ops + trivial verifier).
 - `packages/gatekeeper-github/` — **Observers:** clean strategy B example — `GitHubVerifier.hasRepoAccess` plus a one-method `addObserver`.
+- `packages/gatekeeper-gitlab/` — A **mirror** of gatekeeper-github for a provider with instance configuration (self-hosted URLs, an optional Cloudflare Access service token on upstream requests) and **rotating credentials** (expiring access tokens, single-use refresh tokens refreshed under a mutex). Reads the same `plans/worktrees.md` §3 git contract through `gatekeeper-kit`'s `git-transport`/`git-objects`/`git-diff`. **Observers:** strategy B with a role-aware probe (`membershipGrantsFullRead`): Reporter membership whatever the visibility, since a public project can still hold confidential issues and internal notes, read from `members/all?user_ids[]=` because the project's `permissions` object omits group-inherited access. Its `plans/gitlab-gatekeeper.md` divergence table is a worked example of porting one gatekeeper's API to another provider's vocabulary.
 - `packages/gatekeeper-supabase/` — **Observers:** strategy C with a per-session context object (`authorizeProjectObservation`) — good when sessions already hold a shared context.
 - `packages/gatekeeper-linear/` & `packages/gatekeeper-notion/` — **Observers:** strategy C where the page/team session impls are shared between the narrow (B) and broad (C) bindings, threading an `observe` hook through sub-sessions; both also handle one observation revealing multiple sets.
 - `packages/workshop-shared/src/gatekeeper.ts` — Canonical interfaces with detailed JSDoc (`getVerifier`, `addObserver`, `removeObserver`, `GatekeeperUserVerifier`, `ObservationDescription.excludeObservers`).

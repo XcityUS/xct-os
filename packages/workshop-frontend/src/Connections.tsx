@@ -11,7 +11,7 @@ import { RpcStub } from 'capnweb'
 import { Overseer, GadgetClient, GadgetBindingInfo, BoundHookInfo, AuthenticatedApi, WorkpieceId } from '@gadgets/workshop-shared/api'
 import GatekeeperModal from './GatekeeperModal'
 import { GatekeeperIcon } from './components/GatekeeperIcon'
-import { HookToggle } from './components/HookToggle'
+import { HookToggle, hookToggleFailureToast } from './components/HookToggle'
 import { useVendorBranding } from './useVendorBranding'
 import { WorkshopButton, WorkshopIconButton, WorkshopInput } from './components/WorkshopControls'
 import { EmptyState } from './components/EmptyState'
@@ -96,7 +96,7 @@ export default function Connections({ overseer, gadget, chatId, authenticatedApi
       await loadGatekeepers()
     } catch (err) {
       console.error('Failed to toggle hook:', err)
-      toasts.add({ title: `Failed to ${enabled ? 'enable' : 'disable'} hook`, variant: 'error' })
+      toasts.add(hookToggleFailureToast(enabled, err))
       // Revert optimistic update.
       setHooks((prev) => prev.map((h) => (h.id === id ? { ...h, enabled: !enabled } : h)))
     } finally {
@@ -429,8 +429,9 @@ export default function Connections({ overseer, gadget, chatId, authenticatedApi
                         </div>
                         <div className="ml-auto flex shrink-0 items-center gap-2">
                           <HookToggle
+                            hookTitle={hook.description.title}
                             enabled={hook.enabled}
-                            disabled={togglingHooks.has(hook.id)}
+                            pending={togglingHooks.has(hook.id)}
                             onToggle={(enabled) => handleToggleHook(hook.id, enabled)}
                           />
                           <Tooltip content="Delete hook" asChild>
@@ -557,8 +558,8 @@ function BlueprintAnnotationModal({
   return (
     <>
       <Dialog.Root open={open} onOpenChange={(o) => { if (!o) onClose() }}>
-        <Dialog className="responsive-dialog !z-[1000] !w-[min(480px,calc(100vw-32px))] overflow-hidden bg-kumo-base p-0" size="lg">
-          <div className="flex items-start justify-between gap-4 border-b border-kumo-line px-4 py-4 sm:px-5">
+        <Dialog className="responsive-dialog !z-[1000] !top-[clamp(24px,10vh,80px)] !flex !max-h-[calc(100vh-clamp(24px,10vh,80px)-24px)] !w-[min(480px,calc(100vw-32px))] !-translate-y-0 flex-col overflow-hidden bg-kumo-base p-0" size="lg">
+          <div className="flex shrink-0 items-start justify-between gap-4 border-b border-kumo-line px-4 py-4 sm:px-5">
             <div className="min-w-0">
               <Dialog.Title className="text-[15px] leading-5 font-medium tracking-[-0.3px] text-kumo-default">
                 Blueprint settings
@@ -576,7 +577,7 @@ function BlueprintAnnotationModal({
             />
           </div>
 
-          <div className="space-y-4 px-4 py-4 sm:px-5">
+          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4 sm:px-5">
             {loadError ? (
               <div className="text-[13px] text-kumo-subtle">{loadError}</div>
             ) : !data ? (
@@ -593,7 +594,7 @@ function BlueprintAnnotationModal({
             )}
           </div>
 
-          <div className="border-t border-kumo-line px-4 py-3 sm:px-5">
+          <div className="shrink-0 border-t border-kumo-line px-4 py-3 sm:px-5">
             {saveError && (
               <div className="mb-3 flex items-start gap-2 rounded-lg border border-l-2 border-l-kumo-brand border-y-kumo-line border-r-kumo-line bg-kumo-base px-3 py-2 text-[12px] leading-[18px] font-normal tracking-[-0.2px] text-kumo-default">
                 <Warning size={14} weight="fill" className="mt-0.5 shrink-0 text-kumo-brand" />

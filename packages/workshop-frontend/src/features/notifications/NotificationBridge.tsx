@@ -1,0 +1,163 @@
+import { useEffect, useRef } from "react";
+import { useKumoToastManager } from "@cloudflare/kumo";
+import { useRouter } from "@tanstack/react-router";
+import { RpcStub, RpcTarget } from "capnweb";
+import type {
+  AuthenticatedApi,
+  NotificationSubscriber,
+  UserNotification,
+} from "@gadgets/workshop-shared/api";
+import { logRpcFailure } from "../../rpcErrors";
+import { nativeApp } from "../native-app/nativeApp";
+import { isChatVisible } from "./visibleChat";
+
+const DEVICE_REGISTRATION_EVENT = "cloudflare-os:notification-device-registration";
+
+type LegacyNativeNotificationWindow = Window & {
+  __CLOUDFLARE_OS_NOTIFICATION_DEVICE_REGISTRATION__?: string;
+  __CLOUDFLARE_OS_REQUEST_NOTIFICATION_DEVICE_REGISTRATION__?: () => void;
+  webkit?: { messageHandlers?: { cloudflareOSNotificationReady?: {
+    postMessage: (message: { type: "ready" | "failed" }) => void;
+  } } };
+};
+
+class NotificationSubscriberImpl extends RpcTarget implements NotificationSubscriber {
+  constructor(
+    private readonly present: (notification: UserNotification) => void,
+    private readonly onReleased: () => void,
+  ) {
+    super();
+  }
+
+  async notify(notification: UserNotification): Promise<void> {
+    if (document.visibilityState !== "visible") {
+      throw new Error("notification client is not visible");
+    }
+    this.present(notification);
+  }
+
+  // capnweb calls this once the server drops its last reference to the subscriber.
+  [Symbol.dispose]() {
+    this.onReleased();
+  }
+}
+
+const eventDeviceRegistration = (event: Event): string | undefined => {
+  if (!(event instanceof CustomEvent)) return undefined;
+  let detail = event.detail as { deviceRegistrationId?: unknown } | null;
+  return typeof detail?.deviceRegistrationId === "string" ? detail.deviceRegistrationId : undefined;
+};
+
+/** Connects the authenticated SPA to native enrollment and live notification delivery. */
+export const NotificationBridge = ({
+  authenticatedApi,
+}: {
+  authenticatedApi: RpcStub<AuthenticatedApi>;
+}) => {
+  const toasts = useKumoToastManager();
+  const addToast = useRef(toasts.add);
+  addToast.current = toasts.add;
+  const router = useRouter();
+  const askedNative = useRef(false);
+  const claimedRegistrations = useRef(new Set<string>());
+
+  useEffect(() => {
+    let legacyWindow = window as LegacyNativeNotificationWindow;
+    let notifications = nativeApp()?.notifications;
+    let reportRegistration = (outcome: "ready" | "failed") => {
+      if (notifications) {
+        notifications.registrationFinished(outcome);
+      } else {
+        legacyWindow.webkit?.messageHandlers?.cloudflareOSNotificationReady
+          ?.postMessage({ type: outcome });
+      }
+    };
+    let register = async (deviceRegistrationId: string | undefined) => {
+      if (!deviceRegistrationId || claimedRegistrations.current.has(deviceRegistrationId)) return;
+      // The native handle is single-use, including across authenticatedApi reconnects. A failed
+      // exchange may already have consumed it, so native must issue a fresh id for any retry.
+      claimedRegistrations.current.add(deviceRegistrationId);
+      if (legacyWindow.__CLOUDFLARE_OS_NOTIFICATION_DEVICE_REGISTRATION__ ===
+          deviceRegistrationId) {
+        delete legacyWindow.__CLOUDFLARE_OS_NOTIFICATION_DEVICE_REGISTRATION__;
+      }
+      try {
+        await authenticatedApi.registerNotificationDevice(deviceRegistrationId);
+        reportRegistration("ready");
+      } catch (error) {
+        reportRegistration("failed");
+        logRpcFailure("Failed to register notification device:", error);
+      }
+    };
+    let onDeviceRegistration = (event: Event) => {
+      void register(eventDeviceRegistration(event));
+    };
+
+    // The legacy globals remain only for the currently distributed TestFlight build. New shells
+    // expose notification controls through the same versioned object as navigation and login.
+    let injected = notifications?.currentDeviceRegistration() ??
+      legacyWindow.__CLOUDFLARE_OS_NOTIFICATION_DEVICE_REGISTRATION__;
+    void register(injected);
+    window.addEventListener(DEVICE_REGISTRATION_EVENT, onDeviceRegistration);
+    // Each id costs a central registration, and this Effect reruns on every reconnect: ask at most
+    // once per mount, and not at all when native already injected one.
+    if (!askedNative.current) {
+      askedNative.current = true;
+      if (!injected) {
+        if (notifications) notifications.requestDeviceRegistration();
+        else legacyWindow.__CLOUDFLARE_OS_REQUEST_NOTIFICATION_DEVICE_REGISTRATION__?.();
+      }
+    }
+    return () => window.removeEventListener(DEVICE_REGISTRATION_EVENT, onDeviceRegistration);
+  }, [authenticatedApi]);
+
+  useEffect(() => {
+    let subscription: RpcStub<{}> | undefined;
+
+    let updateSubscription = () => {
+      subscription?.[Symbol.dispose]();
+      subscription = undefined;
+      if (document.visibilityState !== "visible") return;
+
+      let live = false;
+      let subscriber = new NotificationSubscriberImpl(notification => {
+        let { id, kind, workspaceId, chatId, chatTitle } = notification;
+        if (isChatVisible(workspaceId, chatId)) return;
+        let completed = kind === "taskCompleted";
+        addToast.current({
+          id,
+          title: `${chatTitle || "Task"} ${completed ? "completed" : "needs permission"}`,
+          variant: completed ? "success" : "info",
+          actions: [{
+            children: "Open task",
+            onClick: () => router.navigate({
+              to: "/workspace/$id",
+              params: { id: workspaceId },
+              search: { chat: chatId, showChat: true },
+            }),
+          }],
+        });
+      }, () => {
+        // Released while still ours, after it took: the User DO reset and forgot it. (A failed
+        // subscribe releases it too, so `live` keeps that from retrying in a loop.)
+        if (live && subscription === nextSubscription) updateSubscription();
+      }) as unknown as RpcStub<NotificationSubscriber>;
+      let nextSubscription = authenticatedApi.subscribeToNotifications(subscriber);
+      subscription = nextSubscription;
+      nextSubscription.then(() => { live = true; }, error => {
+        if (subscription !== nextSubscription) return;
+        logRpcFailure("Notification subscription failed:", error);
+      });
+    };
+
+    document.addEventListener("visibilitychange", updateSubscription);
+    updateSubscription();
+    return () => {
+      document.removeEventListener("visibilitychange", updateSubscription);
+      subscription?.[Symbol.dispose]();
+      subscription = undefined;
+    };
+  }, [authenticatedApi, router]);
+
+  return null;
+};

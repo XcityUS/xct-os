@@ -20,12 +20,12 @@ import type {
   HookController,
   HookInitiator,
   HookTargetMetadata,
-  ObservationAuthorizer,
   ResourceConfiguratorFrame,
   ResourceDescription,
   SupportedResource,
   VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
+import { workerVersionTag } from "@gadgets/workshop-shared/gatekeeper";
 import {
   normalizeCalendarRule,
   normalizeInterval,
@@ -269,9 +269,7 @@ export class SchedulerGatekeeper
   }
 
   /** Returns no catalog because schedule discovery happens through list(). */
-  async getAgentCatalog(
-    _authorizer: NativeRpcStub<ObservationAuthorizer>,
-  ): Promise<AgentCatalog | null> {
+  async getAgentCatalog(): Promise<AgentCatalog | null> {
     return null;
   }
 
@@ -374,6 +372,11 @@ export class ScheduleAccount
     throw new Error("Scheduled Tasks has no connect flow.");
   }
 
+  /** Rejects commit because no flow can ever stage credentials. */
+  commitReconnect(_stageId: string): Promise<void> {
+    throw new Error("Scheduled Tasks has no connect flow.");
+  }
+
   /** Returns no authentication identity. */
   async getAuthenticatedEmail(): Promise<string | null> {
     return null;
@@ -411,6 +414,11 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
       autoProvisionsAccount: true,
       providesAuth: false,
     };
+  }
+
+  /** The version tag of this Worker's running version, for the deployment's admins. */
+  async versionTag(): Promise<string | undefined> {
+    return workerVersionTag(this.env);
   }
 
   /** Mints a new opaque Scheduler account capability. */

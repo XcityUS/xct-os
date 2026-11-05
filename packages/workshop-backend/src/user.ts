@@ -1,13 +1,20 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, XcityCatalogAgent, XcityChatAgentInfo } from '@gadgets/workshop-shared/api';
-import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, XcityCatalogAgent, XcityChatAgentInfo, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart, type WebPushSubscription } from '@gadgets/workshop-shared/api';
+import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
 import { XcityGatekeeperUser } from "@gadgets/workshop-shared/xcity-gatekeeper";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
-import { createTypedStorage, collection } from "@gadgets/typed-storage";
+import { skipRpcValidation, validateRpc } from "capnweb-validate";
+import {
+  makeUserStorage, type BlueprintUserRecord, type CloudflareBilling, type ConnectedAccountRecord,
+  type XcityWalletBalance,
+  type GadgetRecord, type PendingConnectFlow, type PendingDeviceHandoffRecord,
+  type PendingHandoffRecord, type UserAiModelRecord, type UserStorage, type WorkspaceOutputEntry,
+} from "./storage-schema/user-storage.js";
+import { recordAnalytics } from "./analytics";
 import { createWorkshopLogger } from "./observability";
-import { getAiGatewayConfig } from "./ai-gateway.js";
+import { getGatewayModels, type GatewayModels } from "./ai-gateway.js";
 import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-billing/limits/config.js";
 import { getXcityAgentMarketplaceConfig, getXcityConfig } from "./xcity/config.js";
 import { getXcityAgent, isSafeXcityAgentSlug, listXcityAgents } from "./xcity/agent-catalog.js";
@@ -15,13 +22,19 @@ import { getXcityAgentPersona } from "./xcity/agent-persona.js";
 import {
   XcityModelPlane,
   XCITY_VENDOR_ID,
-  type XcityModelPlaneCache,
   type XcityUserIdentity,
 } from "./xcity/model-plane.js";
 import type { AdminSettings } from "./admin-settings.js";
-import { isReservedBlueprintKey, readBlueprintKvRecord } from "./blueprint-archive.js";
+import { deleteBlueprintContent } from "./blueprint-archive.js";
+import { isReservedBlueprintKey, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
+import { CONNECT_FLOW_LIFETIME_MS, handoffTargetOrigin, hashPresentedSecret, hashSecret, newSecretToken, PENDING_HANDOFF_LIFETIME_MS } from "./connect-handoff.js";
+import { deliver, registerDevice } from "./notification-service.js";
+import {
+  DEVICE_HANDOFF_LIFETIME_MS, isDeviceHandoffState, sealDeviceSessionHandoff,
+  type DeviceSessionCredential, type DeviceSessionHandoff,
+} from "./auth/device-session-handoff.js";
 
 const logger = createWorkshopLogger("workshop.user");
 
@@ -29,18 +42,14 @@ const logger = createWorkshopLogger("workshop.user");
 // listOutputs() call wakes and how long it waits. The client calls again until catch-up is done.
 const OUTPUTS_BACKFILL_PAGE = 16;
 
-type ConnectedAccountRecord = {
-  id: number;
-  account: Fetcher<GatekeeperUser>;
-  description: AccountDescription;
-  vendorId: string;   // Derived from the GATEKEEPER_ binding name (e.g. "google", "email").
-  credentialExpiresAt?: Date;    // When credentials are expected to expire, if known.
-  credentialsExpired?: boolean;  // Set true by async notification from gatekeeper.
-  // True if the Workshop created this account automatically via GatekeeperVendor.createAccount()
-  // (no OAuth flow), rather than the user connecting it. Such accounts are protected from manual
-  // disconnect, since deleting one permanently destroys the user's data in that gatekeeper.
-  autoProvisioned?: boolean;
-};
+/** Server-enforced lifetime of a Workshop session issued to a native device. */
+export const DEVICE_SESSION_LIFETIME_MS = 30 * 24 * 60 * 60_000;
+
+/**
+ * How long a user selection ticket (GatekeeperUserSelection) remains
+ * redeemable.
+ */
+export const GATEKEEPER_USER_SELECTION_LIFETIME_MS = 30 * 60 * 1000;
 
 /**
  * Metadata about an auto-provisioned account that provides an agent singleton and/or a management UI.
@@ -62,7 +71,9 @@ export type ProvidedAccountInfo = {
 // shape keeps the methods' declared return types (e.g. createAccount's Fetcher<GatekeeperUser>)
 // usable directly, the way the runtime stub actually behaves.
 type AccountCreatorStub = Required<Pick<GatekeeperVendor, "createAccount">>;
+type ResourceCreatorStub = Required<Pick<GatekeeperVendor, "createResource">>;
 type SingletonAccountStub = Required<Pick<GatekeeperUser, "getSingletonGatekeeperClass" | "startAppUi">>;
+type CreationConfiguratorStub = Required<Pick<GatekeeperUser, "startCreationConfigurator">>;
 
 function areCredentialsValid(record: ConnectedAccountRecord): boolean {
   if (record.credentialsExpired) return false;
@@ -76,9 +87,51 @@ function areCredentialsValid(record: ConnectedAccountRecord): boolean {
  */
 export const CLOUDFLARE_VENDOR_ID = "cloudflare";
 
-export type UserAiModelRecord = {
-  profile: AiChatAuthorInfo;
-  config: AiModelConfig;
+const withholdSecret = (secret: string) => secret === "" ? "" : null;
+
+/** Withholds the non-empty secrets of `config`, for returning it to a client. */
+function redactModelConfig(config: AiModelConfig): RedactedAiModelConfig {
+  let {apiToken, extraHeaders, ...rest} = config;
+  return {
+    ...rest,
+    apiToken: withholdSecret(apiToken),
+    ...(extraHeaders && {extraHeaders: Object.fromEntries(
+        Object.entries(extraHeaders).map(([name, value]) => [name, withholdSecret(value)]))}),
+  };
+}
+
+/**
+ * Fills in the `null` secrets of `config` from `source`, throwing if `source` is absent or doesn't
+ * hold them. Secrets only carry over to the endpoint they were configured for: otherwise a client
+ * could point the model at its own server and receive them.
+ */
+function resolveWithheldSecrets(
+    config: RedactedAiModelConfig, source?: AiModelConfig): AiModelConfig {
+  let resolve = (secret: string | null, stored: string | undefined, what: string) => {
+    if (secret !== null) return secret;
+    if (!source) {
+      throw new Error(`A value for ${what} is required.`);
+    }
+    if (source.provider !== config.provider || (source.apiUrl ?? "") !== (config.apiUrl ?? "")) {
+      throw new Error(`Please re-enter ${what}, since the provider or API URL changed.`);
+    }
+    if (stored === undefined) {
+      throw new Error(`There is no stored ${what} to keep.`);
+    }
+    return stored;
+  };
+
+  let storedHeader = (name: string) => source?.extraHeaders && Object.hasOwn(source.extraHeaders, name)
+      ? source.extraHeaders[name] : undefined;
+
+  let {apiToken, extraHeaders, ...rest} = config;
+  return {
+    ...rest,
+    apiToken: resolve(apiToken, source?.apiToken, "the API token"),
+    ...(extraHeaders && {extraHeaders: Object.fromEntries(
+        Object.entries(extraHeaders).map(([name, value]) =>
+            [name, resolve(value, storedHeader(name), `the value of header "${name}"`)]))}),
+  };
 }
 
 export type UserChatContext = {
@@ -92,77 +145,9 @@ export type XcityChatAgentPersona = {
   persona: string | null;
 };
 
-type LoginSessionRecord = {
-  tokenId: string,  // sha256 hash of token, hex-formatted
-  created: Date,
-}
-
-// Blueprint record stored in the user's `blueprints` collection.
-type BlueprintUserRecord = {
-  id: string;
-  metadata: BlueprintMetadata;
-  gadgetId?: string;
-  // Source of truth for whether the blueprint is featured deployment-wide.
-  featured?: boolean;
-};
-
-type LibraryBlueprintRecord = {
-  id: string;
-  metadata: BlueprintMetadata;
-  addedAt: Date;
-  uploaded: boolean;
-};
-
-type GadgetRecord = GadgetMetadata & {
-  created: Date;
-  lastActive?: Date;  // if missing, gadget is provisional
-  // If we're not the gadget owner (it was shared with us), `owner` is set (inherited from
-  // GadgetMetadata).
-};
-
 function isFullyCreated(g: GadgetRecord): g is GadgetMetadataWithTimestamps {
   return g.lastActive !== undefined;
 }
-
-/**
- * One output of a workspace, as pushed into a user's output index by the Overseer that owns it
- * (see `syncWorkspaceOutputs()`). Carries only what the workspace itself knows: its title,
- * activity time and ownership are joined in from the `gadgets` collection on read, so they can't
- * go stale here.
- */
-export type WorkspaceOutputEntry = {
-  workpieceId: WorkpieceId;
-  title: string;
-  created: Date;
-
-  /** The format the gadget was built as, if it was instantiated from a blueprint declaring one. */
-  output?: BlueprintOutput;
-};
-
-type OutputRecord = WorkspaceOutputEntry & {
-  // The workspace containing this output (an Overseer DO id).
-  workspaceId: string;
-};
-
-// AI Gateway billing state for the optional top-up flow: which Cloudflare account to bill and a
-// cached credit balance. The OAuth tokens themselves live in the connected Cloudflare *gatekeeper*
-// account (vendorId "cloudflare"); billing reads a usable token from there via getUsableAccessToken.
-type CloudflareBilling = {
-  // Selected account, once chosen (auto-selected when the grant sees exactly one).
-  accountId?: string;
-  accountName?: string;
-  // Cached credit balance (USD) and when it was last fetched (unix ms).
-  creditsRemaining?: number | null;
-  creditsUpdatedAt?: number;
-};
-
-// Cached Xcity wallet balance. The GoTrue tokens live in the connected Xcity gatekeeper account
-// (vendorId "xcity"); the usage checker reads a usable token from there via getUsableAccessToken.
-type XcityWalletBalance = {
-  // Cached wallet balance in Xcity credits and when it was last fetched (unix ms).
-  creditsRemaining?: number | null;
-  creditsUpdatedAt?: number;
-};
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length != b.length) {
@@ -176,86 +161,6 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 
   return result === 0;
 }
-
-function makeUserStorage(storage: DurableObjectStorage) {
-  return createTypedStorage(storage, {
-    collections: {
-      aiModels: collection<UserAiModelRecord>()({
-        primaryKey: record => record.profile.id,
-      }),
-      gadgets: collection<GadgetRecord>()({
-        primaryKey: "id"
-      }),
-      connectedAccounts: collection<ConnectedAccountRecord>()({
-        primaryKey: "id"
-      }),
-      sessions: collection<LoginSessionRecord>()({
-        primaryKey: "tokenId",
-      }),
-      blueprints: collection<BlueprintUserRecord>()({
-        primaryKey: "id",
-      }),
-      libraryBlueprints: collection<LibraryBlueprintRecord>()({
-        primaryKey: "id",
-      }),
-      // Outputs of every workspace in `gadgets`, mirrored here by each workspace's Overseer so the
-      // Outputs page is one cheap read of the user's own DO. Entries are meaningful only while the
-      // corresponding `gadgets` record exists; `syncWorkspaceOutputs()` and the `gadgets` deletion
-      // paths keep the two in step.
-      outputs: collection<OutputRecord>()({
-        primaryKey: record => `${record.workspaceId}:${record.workpieceId}`,
-        nonUniqueIndexes: {
-          byWorkspace(record: OutputRecord) { return record.workspaceId; },
-        },
-      }),
-    },
-    singletons: {
-      // AI Gateway billing state (selected account + cached balance) for the optional top-up flow;
-      // null until a Cloudflare account is connected and resolved.
-      cloudflareBilling: <CloudflareBilling | null>null,
-
-      created: false,
-      profile: <AiChatAuthorInfo>{
-        type: "user",
-        name: "User",
-        id: "user@example.com",
-      },
-      quickModel: <string | null>null,
-      preferredModel: <string | null>null,
-      preferredXcityAgent: <string | null>null,
-      onboardingCompleted: false,
-
-      // Set once the user's pre-existing workspaces have been asked to populate the outputs index
-      // (see #backfillOutputs()). Workspaces created since push on their own.
-      outputsBackfilled: false,
-
-      // How far that catch-up has got: the last workspace id examined. The sweep runs a page at a
-      // time and resumes here on the next visit.
-      outputsBackfillCursor: "",
-
-      nextAccountId: 0,
-      pinnedBlueprints: <string[]>[],
-
-      // Per-user free-tier daily LLM-call counter (only used when ENABLE_CLOUDFLARE_LIMITS is on).
-      // Stores the current UTC day and the calls made that day; a stale `day` implicitly resets the
-      // count. Folds the former standalone RateLimitDO into the user object.
-      dailyLlmCount: <{ day: string; count: number } | null>null,
-
-      // Xcity sign-in identity and per-user model-plane cache. The litellm virtual key is a secret
-      // and never leaves this user object except as part of an internal model config.
-      xcityIdentity: <XcityUserIdentity | null>null,
-      xcityModelPlane: <XcityModelPlaneCache>{},
-      xcityWalletBalance: <XcityWalletBalance | null>null,
-
-      // `passwordHash` value as passed to `login()`, but with an extra round of SHA-256 applied.
-      //
-      // null = password disabled (e.g. because some other auth mechanism is used)
-      passwordHashHash: <Uint8Array | null>null,
-    }
-  });
-}
-
-type UserStorage = ReturnType<typeof makeUserStorage>;
 
 function unavailableGatekeeperVendorInfo(id: string): GatekeeperVendorInfo {
   return {
@@ -313,22 +218,38 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   private storage: UserStorage;
   private vendors: Map<string, Service<GatekeeperVendor>>;
   private adminSettings: DurableObjectNamespace<AdminSettings>;
+  #notificationSubscribers = new Map<object, RpcStub<NotificationSubscriber>>();
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
-
-    // Migrate data created prior to the minions -> gadgets rename.
-    // TODO(cleanup): Eventually remove this, very few people ever used it as "minions".
-    for (let [key, value] of Array.from(ctx.storage.kv.list({prefix: "minions:"}))) {
-      let newKey = "gadgets:" + key.slice("minions:".length);
-      ctx.storage.kv.put(newKey, value);
-      ctx.storage.kv.delete(key);
-    }
 
     this.storage = makeUserStorage(ctx.storage);
     this.adminSettings = this.ctx.exports.AdminSettings;
 
     this.vendors = buildGatekeeperVendorMap(env);
+  }
+
+  // Mirrors the profile into the deployment-wide user directory. Best-effort
+  // and does not block the caller. The `syncUser` call opens this DO's input
+  // gate, so a rename can start a second sync while one is in flight, and the
+  // two can reach the directory in either order. Each sync carries its
+  // `profileRev` and the directory keeps the highest, so no ordering is needed
+  // here. The revision counter only increases, and a failed sync leaves it
+  // behind so the next authentication retries.
+  #syncDirectory(): void {
+    const rev = this.storage.profileRev.get();
+    if (rev === this.storage.directoryRev.get()) return;
+    const profile = this.storage.profile.get();
+    this.ctx.exports.UserDirectoryDurableObject.getByName("")
+        .syncUser({ id: profile.id, name: profile.name }, rev)
+        .then(() => {
+          if (rev > this.storage.directoryRev.get()) this.storage.directoryRev.put(rev);
+        }, (error: unknown) => {
+          logger.warn("failed to sync user directory record", {
+            event: "user.directory.sync.failed",
+            error,
+          });
+        });
   }
 
   async authenticate(token: string): Promise<void> {
@@ -346,6 +267,16 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (!session) {
       throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
     }
+    const now = Date.now();
+    if ((session.expiresAt && session.expiresAt.getTime() <= now) ||
+        (session.pendingUntil && session.pendingUntil.getTime() <= now)) {
+      this.storage.sessions.delete(tokenId);
+      throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
+    }
+    if (session.pendingUntil) {
+      throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
+    }
+    this.#syncDirectory();
   }
 
   /**
@@ -354,7 +285,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * existing users can still sign in.
    */
   async authenticateFromCfAccess(email: string, allowCreate: boolean): Promise<boolean> {
-    if (!this.storage.created.get()) {
+    const isNew = !this.storage.created.get();
+    if (isNew) {
       if (!allowCreate) {
         throw new Error("New sign-ups are currently disabled on this deployment.");
       }
@@ -365,20 +297,116 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         name: email.split("@")[0],
         id: email,
       });
-      return true;
     }
-
-    return false;
+    this.#syncDirectory();
+    return isNew;
   }
 
-  async #newSessionToken(): Promise<string> {
-    let sessionToken = new Uint8Array(32);
-    crypto.getRandomValues(sessionToken);
+  async #newSessionToken(options: { expiresAt?: Date; pendingUntil?: Date } = {}): Promise<string> {
+    let { secret, hash: tokenId } = await newSecretToken();
+    this.storage.sessions.put({ tokenId, created: new Date(), ...options });
+    return secret.toBase64();
+  }
 
-    let tokenId = new Uint8Array(await crypto.subtle.digest('SHA-256', sessionToken)).toHex();
-    this.storage.sessions.put({ tokenId, created: new Date() });
+  /**
+   * Stage an idempotent, single-use transfer without returning encrypted credentials to page
+   * JavaScript. A Workshop session remains inactive until the HTTPS callback consumes the record;
+   * an Access token is already bounded by its JWT expiry and is stored only inside `handoff`.
+   */
+  async stageDeviceSessionHandoff(publicKey: string, state: string, accessJwt?: string)
+      : Promise<DeviceSessionHandoffStart> {
+    if (!this.storage.created.get()) {
+      throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
+    }
+    if (!isDeviceHandoffState(state)) throw new Error("Invalid device sign-in state.");
+    const stateHash = await hashSecret(new TextEncoder().encode(state));
+    const existing = this.storage.pendingDeviceHandoffs.get(stateHash);
+    if (existing && existing.expiresAt.getTime() > Date.now()) {
+      if (existing.publicKey !== publicKey) {
+        throw new Error("This device sign-in state is already bound to another key.");
+      }
+      // Reissue only the one-use ticket; a retry must not mint another credential or session.
+      const { secret, hash: ticketHash } = await newSecretToken();
+      this.storage.pendingDeviceHandoffs.put({ ...existing, ticketHash });
+      return { userDoId: this.ctx.id.toString(), ticket: secret.toHex() };
+    }
+    if (existing) this.#dropPendingDeviceHandoff(existing);
 
-    return sessionToken.toBase64();
+    const { secret: ticket, hash: ticketHash } = await newSecretToken();
+    const now = Date.now();
+    const handoffExpiresAt = now + DEVICE_HANDOFF_LIFETIME_MS;
+    let credential: DeviceSessionCredential;
+    let sessionTokenId: string | undefined;
+    let deviceSessionExpiresAt: number | undefined;
+    if (accessJwt) {
+      credential = { kind: "cloudflare-access", token: accessJwt };
+    } else {
+      const { secret, hash } = await newSecretToken();
+      sessionTokenId = hash;
+      deviceSessionExpiresAt = now + DEVICE_SESSION_LIFETIME_MS;
+      credential = {
+        kind: "workshop",
+        token: `${this.storage.profile.get().id}:${secret.toBase64()}`,
+        expiresAt: deviceSessionExpiresAt,
+      };
+    }
+    const handoff = await sealDeviceSessionHandoff(
+        publicKey, state, credential, handoffExpiresAt);
+    if (sessionTokenId && deviceSessionExpiresAt) {
+      this.storage.sessions.put({
+        tokenId: sessionTokenId,
+        created: new Date(now),
+        expiresAt: new Date(deviceSessionExpiresAt),
+        pendingUntil: new Date(handoffExpiresAt),
+      });
+    }
+    this.storage.pendingDeviceHandoffs.put({
+      stateHash,
+      ticketHash,
+      publicKey,
+      handoff,
+      expiresAt: new Date(handoffExpiresAt),
+      sessionTokenId,
+    });
+    await this.#armExpirySweep();
+    logger.info("device session handoff staged", {
+      event: "auth.device_handoff.staged",
+      credentialKind: credential.kind,
+    });
+    return { userDoId: this.ctx.id.toString(), ticket: ticket.toHex() };
+  }
+
+  /** Consume a staged handoff once and activate its pending Workshop device session, if any. */
+  async consumeDeviceSessionHandoff(state: string, ticket: string): Promise<DeviceSessionHandoff | null> {
+    if (!isDeviceHandoffState(state)) return null;
+    const presentedHash = hashPresentedSecret(ticket);
+    if (!presentedHash) return null;
+    const stateHash = await hashSecret(new TextEncoder().encode(state));
+    const pending = this.storage.pendingDeviceHandoffs.get(stateHash);
+    if (!pending) return null;
+    if (pending.expiresAt.getTime() <= Date.now()) {
+      this.#dropPendingDeviceHandoff(pending);
+      await this.#armExpirySweep();
+      return null;
+    }
+    if (pending.ticketHash !== await presentedHash) return null;
+    this.storage.pendingDeviceHandoffs.delete(stateHash);
+    if (pending.sessionTokenId) {
+      const session = this.storage.sessions.get(pending.sessionTokenId);
+      if (!session || !session.pendingUntil || session.pendingUntil.getTime() <= Date.now()) {
+        if (session) this.storage.sessions.delete(pending.sessionTokenId);
+        await this.#armExpirySweep();
+        return null;
+      }
+      const { pendingUntil: _pendingUntil, ...active } = session;
+      this.storage.sessions.put(active);
+    }
+    await this.#armExpirySweep();
+    logger.info("device session handoff consumed", {
+      event: "auth.device_handoff.consumed",
+      credentialKind: pending.sessionTokenId ? "workshop" : "cloudflare-access",
+    });
+    return pending.handoff;
   }
 
   async login(passwordHash: Uint8Array): Promise<string | null> {
@@ -400,20 +428,6 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       : Promise<string | null> {
     if (this.storage.created.get()) {
       return null;
-    }
-
-    // Do a little migration here for old data.
-    // TODO(soon): Delete this.
-    for (let gadget of Array.from(this.storage.gadgets.list())) {
-      if (!gadget.created || !gadget.lastActive) {
-        if (!gadget.created) {
-          gadget.created = new Date("2026-01-01");
-        }
-        if (!gadget.lastActive) {
-          gadget.lastActive = new Date("2026-01-01");;
-        }
-        this.storage.gadgets.put(gadget);
-      }
     }
 
     this.storage.created.put(true);
@@ -452,7 +466,17 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         name: email.split("@")[0],
         id: email,
       });
+      recordAnalytics(this.ctx, this.env, {
+        event_name: "account_created",
+        user_id: this.ctx.id.toString(),
+        source: "gatekeeper",
+      });
     }
+    recordAnalytics(this.ctx, this.env, {
+      event_name: "user_authenticated",
+      user_id: this.ctx.id.toString(),
+      source: "gatekeeper",
+    });
     return this.#newSessionToken();
   }
 
@@ -463,6 +487,71 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   /** Whether this account has a password set (false for gatekeeper sign-in accounts). */
   async hasPasswordLogin(): Promise<boolean> {
     return this.storage.passwordHashHash.get() !== null;
+  }
+
+  /**
+   * Exchange a native app's one-time device registration, or a browser's Web Push subscription,
+   * for that device's push subscription.
+   */
+  async registerNotificationDevice(registration: string | WebPushSubscription): Promise<void> {
+    let { deviceKey, subscriptionId } = await registerDevice(this.env, registration);
+    this.storage.notificationSubscriptions.put(
+        { ...this.storage.notificationSubscriptions.get(), [deviceKey]: subscriptionId });
+  }
+
+  /** Subscribe a visible authenticated client to live user notifications. */
+  async subscribeToNotifications(
+      subscriber: RpcStub<NotificationSubscriber>): Promise<RpcStub<{}>> {
+    subscriber = subscriber.dup();
+    let token = {};
+    this.#notificationSubscribers.set(token, subscriber);
+    let unsubscribe = () => {
+      let existing = this.#notificationSubscribers.get(token);
+      if (!existing) return;
+      this.#notificationSubscribers.delete(token);
+      existing[Symbol.dispose]();
+    };
+    subscriber.onRpcBroken(unsubscribe);
+    return new RpcStub<{}>({ [Symbol.dispose]: unsubscribe });
+  }
+
+  /** See `AuthenticatedApi.setWorkspaceNotificationMute()`. */
+  async setWorkspaceNotificationMute(workspaceId: string, mute: NotificationMute | null)
+      : Promise<void> {
+    let record = this.storage.gadgets.get(workspaceId);
+    if (!record) throw new Error("No such workspace belonging to user.");
+    record.notificationMute = mute ?? undefined;
+    this.storage.gadgets.put(record);
+  }
+
+  /**
+   * Offer a notification to visible clients; push it to every registered device unless one
+   * acknowledges within 3s. A finished task in a workspace the user muted goes nowhere.
+   */
+  async publishNotification(notification: UserNotification): Promise<void> {
+    let mute = this.storage.gadgets.get(notification.workspaceId)?.notificationMute;
+    if (notification.kind === "taskCompleted" && mute &&
+        ("indefinite" in mute || mute.until.getTime() > Date.now())) {
+      return;
+    }
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let acknowledged = await Promise.race([
+      Promise.any([...this.#notificationSubscribers.values()]
+          .map(subscriber => subscriber.notify(notification))).then(() => true, () => false),
+      new Promise<boolean>(resolve => { timeout = setTimeout(() => resolve(false), 3_000); }),
+    ]).finally(() => clearTimeout(timeout));
+    if (acknowledged) return;
+    let subscriptions = Object.entries(this.storage.notificationSubscriptions.get());
+    let results = await Promise.allSettled(subscriptions.map(async ([deviceKey, subscriptionId]) => {
+      if (await deliver(this.env, subscriptionId, notification)) return;
+      // This subscription is dead; the device gets a new one when its app next opens. Keep one it
+      // registered while this delivery was in flight.
+      let { [deviceKey]: current, ...others } = this.storage.notificationSubscriptions.get();
+      if (current === subscriptionId) this.storage.notificationSubscriptions.put(others);
+    }));
+    for (let result of results) {
+      if (result.status === "rejected") throw result.reason;
+    }
   }
 
   async changePassword(oldHash: Uint8Array, newHash: Uint8Array): Promise<void> {
@@ -557,6 +646,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let profile = this.storage.profile.get();
     profile.name = name;
     this.storage.profile.put(profile);
+    this.storage.profileRev.put(this.storage.profileRev.get() + 1);
+    this.#syncDirectory();
   }
 
   async #getXcityModelPlane(): Promise<XcityModelPlane | null> {
@@ -596,10 +687,27 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
   }
 
-  async listModels(): Promise<AiChatAuthorInfo[]> {
+  async setOwnCommitEmail(email: string | null): Promise<void> {
+    let profile = this.storage.profile.get();
+    if (email === null) {
+      delete profile.commitEmail;
+    } else {
+      validateCommitEmail(email);
+      profile.commitEmail = email;
+    }
+    this.storage.profile.put(profile);
+  }
+
+  async listModels(kind: ModelKind = "language"): Promise<AiChatAuthorInfo[]> {
+    // Tokenhub serves language models only.
+    let xcityModelPlane = kind === "language" ? await this.#getXcityModelPlane() : null;
+    return this.#listModels(await getGatewayModels(this.env), kind, xcityModelPlane);
+  }
+
+  #listModels(models: GatewayModels | null, kind: ModelKind,
+              xcityModelPlane: XcityModelPlane | null = null): AiChatAuthorInfo[] {
     let result: AiChatAuthorInfo[] = [];
 
-    let xcityModelPlane = await this.#getXcityModelPlane();
     if (xcityModelPlane) {
       let xcityModelIds = new Set<string>();
       for (let entry of xcityModelPlane.getModelList()) {
@@ -609,58 +717,98 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
       // User-configured models remain available, but tokenhub is authoritative for duplicates.
       for (let model of this.storage.aiModels.list()) {
-        if (!xcityModelIds.has(model.profile.id)) {
+        if (!xcityModelIds.has(model.profile.id) &&
+            modelKind(model.config.provider, model.config.model) === kind) {
           result.push(model.profile);
         }
       }
       return result;
     }
 
-    // When AI Gateway mode is active, include all suggested models for enabled providers.
-    let gwConfig = getAiGatewayConfig(this.env);
-    let gwModelIds = new Set<string>();
-    if (gwConfig) {
-      for (let entry of gwConfig.getModelList()) {
-        result.push(entry);
-        gwModelIds.add(entry.id);
-      }
+    // When AI Gateway mode is active, include the gateway models the deployment offers.
+    if (models) {
+      result.push(...models.list(kind));
     }
 
-    // Also include user-configured models, skipping any that duplicate a gateway model.
+    // Also include user-configured models, where users may add their own, skipping any that a
+    // gateway model shadows, whatever its mode (see #resolveModel()).
+    if (models && !models.userModels) return result;
     for (let model of this.storage.aiModels.list()) {
-      if (!gwModelIds.has(model.profile.id)) {
+      if (!models?.get(model.profile.id) &&
+          modelKind(model.config.provider, model.config.model) === kind) {
         result.push(model.profile);
       }
     }
     return result;
   }
 
-  async addModel(profile: AiChatAuthorInfo, config: AiModelConfig): Promise<void> {
-    let gwConfig = getAiGatewayConfig(this.env);
-    if (gwConfig && !gwConfig.providers.has(config.provider)) {
+  async addModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig,
+                 copySecretsFrom?: string): Promise<void> {
+    let models = await getGatewayModels(this.env);
+    models?.refuseUserModel();
+    let source: AiModelConfig | undefined;
+    if (copySecretsFrom !== undefined) {
+      source = this.#getHandAddedModel(copySecretsFrom, models).config;
+    }
+    // A gateway model, whatever its mode, would shadow the new model and leave it unreachable.
+    if (this.storage.aiModels.get(profile.id) || models?.get(profile.id)) {
+      throw new Error(`A model with ID "${profile.id}" already exists.`);
+    }
+    this.#putModel(profile, resolveWithheldSecrets(config, source), models);
+  }
+
+  async getModelConfig(id: string): Promise<{profile: AiChatAuthorInfo, config: RedactedAiModelConfig}> {
+    let {profile, config} = this.#getHandAddedModel(id, await getGatewayModels(this.env));
+    return {profile, config: redactModelConfig(config)};
+  }
+
+  async updateModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig): Promise<void> {
+    let models = await getGatewayModels(this.env);
+    models?.refuseUserModel();
+    let stored = this.#getHandAddedModel(profile.id, models).config;
+    if (config.provider !== stored.provider || config.model !== stored.model) {
+      throw new Error("A model's provider and model ID can't be changed.");
+    }
+    this.#putModel(profile, resolveWithheldSecrets(config, stored), models);
+  }
+
+  /** The stored record of a model the user added, throwing for AI Gateway models. */
+  #getHandAddedModel(id: string, models: GatewayModels | null): UserAiModelRecord {
+    let record = this.storage.aiModels.get(id);
+    // A stored model sharing a gateway model's ID is shadowed by it (see listModels()).
+    if (!record || models?.get(id)) {
+      throw new Error(`No such hand-added model: ${id}`);
+    }
+    return record;
+  }
+
+  #putModel(profile: AiChatAuthorInfo, config: AiModelConfig, models: GatewayModels | null) {
+    if (models && !models.providers.has(config.provider)) {
       throw new Error(`Provider "${config.provider}" is not available in AI Gateway mode.`);
     }
+    for (let limit of [config.contextWindow, config.outputLimit]) {
+      if (limit !== undefined && !(Number.isSafeInteger(limit) && limit > 0)) {
+        throw new Error("Token limits must be positive integers.");
+      }
+    }
+
+    // capnweb-validate lets through properties that RedactedAiModelConfig omits, and these are a
+    // deployment's to set on its own models.
+    let {reasoning, compactionInputBudget, behavesLike, capabilities, ...own} = config;
 
     profile.type = "agent";
-    this.storage.aiModels.put({profile, config});
+    this.storage.aiModels.put({profile, config: own});
   }
 
   async deleteModel(id: string): Promise<void> {
-    let xcityModelPlane = await this.#getXcityModelPlane();
-    let xcityModel = xcityModelPlane?.resolveModel(id);
+    let xcityModel = (await this.#getXcityModelPlane())?.resolveModel(id);
     if (xcityModel) {
       throw new Error(`Cannot delete built-in model "${xcityModel.profile.name}".`);
     }
 
-    // In AI Gateway mode, don't allow deleting built-in suggested models.
-    let gwConfig = getAiGatewayConfig(this.env);
-    if (gwConfig) {
-      for (let [provider, models] of Object.entries(SUGGESTED_MODELS)) {
-        if (gwConfig.providers.has(provider) && id in models) {
-          throw new Error(`Cannot delete built-in model "${models[id].name}".`);
-        }
-      }
-    }
+    // In AI Gateway mode, don't allow deleting the gateway's own models, whatever their mode.
+    let model = (await getGatewayModels(this.env))?.get(id);
+    if (model) throw new Error(`Cannot delete built-in model "${model.name}".`);
 
     this.storage.aiModels.delete(id);
   }
@@ -688,13 +836,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   async setPreferredModel(id: string | null): Promise<void> {
     if (id !== null) {
-      // Validate that the model exists in the user's configured models or as a gateway model.
-      let xcityModelPlane = await this.#getXcityModelPlane();
-      let gwConfig = getAiGatewayConfig(this.env);
-      let exists = !!this.storage.aiModels.get(id) ||
-          !!xcityModelPlane?.resolveModel(id) ||
-          (!xcityModelPlane && !!gwConfig?.resolveModel(id));
-      if (!exists) {
+      // Any model that resolves is accepted, hidden ones included (see getExternalMessageChatContext()).
+      if (!this.#resolveModel(id, await getGatewayModels(this.env), await this.#getXcityModelPlane())) {
         throw new Error(`No such model: ${id}`);
       }
     }
@@ -912,33 +1055,35 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   /** DO NOT MAKE PUBLIC -- returns API keys. Pure read: call sites replay it across DO resets
    * via retryOnDoReset, so it must stay free of writes and side effects. */
   async getChatContext(modelId: string | null): Promise<UserChatContext> {
-    let xcityModelPlane = await this.#getXcityModelPlane();
-    let gwConfig = getAiGatewayConfig(this.env);
+    return this.#getChatContext(
+        modelId, await getGatewayModels(this.env), await this.#getXcityModelPlane());
+  }
 
+  #getChatContext(modelId: string | null, models: GatewayModels | null,
+                  xcityModelPlane: XcityModelPlane | null = null): UserChatContext {
     let result: UserChatContext = {
       profile: this.storage.profile.get()
     };
     if (modelId) {
-      if (xcityModelPlane) {
-        result.aiModel = xcityModelPlane.resolveModel(modelId);
-      }
-      // In AI Gateway mode, resolve gateway models first.
-      if (!result.aiModel && !xcityModelPlane && gwConfig) {
-        result.aiModel = gwConfig.resolveModel(modelId);
-      }
+      result.aiModel = this.#resolveModel(modelId, models, xcityModelPlane);
       if (!result.aiModel) {
-        result.aiModel = this.storage.aiModels.get(modelId);
+        models?.refuseDisabled(modelId);
+        // No gateway model has the ID, so a stored model with it is one the deployment keeps
+        // users from running.
+        let stored = this.storage.aiModels.get(modelId);
+        if (stored) models?.refuseUserModel(stored.profile.name);
+        throw new Error(`No such model: ${modelId}`);
       }
-      if (!result.aiModel) throw new Error(`No such model: ${modelId}`);
     }
 
     // Resolve the quick model (used for lightweight tasks like title generation).
     if (xcityModelPlane) {
-      result.quickModel = gwConfig
-          ? gwConfig.getQuickModelConfig(xcityModelPlane)
+      result.quickModel = models
+          ? models.gateway.getQuickModelConfig(xcityModelPlane)
           : xcityModelPlane.getQuickModelConfig();
-    } else if (gwConfig) {
-      result.quickModel = gwConfig.getQuickModelConfig();
+    } else if (models) {
+      // In AI Gateway mode, always use the hardcoded quick model.
+      result.quickModel = models.gateway.getQuickModelConfig();
     } else {
       let quickModelId = this.storage.quickModel.get();
       if (quickModelId) {
@@ -952,13 +1097,33 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async getExternalMessageChatContext(existingChatModelId: string | null): Promise<UserChatContext> {
-    let models = await this.listModels();
-    // Prefer the existing chat's model, then the user's preferred model, then the first available model.
-    let selectedModel = models.find(model => model.id === existingChatModelId)
-      ?? models.find(model => model.id === this.storage.preferredModel.get())
-      ?? models[0];
+    // An existing chat keeps its model while it still resolves, even once no longer offered. A new
+    // conversation takes the user's preferred model only while it is still offered, as the web
+    // composer does with its stored choice, and otherwise the first available model.
+    let models = await getGatewayModels(this.env);
+    let xcityModelPlane = await this.#getXcityModelPlane();
+    let selectedModelId = existingChatModelId;
+    if (selectedModelId === null || !this.#resolveModel(selectedModelId, models, xcityModelPlane)) {
+      let offered = this.#listModels(models, "language", xcityModelPlane);
+      let preferredModel = this.storage.preferredModel.get();
+      selectedModelId = (offered.find(model => model.id === preferredModel) ?? offered[0])?.id ?? null;
+    }
 
-    return this.getChatContext(selectedModel?.id ?? null);
+    return this.#getChatContext(selectedModelId, models, xcityModelPlane);
+  }
+
+  /**
+   * Resolve a model ID the way chats do: a gateway model shadows a stored model with the same ID
+   * whatever its mode, so a disabled one resolves to nothing rather than to the stored model. No
+   * stored model resolves on a gateway deployment whose users may not add their own.
+   */
+  #resolveModel(id: string, models: GatewayModels | null,
+                xcityModelPlane: XcityModelPlane | null = null): UserAiModelRecord | undefined {
+    // Tokenhub is authoritative for the models it serves.
+    let xcityModel = xcityModelPlane?.resolveModel(id);
+    if (xcityModel) return xcityModel;
+    if (models?.get(id)) return models.resolve(id);
+    return models && !models.userModels ? undefined : this.storage.aiModels.get(id);
   }
 
   async listGadgets(): Promise<GadgetMetadataWithTimestamps[]> {
@@ -1223,9 +1388,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       }
 
       // Delete all R2 objects with the blueprint ID prefix.
-      for (let v = 1; v <= kvRecord.metadata.version; v++) {
-        await this.env.BLUEPRINT_CONTENT.delete(`${id}/${v}`);
-      }
+      await deleteBlueprintContent(this.env, id);
       await this.env.BLUEPRINT_CONTENT.delete(`${BLUEPRINT_SCREENSHOT_R2_PREFIX}${id}`);
 
       // Delete from KV.
@@ -1364,7 +1527,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return (await Promise.all(promises)).filter(value => value !== null);
   }
 
-  async connectAccount(vendorId: string, resourceUrlPatterns?: string[]): Promise<{url: string}> {
+  async connectAccount(vendorId: string, resourceUrlPatterns?: string[]): Promise<ConnectFlowStart> {
     let vendor = this.vendors.get(vendorId);
     if (!vendor) {
       throw new Error("No such service: " + vendorId);
@@ -1385,10 +1548,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let callback = this.ctx.exports.GatekeeperConnectCallbackImpl({props});
 
     let {url} = await vendor.connectAccount(callback, {resourceUrlPatterns});
+    let nonce = await this.openConnectFlow(accountId);
     logger.info("account connect started", {
       event: "account.connect.started", vendorId, accountId,
     });
-    return {url};
+    return { url, nonce };
   }
 
   // Iterate every connected-account record, skipping any that fails to load. A record can fail to
@@ -1587,16 +1751,116 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * Open the full-page management UI for an account that declares one. `context.isAdmin` is supplied
    * fresh by the caller so admin-gated features reflect the user's current status.
    */
-  async startAccountAppUi(accountId: number, context: AppUiContext): Promise<GatekeeperUiFrame> {
+  async startAccountAppUi(
+      accountId: number, options: Pick<AppUiContext, "isAdmin">,
+  ): Promise<GatekeeperUiFrame> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record?.description.providesUi) throw new Error("No such app.");
-    return (record.account as unknown as SingletonAccountStub).startAppUi(context);
+    let userSelectionExchange = this.ctx.exports.GatekeeperUserSelectionExchangeImpl({
+      props: { selectorUserId: this.ctx.id.toString(), appAccountId: accountId },
+    });
+    return (record.account as unknown as SingletonAccountStub)
+        .startAppUi({ isAdmin: options.isAdmin, userSelectionExchange });
   }
 
-  async ensureAccountResources(accountId: number, resourceUrlPatterns: string[]): Promise<{url?: string}> {
+  // The account record behind one of this user's gatekeeper apps, or undefined
+  // if `accountId` is not a UI-providing account the deployment currently
+  // offers (the same test listProvidedAccounts applies, since a "disabled"
+  // ambient gatekeeper's account stays dormant).
+  async #uiAccountRecord(accountId: number): Promise<ConnectedAccountRecord | undefined> {
+    let record = this.storage.connectedAccounts.get(accountId);
+    if (!record?.description.providesUi) return undefined;
+    let config = await readAdminConfig(this.env);
+    if (config.disabledGatekeepers.includes(record.vendorId)) return undefined;
+    if (record.autoProvisioned) {
+      if (ambientGatekeeperMode(config, record.vendorId) === "disabled") return undefined;
+    }
+    return record;
+  }
+
+  /**
+   * Mint a single-use ticket for a user selected on behalf of a gatekeeper app,
+   * redeemable through that gatekeeper app's exchange capability (see
+   * GatekeeperUserSelectionExchangeImpl). Returns null if the selected user is
+   * this user or does not exist. Self-selection uses stable DO identity because
+   * ctx.id.name may be absent after a cold start through idFromString().
+   */
+  async createGatekeeperUserSelection(
+      appAccountId: number, selectedUserId: string,
+  ): Promise<GatekeeperUserSelection | null> {
+    let app = await this.#uiAccountRecord(appAccountId);
+    if (!app) throw new Error("No such app.");
+    let selectedId = this.ctx.exports.UserDurableObject.idFromName(selectedUserId);
+    if (this.ctx.id.equals(selectedId)) return null;
+    let selectedProfile = await this.ctx.exports.UserDurableObject.get(selectedId).whoamiIfExists();
+    if (!selectedProfile) return null;
+    let profile = { displayName: selectedProfile.name };
+    let { secret, hash: ticketHash } = await newSecretToken();
+    let expiresAt = new Date(Date.now() + GATEKEEPER_USER_SELECTION_LIFETIME_MS);
+    this.storage.pendingUserSelections.put({
+      ticketHash, appAccountId, vendorId: app.vendorId, selectedUserId, expiresAt,
+    });
+    await this.#armExpirySweep();
+    return { ticket: secret.toHex(), profile };
+  }
+
+  /**
+   * Redeem a ticket returned from createGatekeeperUserSelection. A ticket can
+   * only be redeemed once by the gatekeeper app account that minted it. A
+   * ticket minted for a different gatekeeper app account is refused without
+   * being spent, so a later valid exchange can still redeem it. Returns all of
+   * the selected user's eligible same-vendor accounts. The gatekeeper handles
+   * zero or multiple results. A ticket represents a Workshop user, not a
+   * connected account, so a 1:1 mapping with a connected account is not
+   * guaranteed.
+   */
+  async redeemGatekeeperUserSelection(
+      appAccountId: number, ticket: string,
+  ): Promise<RedeemedGatekeeperUserSelection[]> {
+    let ticketHash = await hashPresentedSecret(ticket);
+    let record = ticketHash === undefined
+        ? undefined : this.storage.pendingUserSelections.get(ticketHash);
+    if (!record || record.appAccountId !== appAccountId) {
+      throw new Error("This selection has expired. Please select the user again.");
+    }
+    this.storage.pendingUserSelections.delete(record.ticketHash);
+    if (record.expiresAt.getTime() <= Date.now()) {
+      throw new Error("This selection has expired. Please select the user again.");
+    }
+    let app = await this.#uiAccountRecord(appAccountId);
+    if (!app || app.vendorId !== record.vendorId) throw new Error("No such app.");
+    return this.ctx.exports.UserDurableObject.getByName(record.selectedUserId)
+        .selectableGatekeeperUsers(record.vendorId);
+  }
+
+  /**
+   * Make the account's grant cover the resource types `resourceUrlPatterns` names. Only the
+   * gatekeeper knows what it was granted, so it decides: it returns the URL of a consent flow that
+   * widens the grant, opened here as a connect flow, or no URL when the grant already covers them.
+   */
+  async ensureAccountResources(accountId: number, resourceUrlPatterns: string[])
+      : Promise<ConnectFlowStart | null> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record) throw new Error("No such account.");
-    return record.account.ensureResources(resourceUrlPatterns);
+    let { url } = await record.account.ensureResources(resourceUrlPatterns);
+    if (url === undefined) {
+      // Nothing to grant, yet callers ask for what the account's stored description doesn't list as
+      // granted, so that list is out of date. A gatekeeper that renames a resource type's
+      // `urlPattern` reads the grants it recorded under the new name, but the description stored
+      // here keeps the old one until it is fetched again. Fetch it now, or the UI keeps offering a
+      // grant the account already has. Best-effort: null still means nothing needed granting.
+      try {
+        let description = await record.account.describe();
+        let current = this.storage.connectedAccounts.get(accountId);
+        if (current) this.storage.connectedAccounts.put({ ...current, description });
+      } catch (err) {
+        logger.warn("failed to refresh a stale account description", {
+          event: "account.describe.refresh.failed", vendorId: record.vendorId, accountId, error: err,
+        });
+      }
+      return null;
+    }
+    return { url, nonce: await this.openConnectFlow(accountId) };
   }
 
   async subscribeConnectedAccounts(
@@ -1765,10 +2029,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
   }
 
-  async reconnectAccount(accountId: number): Promise<{url: string}> {
+  async reconnectAccount(accountId: number): Promise<ConnectFlowStart> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record) throw new Error("No such account.");
-    return record.account.reconnect();
+    let { url } = await record.account.reconnect();
+    return { url, nonce: await this.openConnectFlow(accountId) };
   }
 
   async startResourceConfigurator(
@@ -1779,15 +2044,25 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return record.account.startResourceConfigurator(resourceUrlPattern);
   }
 
+  async startCreationConfigurator(accountId: number, resourceUrlPattern: string)
+      : Promise<GatekeeperUiFrame> {
+    let record = this.storage.connectedAccounts.get(accountId);
+    if (!record) throw new Error("No such account.");
+    return (record.account as unknown as CreationConfiguratorStub)
+        .startCreationConfigurator(resourceUrlPattern);
+  }
+
   /**
    * Persist a connected gatekeeper account that was established during sign-in (rather than via the
    * usual logged-in connectAccount flow). Used for providers like Cloudflare where signing in also
    * links the account for AI Gateway billing: the login callback resolves this user by verified
    * email, then calls here to store the resulting grant. That grant covers billing only: sign-in
    * requests no gadget-facing resources, so any later resource access is authorized separately.
+   * Returns the id of the connected account the grant now backs, so the login callback — which the
+   * gatekeeper keeps for that account's lifetime — can find it again.
    */
   async linkConnectedAccountFromLogin(
-      account: Fetcher<GatekeeperUser>, vendorId: string, expiresAt?: Date): Promise<void> {
+      account: Fetcher<GatekeeperUser>, vendorId: string, expiresAt?: Date): Promise<number> {
     let description = await account.describe();
     let uniqueName = description.uniqueName;
 
@@ -1814,7 +2089,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         existing.credentialExpiresAt = expiresAt;
         existing.credentialsExpired = false;
         this.storage.connectedAccounts.put(existing);
-        return;
+        return existing.id;
       }
     }
 
@@ -1827,6 +2102,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       vendorId,
       credentialExpiresAt: expiresAt,
     });
+    return id;
   }
 
   // Find an existing connected account for the given vendor + identity (uniqueName), excluding
@@ -1883,11 +2159,225 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record) throw new Error("No such account.");
 
-    // Re-fetch description since the user may have re-authed with different info.
-    record.description = await record.account.describe();
     record.credentialsExpired = false;
     record.credentialExpiresAt = expiresAt;
     this.storage.connectedAccounts.put(record);
+
+    // Re-fetch the description since the user may have re-authed with different info. Best-effort:
+    // the credentials are live either way, and a record still showing as expired over a failed
+    // describe() would send the user back through a reconnect that changes nothing.
+    try {
+      record.description = await record.account.describe();
+      this.storage.connectedAccounts.put(record);
+    } catch (err) {
+      logger.warn("failed to refresh the description of a restored account", {
+        event: "account.describe.refresh.failed", vendorId: record.vendorId, accountId, error: err,
+      });
+    }
+  }
+
+  // --- Connect handoff (see connect-handoff.ts) ---
+
+  /**
+   * Start a connect / reconnect / ensure-resources flow for `accountId`: mints the nonce the Workshop
+   * tab gives the popup (see ConnectFlowStart) and keeps its hash, so completeConnectHandoff can
+   * check that the ticket the flow produces came back through that popup.
+   */
+  async openConnectFlow(accountId: number): Promise<string> {
+    let { secret, hash: nonceHash } = await newSecretToken();
+    let expiresAt = new Date(Date.now() + CONNECT_FLOW_LIFETIME_MS);
+    this.storage.pendingConnectFlows.put({ nonceHash, accountId, expiresAt });
+    await this.#armExpirySweep();
+    return secret.toHex();
+  }
+
+  // Store a finished-but-unconfirmed flow and hand back the ticket its page must present, together
+  // with the flow's nonce, over the initiating user's session. Only the ticket's hash is kept, and
+  // only in this user's DO, so the ticket is redeemable by nobody else (completeConnectHandoff looks
+  // it up in the caller's own DO).
+  async #stagePendingHandoff(
+      record: Omit<PendingHandoffRecord, "ticketHash" | "expiresAt">): Promise<ConnectHandoff> {
+    let targetOrigin = handoffTargetOrigin(this.env);
+    let { secret, hash: ticketHash } = await newSecretToken();
+    let expiresAt = new Date(Date.now() + PENDING_HANDOFF_LIFETIME_MS);
+    this.storage.pendingHandoffs.put({ ...record, ticketHash, expiresAt });
+    await this.#armExpirySweep();
+    return { targetOrigin, ticket: secret.toHex() };
+  }
+
+  /** A gatekeeper finished a connect flow for a reserved account id; stage it until confirmed. */
+  async stagePendingConnect(accountId: number, account: Fetcher<GatekeeperUser>, vendorId: string,
+                            credentialExpiresAt?: Date): Promise<ConnectHandoff> {
+    let description = await account.describe();
+    return this.#stagePendingHandoff({
+      kind: "connect", accountId, credentialExpiresAt, connect: { account, description, vendorId },
+    });
+  }
+
+  /**
+   * A gatekeeper finished a reconnect/ensureResources flow; its credentials stay staged there under
+   * `stageId`, which commitReconnect() names so the ticket activates exactly those credentials.
+   */
+  stagePendingRestore(accountId: number, stageId: string, credentialExpiresAt?: Date)
+      : Promise<ConnectHandoff> {
+    return this.#stagePendingHandoff({ kind: "restore", accountId, stageId, credentialExpiresAt });
+  }
+
+  /**
+   * Redeem a finished flow's handoff. Called by the Workshop's own /connect/handoff page in the popup
+   * over the popup's session; `nonce` proves the popup is the one this user's tab opened for that
+   * flow. The ticket's record is deleted before anything else, so a ticket is single-use however the
+   * rest goes (DO input gates serialize the read and delete) and a wrong nonce still spends it; the
+   * nonce's flow is deleted too, so a nonce cannot be retried against another ticket. A staged
+   * connect the redemption cannot activate is dropped like an unredeemed one, so no grant is left
+   * reachable in a gatekeeper with nothing to revoke it.
+   */
+  async completeConnectHandoff(ticket: string, nonce: string): Promise<void> {
+    let [ticketHash, nonceHash] =
+        await Promise.all([hashPresentedSecret(ticket), hashPresentedSecret(nonce)]);
+    let record: PendingHandoffRecord | undefined;
+    if (ticketHash !== undefined) {
+      record = this.storage.pendingHandoffs.get(ticketHash);
+      if (record) this.storage.pendingHandoffs.delete(ticketHash);
+    }
+    let flow: PendingConnectFlow | undefined;
+    if (nonceHash !== undefined) {
+      flow = this.storage.pendingConnectFlows.get(nonceHash);
+      if (flow) this.storage.pendingConnectFlows.delete(nonceHash);
+    }
+    let now = Date.now();
+    if (!record || record.expiresAt.getTime() <= now ||
+        !flow || flow.expiresAt.getTime() <= now || flow.accountId !== record.accountId) {
+      if (record) await this.#dropPendingConnect(record);
+      throw new Error("This connection attempt has expired. Please try again.");
+    }
+
+    if (record.kind === "connect") {
+      if (!record.connect) throw new Error("Corrupt pending connection.");
+      try {
+        await this.putConnectedAccount({
+          id: record.accountId, ...record.connect, credentialExpiresAt: record.credentialExpiresAt,
+        });
+      } catch (err) {
+        await this.#dropPendingConnect(record);
+        throw err;
+      }
+      logger.info("account connected", {
+        event: "account.connect.completed", vendorId: record.connect.vendorId,
+        accountId: record.accountId,
+      });
+    } else {
+      let account = this.storage.connectedAccounts.get(record.accountId);
+      if (!account) throw new Error("No such account.");
+      if (record.stageId === undefined) throw new Error("Corrupt pending reconnect.");
+      // A failed commit changed nothing live, and the gatekeeper's stage expires on its own.
+      await account.account.commitReconnect(record.stageId);
+      await this.markCredentialsRestored(record.accountId, record.credentialExpiresAt);
+      logger.info("account credentials restored", {
+        event: "account.reconnect.completed", vendorId: account.vendorId,
+        accountId: record.accountId,
+      });
+    }
+  }
+
+  // Drop a pending handoff that will never activate. A staged connect holds a victim's (or just an
+  // abandoned) grant in a reachable gatekeeper DO, so it is revoked, best-effort. A staged restore
+  // left nothing live: the gatekeeper's staged credentials stop being committable on their own
+  // (commitStagedCredentials refuses an expired stage), though they stay stored until the next
+  // reconnect overwrites them; deleting them from here is a follow-up.
+  async #dropPendingConnect(pending: PendingHandoffRecord): Promise<void> {
+    if (pending.kind === "connect" && pending.connect) {
+      try {
+        await pending.connect.account.revoke();
+      } catch (err) {
+        logger.warn("failed to revoke unconfirmed connection", {
+          event: "connect.handoff.revoke.failed", vendorId: pending.connect.vendorId,
+          accountId: pending.accountId, error: err,
+        });
+      }
+    }
+    logger.info("unconfirmed connection dropped", {
+      event: "connect.handoff.expired", handoffKind: pending.kind, accountId: pending.accountId,
+    });
+  }
+
+  #dropPendingDeviceHandoff(pending: PendingDeviceHandoffRecord): void {
+    this.storage.pendingDeviceHandoffs.delete(pending.stateHash);
+    if (pending.sessionTokenId) this.storage.sessions.delete(pending.sessionTokenId);
+  }
+
+  // Arm the alarm for the soonest pending expiry, including device sessions and picker selections.
+  async #armExpirySweep(): Promise<void> {
+    let next: number | undefined;
+    let consider = (at: number) => { if (next === undefined || at < next) next = at; };
+    for (let flow of this.storage.pendingConnectFlows.list()) consider(flow.expiresAt.getTime());
+    for (let pending of this.storage.pendingDeviceHandoffs.list()) {
+      consider(pending.expiresAt.getTime());
+    }
+    for (let session of this.storage.sessions.list()) {
+      if (session.expiresAt) consider(session.expiresAt.getTime());
+    }
+    for (let selection of this.storage.pendingUserSelections.list()) {
+      consider(selection.expiresAt.getTime());
+    }
+    try {
+      for (let pending of this.storage.pendingHandoffs.list()) consider(pending.expiresAt.getTime());
+    } catch (err) {
+      // A record whose stub no longer deserializes (its Worker was unbound) fails the listing, and
+      // without a keys-only listing it cannot be deleted either. Staging a new connect must not
+      // depend on listing old ones, so arm a retry instead: one warning per lifetime for this user
+      // until the Worker is bound again, while the grant the record holds is reachable by nobody.
+      logger.warn("failed to list pending handoffs", {
+        event: "connect.handoff.arm.failed", error: err,
+      });
+      consider(Date.now() + PENDING_HANDOFF_LIFETIME_MS);
+    }
+    if (next === undefined) {
+      await this.ctx.storage.deleteAlarm();
+    } else {
+      await this.ctx.storage.setAlarm(next);
+    }
+  }
+
+  /**
+   * Drop unconfirmed connect handoffs, abandoned connect flows and picker selections, and expired
+   * device handoffs and sessions. Device handoff cleanup also deletes its unactivated session.
+   */
+  async alarm(): Promise<void> {
+    let now = Date.now();
+    let expiredFlows = Array.from(this.storage.pendingConnectFlows.list())
+        .filter(flow => flow.expiresAt.getTime() <= now);
+    for (let flow of expiredFlows) this.storage.pendingConnectFlows.delete(flow.nonceHash);
+    let expiredSelections = Array.from(this.storage.pendingUserSelections.list())
+        .filter(selection => selection.expiresAt.getTime() <= now);
+    for (let selection of expiredSelections) {
+      this.storage.pendingUserSelections.delete(selection.ticketHash);
+    }
+    let expired: PendingHandoffRecord[] = [];
+    try {
+      for (let pending of this.storage.pendingHandoffs.list()) {
+        if (pending.expiresAt.getTime() <= now) expired.push(pending);
+      }
+    } catch (err) {
+      // Same failure mode as #connectedAccountRecords: a stub for a Worker that is no longer bound
+      // fails to deserialize. Leave the sweep for next time (#armExpirySweep bounds the retry).
+      logger.warn("failed to list pending handoffs", {
+        event: "connect.handoff.sweep.failed", error: err,
+      });
+    }
+    for (let pending of expired) {
+      this.storage.pendingHandoffs.delete(pending.ticketHash);
+      await this.#dropPendingConnect(pending);
+    }
+    for (let pending of Array.from(this.storage.pendingDeviceHandoffs.list())) {
+      if (pending.expiresAt.getTime() <= now) this.#dropPendingDeviceHandoff(pending);
+    }
+    for (let session of Array.from(this.storage.sessions.list())) {
+      if ((session.expiresAt?.getTime() ?? Infinity) <= now) {
+        this.storage.sessions.delete(session.tokenId);
+      }
+    }
+    await this.#armExpirySweep();
   }
 
   async getGatekeeperClassFor(accountId: number, url: string)
@@ -1896,31 +2386,55 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let account = this.storage.connectedAccounts.get(accountId);
     if (!account) throw new Error("No such account.");
     let {class: cls, resource} = await account.account.getGatekeeperClassFor(url);
+    await this.#assertResourceEnabled(account.vendorId, resource);
+    return {class: cls, vendorId: account.vendorId, typeUrlPattern: resource.urlPattern};
+  }
 
-    // Block whole gatekeepers + disabled resources at this single core-side chokepoint where a
-    // resourceUrl becomes a capability (reached only via the user/UI-facing Overseer.newGatekeeper
-    // and blueprint instantiation — never from gadget or agent code).
-    let config = await readAdminConfig(this.env);
-    let vendorId = account.vendorId.toLowerCase();
-    if (config.disabledGatekeepers.includes(vendorId)) {
-      throw new Error(
-          `The "${account.vendorId}" gatekeeper is disabled on this deployment by an administrator.`);
+  /**
+   * Mint a gatekeeper class simulating a new resource of a creatable type (see
+   * GatekeeperVendor.createResource()). It belongs to no account; the returned `action` is the
+   * creation to queue.
+   */
+  async createResourceGatekeeper(vendorId: string, resourceUrlPattern: string, title: string)
+      : Promise<{class: DurableObjectClass<Gatekeeper<any>>, typeUrlPattern: string,
+                  action: ActionDescription}> {
+    let vendor = this.vendors.get(vendorId);
+    if (!vendor) throw new Error(`Unknown vendor "${vendorId}".`);
+    let {class: cls, resource, action} = await (vendor as unknown as ResourceCreatorStub)
+        .createResource(resourceUrlPattern, title);
+    if (!resource.creatable) {
+      throw new Error(`"${resource.title}" resources can't be created. ` +
+          "listConnectableResources marks the types that can.");
     }
+    await this.#assertResourceEnabled(vendorId, resource);
+    return {class: cls, typeUrlPattern: resource.urlPattern, action};
+  }
 
-    // Blocking here prevents minting a new capability to a disabled resource even if the request
-    // bypasses the (separately filtered) picker/agent listings.
-    if (isResourceDisabled(config, vendorId, resource.urlPattern)) {
+  // Block whole gatekeepers + disabled resources at the core-side chokepoints where a gatekeeper
+  // class is minted (reached only via the user/UI-facing Overseer.newGatekeeper, blueprint
+  // instantiation, and the agent's createExternalResource -- never from gadget code). An ambient
+  // gatekeeper an admin set to "disabled" is blocked here too. Blocking here prevents minting a
+  // capability to a disabled resource even if the request bypasses the (separately filtered)
+  // picker/agent listings.
+  async #assertResourceEnabled(vendorId: string, resource: SupportedResource) {
+    let config = await readAdminConfig(this.env);
+    let normalized = vendorId.toLowerCase();
+    if (config.disabledGatekeepers.includes(normalized) ||
+        ambientGatekeeperMode(config, normalized) === "disabled") {
+      throw new Error(
+          `The "${vendorId}" gatekeeper is disabled on this deployment by an administrator.`);
+    }
+    if (isResourceDisabled(config, normalized, resource.urlPattern)) {
       throw new Error(
           `The "${resource.title}" resource is disabled on this deployment by an administrator.`);
     }
-
-    return {class: cls, vendorId: account.vendorId, typeUrlPattern: resource.urlPattern};
   }
 
   /**
    * Mint a verifier from one of THIS user's connected accounts, identified by accountId. The
    * overseer passes the returned verifier to a gatekeeper's `addObserver()` so the gatekeeper can
-   * check whether this user is allowed to observe the data read through it. Returns null if the
+   * check whether this user is allowed to observe the data read through it, or to its
+   * `applyCreation()` to create the resource in this account. Returns null if the
    * account no longer exists (or never existed). Throws if the account belongs to a different
    * vendor (not a legitimate UI state — only reachable by bypassing client-side filtering).
    *
@@ -1939,6 +2453,39 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       throw new Error("Invalid account selection for this service.");
     }
     return await account.account.getVerifier();
+  }
+
+  // All currently eligible accounts this selected user has with the requested vendor. The
+  // gatekeeper, not the Workshop, decides what zero or multiple accounts mean for its operation.
+  async #eligibleGatekeeperAccounts(vendorId: string): Promise<ConnectedAccountRecord[]> {
+    if (!this.storage.created.get()) return [];
+    vendorId = vendorId.toLowerCase();
+
+    let config = await readAdminConfig(this.env);
+    if (config.disabledGatekeepers.includes(vendorId)) return [];
+
+    await this.#ensureAutoProvisionedAccounts();
+
+    return [...this.#connectedAccountRecords()].filter((record) =>
+      record.vendorId === vendorId && areCredentialsValid(record) &&
+      (!record.autoProvisioned || ambientGatekeeperMode(config, vendorId) !== "disabled")
+    );
+  }
+
+  /**
+   * Return every currently eligible account belonging to this selected user and
+   * vendor, each with its own identity capability and the user's fresh
+   * display-name snapshot. Returns an empty array when none qualify; does not
+   * choose between multiple accounts. Accounts are resolved at redemption time
+   * and need not be the same accounts the user had when the ticket was minted.
+   */
+  async selectableGatekeeperUsers(vendorId: string): Promise<RedeemedGatekeeperUserSelection[]> {
+    let accounts = await this.#eligibleGatekeeperAccounts(vendorId);
+    if (accounts.length === 0) return [];
+    let profile = { displayName: this.storage.profile.get().name };
+    return Promise.all(accounts.map(async account => ({
+      verifier: await account.account.getVerifier(), profile,
+    })));
   }
 
   /**
@@ -1966,16 +2513,13 @@ export class GatekeeperConnectCallbackImpl
     return this.ctx.exports.UserDurableObject.get(userId);
   }
 
-  async complete(account: Fetcher<GatekeeperUser>, expiresAt?: Date): Promise<void> {
-    let userStub = this.#getUserStub();
+  complete(account: Fetcher<GatekeeperUser>, expiresAt?: Date): Promise<ConnectHandoff> {
+    let {accountId, vendorId} = this.ctx.props;
+    return this.#getUserStub().stagePendingConnect(accountId, account, vendorId, expiresAt);
+  }
 
-    await userStub.putConnectedAccount({
-      id: this.ctx.props.accountId,
-      account,
-      description: await account.describe(),
-      vendorId: this.ctx.props.vendorId,
-      credentialExpiresAt: expiresAt,
-    });
+  reconnectComplete(stageId: string, expiresAt?: Date): Promise<ConnectHandoff> {
+    return this.#getUserStub().stagePendingRestore(this.ctx.props.accountId, stageId, expiresAt);
   }
 
   async credentialsExpired(): Promise<void> {
@@ -1986,6 +2530,37 @@ export class GatekeeperConnectCallbackImpl
   async credentialsRestored(expiresAt?: Date): Promise<void> {
     let userStub = this.#getUserStub();
     await userStub.markCredentialsRestored(this.ctx.props.accountId, expiresAt);
+  }
+}
+
+type GatekeeperUserSelectionExchangeProps = {
+  selectorUserId: string;
+  appAccountId: number;
+};
+
+/**
+ * The capability exposed to a gatekeeper app for redeeming user selection
+ * tickets (AppUiContext.userSelectionExchange). Its props contain the selecting
+ * user's ID and the one gatekeeper account startAccountAppUi was called on.
+ * Every ticket is redeemed against that scope, so the capability cannot resolve
+ * anything that the Workshop did not mint for it.
+ */
+@validateRpc()
+export class GatekeeperUserSelectionExchangeImpl
+    extends WorkerEntrypoint<Cloudflare.Env, GatekeeperUserSelectionExchangeProps>
+    implements GatekeeperUserSelectionExchange {
+  /**
+   * RPC validation is skipped for the same reason every gatekeeper's
+   * getVerifier() skips it: the generated return validator wraps the native
+   * Fetcher in a Proxy that Workers RPC then refuses to serialize. The ticket
+   * itself is checked by hashPresentedSecret before it is looked up.
+   */
+  @skipRpcValidation()
+  redeem(ticket: string): Promise<RedeemedGatekeeperUserSelection[]> {
+    let { selectorUserId, appAccountId } = this.ctx.props;
+    let users = this.ctx.exports.UserDurableObject;
+    return users.get(users.idFromString(selectorUserId))
+        .redeemGatekeeperUserSelection(appAccountId, ticket);
   }
 }
 

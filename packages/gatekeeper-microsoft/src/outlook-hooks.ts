@@ -12,6 +12,7 @@
 
 import { DurableObject, RpcTarget, WorkerEntrypoint, type RpcStub } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
+import { haltIfAlarmsDisabled } from "@gadgets/gatekeeper-kit/alarm-guard";
 import { sanitizeTitle } from "@gadgets/gatekeeper-kit/action-description";
 import { HookDeliveryQueue, disposeStubs } from "@gadgets/gatekeeper-kit/hook-delivery-queue";
 import { escapeObservationValue } from "@gadgets/gatekeeper-kit/observers";
@@ -223,6 +224,7 @@ export class OutlookHookDriver extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    if (await haltIfAlarmsDisabled(this.ctx, this.env, "outlook-hooks")) return;
     const kv = this.ctx.storage.kv;
     if (this.#registrations().length > 0) {
       await this.#ensureSubscriptions();

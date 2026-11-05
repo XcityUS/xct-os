@@ -20,6 +20,7 @@ reviewing or answering questions about code under its directory:
 | `packages/gatekeeper-context/AGENTS.md` | Context Library collections and sharing |
 | `packages/gatekeeper-cloudflare/AGENTS.md` | Cloudflare OAuth, billing, Workers Observability |
 | `packages/gatekeeper-x/AGENTS.md` | X, whose reads are billed |
+| `packages/gatekeeper-microsoft/AGENTS.md` | Microsoft 365: SharePoint, Outlook, Calendar |
 | `packages/gatekeeper-websearch/AGENTS.md` | Web Search |
 | `packages/mcp-shared/AGENTS.md` | MCP / MCP Server Portal gatekeepers |
 | `packages/observability/AGENTS.md` | server logging, issue reporting, metrics |
@@ -60,7 +61,8 @@ IMPORTANT: All RPC interface implementations should use the annotation `@validat
 * Each gatekeeper runs as a separate Cloudflare Worker, except that a `gatekeeper-*` package with **no `wrangler.jsonc` is a library, not a worker** (`gatekeeper-kit` here; `gatekeeper-shared` in the internal repo). Deployable discovery is config-gated, not name-gated — `readDeployablePackages` in `scripts/release/manifest-lib.ts` keys solely on the presence of `wrangler.jsonc`, and `run-dev-server.ts` requires it too — so adding one to a library package makes it deployable, at which point `workerKind` would classify it a gatekeeper by prefix and the deploy wizard would demand `CLIENT_ID`/`CLIENT_SECRET` for it. `manifest-lib.test.ts` fails first if that ever happens.
 * Gatekeepers handle OAuth flows and provide sandboxed access to external APIs. A connect URL is a bearer capability, so every connect/reconnect flow ends on the kit's `connectHandoffPageHtml`, which sends the popup to the Workshop's `/connect/handoff` page, and that page redeems the single-use ticket over the popup's own session together with a per-flow nonce (see `docs/connect-handoff.md`); a reconnect stages its new credentials via `gatekeeper-kit/credential-stage` until the Workshop calls `GatekeeperUser.commitReconnect(stageId)` with the id that completion reported; completion is confirmed through the ticket, never through the URL alone.
 * A gatekeeper that declares `VendorDescription.autoProvisionsAccount` mints accounts with no OAuth flow, under a per-vendor mode the deployment admin picks; its account may provide an ambient agent singleton and/or a management UI. See `packages/workshop-backend/AGENTS.md`.
-* Writing or reviewing a gatekeeper: load the `write-gatekeeper` skill (`.agents/skills/write-gatekeeper/SKILL.md`).
+* Writing or reviewing a gatekeeper: load the `write-gatekeeper` skill (`.agents/skills/write-gatekeeper/SKILL.md`); every action declares an `autoApprovable` verdict, `true` unless its opt-out policy applies.
+* New gatekeepers follow the observer contract in the `write-gatekeeper` skill: explicit `subresources` on every observation, all access checks in `verifyObserverAccess()`, a required read-only `getHistoricalSubresources()` returning `[]`, and no-op `addObserver()` / `removeObserver()`. Existing gatekeepers migrate under different rules, also in the skill.
 
 ## Frontend
 
@@ -81,6 +83,7 @@ IMPORTANT: This repository uses pnpm, not npm. Always use pnpm.
 - Run `pnpm lint` before pushing; it includes script types, generated-config checks, and the workspace build.
 - `pnpm build` runs type-checks and codegen. For one package use `pnpm exec vp run -F <package> build`; most builds are tasks, not package.json scripts.
 - Use `pnpm --filter <package> test:run` while iterating and `pnpm test` for workspace verification. Cached tasks may replay results; cold-checkout tests must generate their own prerequisites on both entrypoints.
+- Check backend, API and agent changes end to end with `pnpm cf-os api` against a running `pnpm dev-server`, and use a browser only for what needs the UI: `new-chat`, `wait-for-agent`, `get-chat-history` and `merge-changes` drive a whole agent turn and print JSON. Find commands with `pnpm cf-os api search "<task>"` and `types <service>` (bare `types` is the whole API), after `create-account` with `CFOS_API_PASSWORD` (see `packages/api-cli/README.md`).
 - Cached Vite+ tasks strip undeclared environment variables. Declare output-affecting variables in `cache.env`; a path value does not fingerprint the external files it names.
 - For slow CI/container runs, keep the local watchdog defaults and explicitly choose longer limits. See [testing guidance](docs/testing.md) for commands and timeout policy.
 - Read [build-system guidance](docs/build-system.md) when changing task graphs, codegen, caching, or dev-server startup; [integration testing](docs/integration-testing.md) covers the workerd harness.

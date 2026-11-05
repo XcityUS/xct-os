@@ -10,6 +10,17 @@ declare global {
       // (which is what a secret binding, can carry).
       ADMINS?: string[] | string;
 
+      // The Models tab's admin settings a deployment has until an admin changes one: a JSON object
+      // of the AdminConfig fields ADMIN_CONFIG_SEED_FIELDS lists, or the same object as a JSON
+      // string (a secret's form). See effectiveAdminConfig() in admin-config.ts.
+      ADMIN_CONFIG_SEED?: object | string;
+
+      // Where this Workshop runs: "development" under `pnpm dev-server` (scripts/run-dev-server.ts),
+      // "test" in the integration harness. A deployment never sets it, and must not: an absent or
+      // any other value is a deployment. A local instance lifts the limit on what `cf-os api` may do
+      // (see the /api route in server.ts).
+      WORKSHOP_ENVIRONMENT?: "development" | "test";
+
       // Workers AI binding (injected by generate-wrangler-prod / run-dev-server; not in base wrangler.jsonc).
       WORKERS_AI: Ai;
 

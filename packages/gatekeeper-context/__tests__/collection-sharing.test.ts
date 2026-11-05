@@ -593,7 +593,13 @@ describe("git tokens of members who lose write access", () => {
         expect(await state.storage.getAlarm()).not.toBeNull();
       });
 
-      await expect(runDurableObjectAlarm(stub)).rejects.toThrow("Artifacts is unavailable.");
+      // Xcity: the alarm runs under guardedAlarm, which catches the failure and re-arms with
+      // backoff rather than rethrowing for the platform to retry.
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(artifacts.activeTokens.has(token.id)).toBe(true);
+      await runInDurableObject(stub, async (_instance, state) => {
+        expect(await state.storage.getAlarm()).not.toBeNull();
+      });
       artifacts.failRevocations = false;
       artifacts.failDeletion = false;
       expect(await runDurableObjectAlarm(stub)).toBe(true);
@@ -638,6 +644,32 @@ describe("git tokens of members who lose write access", () => {
     expect(await runDurableObjectAlarm(stub)).toBe(true);
     expect(artifacts.revoked).toContain(token.id);
     await stub.removeMember("alice", "bob");
+  });
+
+  it("stops retrying a failed revocation from the alarm after its attempts run out", async () => {
+    let artifacts = fakeArtifacts();
+    let stub = await createGitCollection(artifacts.binding);
+    let token = await stub.createGitToken("bob");
+
+    artifacts.failRevocations = true;
+    await expect(settled(stub.removeMember("alice", "bob"))).rejects.toThrow("could not be revoked yet");
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.kv.put("gitTokenRevokeAttempts", 15);
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await runInDurableObject(stub, async (_instance, state) => {
+      expect(state.storage.kv.get("gitTokenRevokeAttempts")).toBe(16);
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+    expect(artifacts.activeTokens.has(token.id)).toBe(true);
+
+    // The issuer record survives, so the next access change still revokes the token.
+    artifacts.failRevocations = false;
+    await stub.removeMember("alice", "bob");
+    expect(artifacts.revoked).toContain(token.id);
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(state.storage.kv.get("gitTokenRevokeAttempts")).toBe(0);
+    });
   });
 
   it("retries a failed revocation when a demotion is repeated", async () => {

@@ -73,11 +73,13 @@ import { WebFetchEnv } from "./web-fetch";
 import { UserDurableObject, type UserChatContext, type XcityChatAgentPersona } from "./user";
 import type { AgentSpawnerBinding, CallableAgent, SpawnCallableOptions } from "./agent-spawner-binding";
 import { recordAnalytics } from "./analytics";
+import { alarmsDisabled, guardedAlarm } from "@gadgets/observability/alarm-guard";
 import { reportIssue } from "@gadgets/observability/error-reporting";
 import type { ProductAnalyticsConnectionType, ProductAnalyticsGadgetInput } from "./analytics";
 import { checkUsageAndBalance } from "./ai-gateway-billing/limits/usage-checker";
 import { getXcityUsageConfig } from "./xcity/config";
 import { checkXcityUsage } from "./xcity/usage-checker";
+import { translateXcityModelError } from "./xcity/tokenhub-errors";
 import { normalizeAgentCatalog } from "./agent-catalog";
 import { refreshCachedBalance } from "./ai-gateway-billing/cloudflare/connection-service";
 import { SharingManager, SharingCaller, accessIncludesGadget } from "./sharing";
@@ -525,6 +527,10 @@ const CHAT_CHANGE_RETIRED_TTL_MS = 60_000;
 const CHAT_CHANGE_CLIENT_ID_PATTERN = /^[0-9A-Za-z_-]{1,64}$/;
 
 const AGENT_RESPONSE_DELIVERED_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+// A ready response re-arms the alarm at `now` until delivered, so a target that never accepts would
+// spin it forever; past this many failures the response is abandoned (see docs/alarm-audit.md, O1).
+const MAX_RESPONSE_DELIVERY_ATTEMPTS = 8;
 
 // How long after agent work becomes outstanding (a turn starts, or a call to a callable agent is
 // recorded) the keep-alive alarm fires. See #agentKeepAliveTime.
@@ -7166,6 +7172,7 @@ class OverseerImpl implements AgentHooks {
     // modified in the chat (see ChatCodeBase). Until then the chat reads committed code live at
     // each gadget's current head.
     let chatId = this.nextChatId();
+    let promptSequence: number | undefined;
     let attachmentFiles = await this.#prepareWorkspaceAttachmentFiles(chatId, canonicalAttachments);
     let scratchWorktree = await this.#prepareScratchWorktree(
         chatId, attachmentFiles, userMeta.profile);
@@ -7196,7 +7203,7 @@ class OverseerImpl implements AgentHooks {
         } : {}),
       });
 
-      let promptSequence = this.#commitPreparedChatMessage(
+      promptSequence = this.#commitPreparedChatMessage(
           chatId, timestamp, userMeta.profile, prepared, capsules, canonicalAttachments, formats,
           scratchWorktree, scratchWorktree?.commitId);
       if (responseTargetRegistration) {
@@ -7217,6 +7224,9 @@ class OverseerImpl implements AgentHooks {
 
     if (prepared.message !== undefined && userMeta.aiModel) {
       let needsAgentTurnKeepAlive = responseTargetRegistration !== undefined;
+      if (xcityAgent?.persona != null && promptSequence !== undefined) {
+        this.#debitXcitySkillUse(clientUser, chatId, promptSequence, xcityAgent.info.slug);
+      }
       this.startAgent(chatId, userMeta.aiModel, userMeta.profile,
                       clientUser.id.toString(), false, needsAgentTurnKeepAlive);
     }
@@ -7236,6 +7246,26 @@ class OverseerImpl implements AgentHooks {
     });
 
     return chatId;
+  }
+
+  // Bill one skill-use to the prompting user's Xcity wallet when this chat runs with a priced
+  // marketplace persona. Fires only from the two user-prompt entry points (newChat /
+  // sendChatMessage), so callback continuations, retries, and resumes never re-bill; the prompt's
+  // message sequence makes the wallet idempotency key stable for the turn and distinct across
+  // turns. Fire-and-forget: the User DO fails open and this must never delay or block the turn.
+  // Chats only carry `xcityAgent` context when the Xcity marketplace env is configured, so this is
+  // never reached on non-Xcity deployments.
+  #debitXcitySkillUse(
+      clientUser: DurableObjectStub<UserDurableObject>,
+      chatId: number, promptSequence: number, slug: string): void {
+    let chatRef = `${this.ctx.id.toString()}:${chatId}`;
+    let requestId = `xct-skill:${chatRef}:${promptSequence}`;
+    this.ctx.waitUntil(
+        clientUser.debitXcitySkillUse(slug, requestId, chatRef).catch((err: unknown) => {
+          this.logger.warn("xcity skill-use debit dispatch failed", {
+            event: "xcity.skill.debit.dispatch.failed", agentSlug: slug, chatId, error: err,
+          });
+        }));
   }
 
   async #resolveXcityAgentPersona(
@@ -7332,10 +7362,11 @@ class OverseerImpl implements AgentHooks {
     if (runsAgentTurn && userMeta.aiModel) {
       meta.activeAgent = userMeta.aiModel.profile;
     }
+    let promptSequence: number | undefined;
     try {
       this.ctx.storage.transactionSync(() => {
         this.storage.chatMeta.put(meta);
-        let promptSequence = this.#commitPreparedChatMessage(
+        promptSequence = this.#commitPreparedChatMessage(
             chatId, meta.lastActive, userMeta.profile, prepared, capsules, canonicalAttachments,
             formats, preparedScratchWorktree, attachmentSourceCommit);
         if (scratchWorktree && attachmentFiles.size) {
@@ -7362,6 +7393,10 @@ class OverseerImpl implements AgentHooks {
 
     if (runsAgentTurn && userMeta.aiModel) {
       let needsAgentTurnKeepAlive = responseTargetRegistration !== undefined;
+      let xcityAgent = this.storage.chatContext.get(chatId)?.xcityAgent;
+      if (xcityAgent?.persona != null && promptSequence !== undefined) {
+        this.#debitXcitySkillUse(clientUser, chatId, promptSequence, xcityAgent.slug);
+      }
       this.startAgent(chatId, userMeta.aiModel, userMeta.profile,
                       clientUser.id.toString(), false, needsAgentTurnKeepAlive);
     }
@@ -7472,7 +7507,20 @@ class OverseerImpl implements AgentHooks {
         chatId: record.chatId,
         error: err,
       });
-      throw err;
+      // Count against the stored record (another delivery may have raced this one), and once the
+      // budget is spent settle it as delivered, which keeps retries of the submission idempotent.
+      let current = this.storage.gadgetResponseDeliveries.get(record.idempotencyKey);
+      if (current?.status !== "ready") throw err;
+      let deliveryAttempts = (current.deliveryAttempts ?? 0) + 1;
+      if (deliveryAttempts < MAX_RESPONSE_DELIVERY_ATTEMPTS) {
+        this.storage.gadgetResponseDeliveries.put({ ...current, deliveryAttempts });
+      }
+      current.chatGatewayRpcTarget[Symbol.dispose]();
+      if (deliveryAttempts < MAX_RESPONSE_DELIVERY_ATTEMPTS) throw err;
+      this.logger.error("abandoned undeliverable external message response", {
+        event: "external.message.response.delivery.abandoned",
+        chatId: record.chatId,
+      });
     }
     this.storage.gadgetResponseDeliveries.put({
       idempotencyKey: record.idempotencyKey,
@@ -7925,8 +7973,10 @@ class OverseerImpl implements AgentHooks {
           durationMs: Date.now() - startedAt,
         });
       });
-    } catch (err: unknown) {
+    } catch (caught: unknown) {
       if (!owns()) return;
+      // Xcity: a TokenHub rate-limit failure becomes an actionable message (identity otherwise).
+      let err = translateXcityModelError(this.env, aiModel.config, caught);
       // The turn threw the user's stop (see cancelAgent): it ended as asked, so it is not reported
       // or logged as a failure, and the chat marks it as stopped. Any other error after Stop is a
       // real failure and is reported as one.
@@ -11014,10 +11064,16 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
    *   alarm, picking the work up yet again.
    * - External-message responses ready to deliver, and delivered records due to be swept.
    *
-   * See OverseerImpl.runAlarmTasks for how the concerns are run together.
+   * See OverseerImpl.runAlarmTasks for how the concerns are run together. It runs under
+   * guardedAlarm: the ALARMS_DISABLED kill switch, an hourly cap, and backoff in place of the
+   * `now` re-arm when it throws (see docs/alarm-audit.md).
    */
   async alarm(info?: AlarmInvocationInfo) {
-    await this.impl.runAlarmTasks(info?.retryCount);
+    // The guard catches a failed run and re-arms with backoff itself, so the platform's own retry
+    // (and so `retryCount` > 0) is only reached when the runtime kills the handler outright.
+    await guardedAlarm(this.ctx, {
+      key: "overseer", disabled: alarmsDisabled(this.env), maxPerHour: 1200, deferWhenOpen: true,
+    }, () => this.impl.runAlarmTasks(info?.retryCount));
   }
 
   // Initialize a brand-new workspace's storage. (Before git-backed code storage this also wrote

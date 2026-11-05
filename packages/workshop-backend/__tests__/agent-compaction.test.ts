@@ -126,6 +126,23 @@ describe("compaction trigger", () => {
         .toEqual({inputBudget: 128_000, maxOutputTokens: undefined});
   });
 
+  it("uses tokenhub context and output limits from Xcity model metadata", () => {
+    const [record] = parseTokenhubModelCatalog({
+      data: [{
+        id: "tokenhub-model",
+        context_window: 256_000,
+        max_output_tokens: 32_000,
+      }],
+    }, {
+      tokenhubUrl: "https://tokenhub.xcity.ai",
+      apiKey: "sk-tokenhub",
+      xcityUserId: "01823f64-8ac8-715e-bf17-0f92801f2af3",
+    })!;
+
+    expect(getModelTokenLimits(record.config))
+        .toEqual({inputBudget: 224_000, maxOutputTokens: 32_000});
+  });
+
   it("lets the model config override the window and output limit", () => {
     expect(getModelTokenLimits({
       provider: "anthropic", model: "claude-unlisted", apiToken: "",
@@ -181,24 +198,6 @@ describe("compaction trigger", () => {
       provider: "anthropic", model: "claude-unlisted", apiToken: "",
       contextWindow: 100_000, outputLimit: 20_000, compactionInputBudget: 90_000,
     }).inputBudget).toBe(80_000);
-
-  });
-
-  it("uses tokenhub context and output limits from Xcity model metadata", () => {
-    const [record] = parseTokenhubModelCatalog({
-      data: [{
-        id: "tokenhub-model",
-        context_window: 256_000,
-        max_output_tokens: 32_000,
-      }],
-    }, {
-      tokenhubUrl: "https://tokenhub.xcity.ai",
-      apiKey: "sk-tokenhub",
-      xcityUserId: "01823f64-8ac8-715e-bf17-0f92801f2af3",
-    })!;
-
-    expect(getModelTokenLimits(record.config))
-        .toEqual({inputBudget: 224_000, maxOutputTokens: 32_000});
   });
 
   it("recognizes /compact as the newest message, and only there", () => {

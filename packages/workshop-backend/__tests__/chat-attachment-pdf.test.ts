@@ -3,6 +3,7 @@ import { bridgePdfAttachments, modelApiSupportsPdfAttachments } from "../src/cha
 import {
   attachXcityModelDescriptorMetadata,
   parseTokenhubModelCatalog,
+  xcityModelRejectsImages,
 } from "../src/xcity/model-plane.js";
 
 // Request-level coverage (real pi adapters emitting real payloads, then bridged) lives in
@@ -113,5 +114,39 @@ describe("bridgePdfAttachments", () => {
     }, record.config);
 
     expect(modelApiSupportsPdfAttachments("openai-completions", model)).toBe(true);
+  });
+});
+
+describe("xcityModelRejectsImages", () => {
+  const tokenhubModel = (capabilities: Record<string, boolean>) => {
+    const record = parseTokenhubModelCatalog({
+      data: [{ id: "tokenhub-model", capabilities }],
+    }, {
+      tokenhubUrl: "https://tokenhub.xcity.ai",
+      apiKey: "sk-tokenhub",
+      xcityUserId: "01823f64-8ac8-715e-bf17-0f92801f2af3",
+    })![0];
+    return attachXcityModelDescriptorMetadata({
+      id: "tokenhub-model",
+      name: "tokenhub-model",
+      api: "openai-completions",
+      provider: "ollama",
+      input: ["text", "image"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128_000,
+      maxTokens: 4096,
+    }, record.config);
+  };
+
+  it("keeps images workspace-only for a PDF-only TokenHub model, which still declares image input", () => {
+    expect(xcityModelRejectsImages(tokenhubModel({ vision: false, pdf_input: true }))).toBe(true);
+    expect(xcityModelRejectsImages(tokenhubModel({ vision: true, pdf_input: false }))).toBe(false);
+  });
+
+  it("leaves models without Xcity metadata to upstream behavior", () => {
+    expect(xcityModelRejectsImages({
+      id: "m", name: "m", api: "openai-completions", provider: "ollama", input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1, maxTokens: 1,
+    })).toBe(false);
   });
 });

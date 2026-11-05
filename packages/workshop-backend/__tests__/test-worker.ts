@@ -170,6 +170,13 @@ export class FakeGatekeeperAccount extends WorkerEntrypoint<Cloudflare.Env, {
   }
 }
 
+/** A chat gateway response target that never accepts, as one whose Worker has gone away. */
+export class FailingChatGateway extends WorkerEntrypoint {
+  async onGadgetResponse(): Promise<void> {
+    throw new Error("chat gateway unavailable");
+  }
+}
+
 /** Test-only bridge to Workshop entrypoints that are otherwise reached through authenticated RPC. */
 export class GatekeeperUserPickerTestHooks extends DurableObject<Cloudflare.Env> {
   async createUser(userId: string, displayName: string): Promise<void> {

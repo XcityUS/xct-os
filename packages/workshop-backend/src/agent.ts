@@ -45,6 +45,9 @@ import {
   requestAnthropicCompaction, supportsAnthropicCompaction, withAnthropicCompactionBlock,
 } from "./anthropic-compaction";
 import { formatGrep, type GrepScan } from "./grep";
+import { formatAgentPersona } from "./xcity/agent-persona";
+import { isXcityModelThrottle } from "./xcity/tokenhub-errors";
+import { xcityModelRejectsImages } from "./xcity/model-plane";
 
 const logger = createWorkshopLogger("workshop.agent");
 const traced = createTracer(obsContext.get);
@@ -59,26 +62,6 @@ export function agentCodeChangeShape(change: CodeChange) {
     }
   }
   return shape;
-}
-
-function escapeXmlText(text: string): string {
-  return text.replace(/[<>&]/g, char => {
-    switch (char) {
-      case "<": return "&lt;";
-      case ">": return "&gt;";
-      case "&": return "&amp;";
-      default: return char;
-    }
-  });
-}
-
-export function formatAgentPersona(name: string, persona: string | null | undefined): string {
-  let trimmed = persona?.trim();
-  if (!trimmed) return "";
-  return `<xcity-agent-persona>\n` +
-      `<name>${escapeXmlText(name)}</name>\n` +
-      `<instructions>\n${trimmed}\n</instructions>\n` +
-      `</xcity-agent-persona>`;
 }
 
 /**
@@ -2180,7 +2163,8 @@ async function runAgentPass(
   // providers; conservatively include candidate parts even if their headers later rule them out.
   const attachmentImageCount = chatMessages.reduce((count, msg) => count + (msg.type === "message"
     ? msg.attachments?.filter(attachment => isAllowedChatAttachmentImageMimeType(attachment.mimeType) ||
-        (attachment.mimeType === PDF_MIME_TYPE && modelApiSupportsPdfAttachments(handle.model.api))).length ?? 0
+        (attachment.mimeType === PDF_MIME_TYPE &&
+            modelApiSupportsPdfAttachments(handle.model.api, handle.model))).length ?? 0
     : 0), 0);
   const attachmentImageMaxEdge = attachmentImageCount > 20 ? 2000 : 8000;
   for (let [msgIndex, msg] of chatMessages.entries()) {
@@ -2270,7 +2254,8 @@ async function runAgentPass(
                     "original contents are currently unavailable.]"}];
                 }
                 let text = decodeChatAttachmentText(attachment.mimeType, data);
-                if (canInlineChatAttachmentImage(attachment.mimeType, data, attachmentImageMaxEdge)) {
+                if (canInlineChatAttachmentImage(attachment.mimeType, data, attachmentImageMaxEdge) &&
+                    !xcityModelRejectsImages(handle.model)) {
                   return [{type: "text", text: `\n\n[Attached image${filename}${workspaceLocation}]`}, {
                     type: "image",
                     data: data.toBase64(),
@@ -3191,11 +3176,8 @@ async function runAgentPass(
     }
 
     // Split the system prompt into static and dynamic parts for better caching.
-    let agentPersona = formatAgentPersona(
-        agentContext.xcityAgent?.displayName ?? "", agentContext.xcityAgent?.persona);
-
     systemPromptSlots = [
-      [SYSTEM_PROMPT, agentPersona].filter(Boolean).join("\n\n"),
+      SYSTEM_PROMPT,
       (standardFormats ? `${standardFormats}\n\n` : "") +
           `${savedWorkspace ?? systemPromptWorkspace}${systemPromptConnections}` +
           (alwaysAvailableResourcesPrompt ? `\n\n${alwaysAvailableResourcesPrompt}` : ""),
@@ -3207,6 +3189,11 @@ async function runAgentPass(
   if (instanceInstructions) {
     systemPromptSlots[0] += `\n\n${instanceInstructions}`;
   }
+  // Xcity marketplace persona, last in the static slot (coding-agent chats only; spawned agents
+  // never inherit one). Empty without a persona, leaving the prompt byte-identical to upstream.
+  let agentPersona = agentContext.spawnerConfig ? "" : formatAgentPersona(
+      agentContext.xcityAgent?.displayName ?? "", agentContext.xcityAgent?.persona);
+  if (agentPersona) systemPromptSlots[0] += `\n\n${agentPersona}`;
   // Prompt caches are shared across the provider account, so anyone on it could probe for a cached
   // prefix. The workspace's random salt leads the project-specific part, so nobody without this
   // prompt can probe that part, or the chat after it.
@@ -4408,7 +4395,10 @@ async function runAgentPass(
     // it can be determined) for the overseer's triage; runAgent retries a transient one first.
     let message = turnFailure.errorMessage ?? "The model request failed.";
     let error = new AgentTurnError(message, httpStatusFromError(message, handle.lastResponse));
-    if (isRetryableAssistantError(turnFailure)) return {type: "transientFailure", error};
+    // (Xcity: a TokenHub plan throttle is not transient; the overseer reports it instead.)
+    if (isRetryableAssistantError(turnFailure) && !isXcityModelThrottle(modelConfig, error)) {
+      return {type: "transientFailure", error};
+    }
     throw error;
   }
 

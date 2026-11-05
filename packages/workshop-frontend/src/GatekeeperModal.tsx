@@ -412,15 +412,25 @@ export default function GatekeeperModal({
     setSpawnerEnv(
       (spawnerEnvCandidatesRef.current ?? []).map(entry => ({ ...entry, enabled: true })))
 
-    Promise.all([authenticatedApi.listModels(), authenticatedApi.listModels('decision')])
-        .then(([models, decisions]) => {
+    Promise.all([
+      authenticatedApi.listModels(),
+      authenticatedApi.listModels('decision'),
+      // The default model set on /providers; older backends (and API stubs without the method)
+      // may not implement it, so a synchronous throw falls back like a rejection.
+      Promise.resolve().then(() => authenticatedApi.getQuickModel()).catch(() => null),
+    ]).then(([models, decisions, defaultModelId]) => {
       if (cancelled) return
       setAvailableModels(models)
       setDecisionModels(decisions)
       setSelectedModelId((models[0] ?? decisions[0])?.id)
       if (models.length > 0) {
+        const defaultId =
+          defaultModelId && models.some(m => m.id === defaultModelId) ? defaultModelId : null
+        setSelectedModelId(defaultId ?? models[0].id)
         const lastSelected = localStorage.getItem('lastSelectedModel')
-        if (lastSelected && models.some(m => m.id === lastSelected)) {
+        if (defaultId) {
+          setSpawnerModelId(defaultId)
+        } else if (lastSelected && models.some(m => m.id === lastSelected)) {
           setSpawnerModelId(lastSelected)
         } else {
           setSpawnerModelId(models[0].id)

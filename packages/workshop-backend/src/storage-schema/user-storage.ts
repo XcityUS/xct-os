@@ -11,8 +11,9 @@ import type {
 } from "@gadgets/workshop-shared/api";
 import { chatKey } from "./overseer-storage.js";
 import type { AccountDescription, GatekeeperUser } from "@gadgets/workshop-shared/gatekeeper";
-import type { XcityModelPlaneCache, XcityUserIdentity } from "../xcity/model-plane.js";
 import type { DeviceSessionHandoff } from "../auth/device-session-handoff.js";
+import type { XcityModelPlaneCache, XcityUserIdentity } from "../xcity/model-plane";
+import type { XcityWalletBalance } from "../xcity/usage-checker";
 
 export type ConnectedAccountRecord = {
   id: number;
@@ -222,16 +223,6 @@ type OutputRecord = WorkspaceOutputEntry & {
  * cached credit balance. The OAuth tokens themselves live in the connected Cloudflare *gatekeeper*
  * account (vendorId "cloudflare"); billing reads a usable token from there via getUsableAccessToken.
  */
-/**
- * Cached Xcity wallet balance. The GoTrue tokens live in the connected Xcity gatekeeper account
- * (vendorId "xcity"); the usage checker reads a usable token from there via getUsableAccessToken.
- */
-export type XcityWalletBalance = {
-  /** Cached wallet balance in Xcity credits and when it was last fetched (unix ms). */
-  creditsRemaining?: number | null;
-  creditsUpdatedAt?: number;
-};
-
 export type CloudflareBilling = {
   /** Selected account, once chosen (auto-selected when the grant sees exactly one). */
   accountId?: string;
@@ -303,12 +294,6 @@ export function makeUserStorage(storage: DurableObjectStorage) {
       // null until a Cloudflare account is connected and resolved.
       cloudflareBilling: <CloudflareBilling | null>null,
 
-      // Xcity sign-in identity and per-user model-plane cache. The litellm virtual key is a secret
-      // and never leaves this user object except as part of an internal model config.
-      xcityIdentity: <XcityUserIdentity | null>null,
-      xcityModelPlane: <XcityModelPlaneCache>{},
-      xcityWalletBalance: <XcityWalletBalance | null>null,
-
       created: false,
       profile: <AiChatAuthorInfo>{
         type: "user",
@@ -342,6 +327,16 @@ export function makeUserStorage(storage: DurableObjectStorage) {
       // Stores the current UTC day and the calls made that day; a stale `day` implicitly resets the
       // count. Folds the former standalone RateLimitDO into the user object.
       dailyLlmCount: <{ day: string; count: number } | null>null,
+
+      // Xcity sign-in identity and per-user model-plane cache. The litellm virtual key is a secret
+      // and never leaves this user object except as part of an internal model config.
+      xcityIdentity: <XcityUserIdentity | null>null,
+      xcityModelPlane: <XcityModelPlaneCache>{},
+      xcityWalletBalance: <XcityWalletBalance | null>null,
+
+      // Tokenhub catalog models the user has hidden from their model list. Visibility only:
+      // hidden models still resolve in getChatContext() so existing chats keep working.
+      xcityHiddenModelIds: <string[]>[],
 
       // `passwordHash` value as passed to `login()`, but with an extra round of SHA-256 applied.
       //

@@ -88,6 +88,7 @@ import X_ACCOUNT_CONFIGURATOR_HTML from "./generated/x-account-configurator-ui.t
 import X_LIST_CONFIGURATOR_HTML from "./generated/x-list-configurator-ui.txt";
 import X_POST_CONFIGURATOR_HTML from "./generated/x-post-configurator-ui.txt";
 import X_PROFILE_CONFIGURATOR_HTML from "./generated/x-profile-configurator-ui.txt";
+import { haltIfAlarmsDisabled } from "@gadgets/gatekeeper-kit/alarm-guard";
 
 export { XGatekeeperImpl } from "./x-gatekeeper";
 export {
@@ -280,7 +281,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
       color: "#f2f2f2",
       tagline: "Read, post, and engage on X (formerly Twitter)",
       description:
-        "Connect your X account so Cloudflare OS can read your timeline, mentions, bookmarks, and " +
+        "Connect your X account so Xcity OS can read your timeline, mentions, bookmarks, and " +
         "search, and draft posts, threads, replies, likes, and follows that you approve before " +
         "they go out.",
     };
@@ -559,6 +560,7 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    if (await haltIfAlarmsDisabled(this.ctx, this.env, "connect-timeout")) return;
     // Drop the account if the connect flow never completed.
     if (!this.#creds.stored()) await this.ctx.storage.deleteAll();
   }

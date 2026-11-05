@@ -7,7 +7,14 @@ export const NO_AGENT_OPTION_VALUE = "__gadgets_no_agent__";
 
 export function getStoredSelectedModel(
   models: AiChatAuthorInfo[],
+  defaultModelId?: string | null,
 ): string | null {
+  // A default model explicitly chosen on /providers is a cross-device setting and outranks this
+  // device's remembered last selection.
+  if (defaultModelId && models.some((model) => model.id === defaultModelId)) {
+    return defaultModelId;
+  }
+
   const storedModel = localStorage.getItem(LAST_SELECTED_MODEL_KEY);
 
   if (storedModel === NO_AGENT_OPTION_VALUE) {

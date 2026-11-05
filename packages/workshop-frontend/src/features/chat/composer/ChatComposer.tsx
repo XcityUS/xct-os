@@ -21,6 +21,7 @@ import type {
   Overseer,
   SlashCommandChoice,
   SlashCommandRequest,
+  XcityCatalogAgent,
 } from "@gadgets/workshop-shared/api";
 import { isTransientRpcError } from "../../../rpcErrors";
 import { slashCommandTokenKey } from "./slash-commands/slashCommandInput";
@@ -50,7 +51,6 @@ import {
 import { CapturedConsoleLogsPrompt } from "./CapturedConsoleLogsPrompt";
 import ComposerAddMenu from "./ComposerAddMenu";
 import { ComposerModelSelector, type SelectedModel } from "./ComposerModelSelector";
-import type { XcityCatalogAgent } from "@gadgets/workshop-shared/api";
 import { XcityAgentPicker } from "../../../components/chat/XcityAgentPicker";
 import { useComposerDraft } from "./draft/useComposerDraft";
 import { buildComposerSubmission } from "./composerSubmission";
@@ -134,6 +134,7 @@ export const ChatComposer = ({
   models: AiChatAuthorInfo[];
   selectedModel: SelectedModel;
   onModelChange: (modelId: string | null) => void;
+  /** Xcity agent marketplace picker; shown only when `onXcityAgentChange` is set. */
   xcityAgents?: XcityCatalogAgent[];
   selectedXcityAgentSlug?: string | null;
   xcityPersonaAvailability?: Record<string, boolean | undefined>;
@@ -538,11 +539,15 @@ export const ChatComposer = ({
       const { message, capsules: capsuleSpecifiers, formats: formatRefs } =
         submissionResult.submission;
 
+      // The Xcity agent slug rides along only when the picker is shown, so a non-Xcity send calls
+      // onSend with exactly upstream's arguments.
+      const xcityAgentArg: [string | null] | [] =
+        onXcityAgentChange ? [selectedXcityAgentSlug] : [];
       await onSend(message, selectedModel?.id ?? null,
           capsuleSpecifiers,
           readyAttachments.length ? readyAttachments : undefined,
           formatRefs,
-          ...(onXcityAgentChange ? [selectedXcityAgentSlug] : []));
+          ...xcityAgentArg);
       clearSentAttachments(attachmentsSnapshot);
       if (!completeDraftSend(draftSend)) return;
       replaceComposerDocument({ text: "", capsules: [], formats: [], command: null });

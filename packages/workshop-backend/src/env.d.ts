@@ -6,6 +6,10 @@ import type { ProductAnalyticsRecord } from "./analytics";
 declare global {
   namespace Cloudflare {
     interface Env {
+      // Emergency stop for every Durable Object alarm: set to "true" and redeploy, and each alarm
+      // deletes itself the next time it fires (see @gadgets/observability/alarm-guard).
+      ALARMS_DISABLED?: string;
+
       // Deployment-wide admin usernames: a JSON binding, or the same array as a JSON string
       // (which is what a secret binding, can carry).
       ADMINS?: string[] | string;

@@ -10,7 +10,7 @@ const testState = vi.hoisted(() => {
   const newWorkspace = vi.fn<() => never>();
   return {
     addToast: vi.fn<(toast: unknown) => void>(),
-    authenticatedApi: { listModels, newWorkspace },
+    authenticatedApi: { listModels, newWorkspace, getQuickModel: async () => null },
     currentUser: { id: "user-a", name: "User A" },
     listModels,
     navigate: vi.fn<(options: unknown) => void>(),

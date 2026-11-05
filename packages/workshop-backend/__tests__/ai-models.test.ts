@@ -725,6 +725,58 @@ describe("getModel direct routing (no gateway)", () => {
     expect(request.headers.get("authorization")).toBe("Bearer ollama-token");
   }, 15000);
 
+  it("routes Xcity model-plane configs directly to tokenhub with user attribution", async () => {
+    const [record] = parseTokenhubModelCatalog({
+      data: [{
+        id: "gpt-5.5-xhigh",
+        context_window: 1_000_000,
+        max_output_tokens: 128_000,
+        capabilities: { vision: true, pdf_input: false },
+      }],
+    }, {
+      tokenhubUrl: "https://tokenhub.xcity.ai",
+      apiKey: "sk-tokenhub-user",
+      xcityUserId: "01823f64-8ac8-715e-bf17-0f92801f2af3",
+    })!;
+
+    const handle = getModel(env({
+      XCITY_TOKENHUB_URL: "https://tokenhub.xcity.ai",
+      XCITY_WALLET_URL: "https://wallet.xcity.ai",
+      WALLET_SERVICE_TOKEN: "wallet-service-token",
+    }), record.config, INITIATOR, {
+      userGateway: { accountId: "user-account-id", apiKey: "user-gateway-token" },
+      metadata: { source: "chat", gadgetId: "gadget-789", chatId: 9 },
+    });
+
+    expect(handle.model.api).toBe("openai-completions");
+    expect(handle.model.baseUrl).toBe("https://tokenhub.xcity.ai/v1");
+    expect(handle.aiGatewayLogRoute).toBeUndefined();
+
+    const request = await captureRequest(handle);
+    expect(request.url).toBe("https://tokenhub.xcity.ai/v1/chat/completions");
+    expect(request.headers.get("authorization")).toBe("Bearer sk-tokenhub-user");
+    expect(request.headers.get("cf-aig-authorization")).toBeNull();
+    expect(JSON.parse(request.body)).toMatchObject({
+      model: "gpt-5.5-xhigh",
+      user: "01823f64-8ac8-715e-bf17-0f92801f2af3",
+    });
+  }, 15000);
+
+  it("does not send the OpenAI-only `store` parameter to Ollama-style endpoints", async () => {
+    // LiteLLM forwards unknown parameters to the real vendor, so `store` makes a router model
+    // group backed by Anthropic fail with UnsupportedParamsError.
+    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider: "ollama",
+      model: "smart_router",
+      apiToken: "sk-tokenhub-user",
+      apiUrl: "https://tokenhub.xcity.ai",
+    }, INITIATOR);
+
+    const request = await captureRequest(handle);
+    expect(request.url).toBe("https://tokenhub.xcity.ai/v1/chat/completions");
+    expect(JSON.parse(request.body)).not.toHaveProperty("store");
+  }, 15000);
+
   it("sends the config's extra headers, overriding provider defaults", async () => {
     const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
       provider: "openai",
@@ -784,44 +836,6 @@ describe("getModel direct routing (no gateway)", () => {
 
     const request = await captureRequest(handle);
     expect(request.headers.get("x-proxy-key")).toBeNull();
-
-  }, 15000);
-
-  it("routes Xcity model-plane configs directly to tokenhub with user attribution", async () => {
-    const [record] = parseTokenhubModelCatalog({
-      data: [{
-        id: "gpt-5.5-xhigh",
-        context_window: 1_000_000,
-        max_output_tokens: 128_000,
-        capabilities: { vision: true, pdf_input: false },
-      }],
-    }, {
-      tokenhubUrl: "https://tokenhub.xcity.ai",
-      apiKey: "sk-tokenhub-user",
-      xcityUserId: "01823f64-8ac8-715e-bf17-0f92801f2af3",
-    })!;
-
-    const handle = getModel(env({
-      XCITY_TOKENHUB_URL: "https://tokenhub.xcity.ai",
-      XCITY_WALLET_URL: "https://wallet.xcity.ai",
-      WALLET_SERVICE_TOKEN: "wallet-service-token",
-    }), record.config, INITIATOR, {
-      userGateway: { accountId: "user-account-id", apiKey: "user-gateway-token" },
-      metadata: { source: "chat", gadgetId: "gadget-789", chatId: 9 },
-    });
-
-    expect(handle.model.api).toBe("openai-completions");
-    expect(handle.model.baseUrl).toBe("https://tokenhub.xcity.ai/v1");
-    expect(handle.aiGatewayLogRoute).toBeUndefined();
-
-    const request = await captureRequest(handle);
-    expect(request.url).toBe("https://tokenhub.xcity.ai/v1/chat/completions");
-    expect(request.headers.get("authorization")).toBe("Bearer sk-tokenhub-user");
-    expect(request.headers.get("cf-aig-authorization")).toBeNull();
-    expect(JSON.parse(request.body)).toMatchObject({
-      model: "gpt-5.5-xhigh",
-      user: "01823f64-8ac8-715e-bf17-0f92801f2af3",
-    });
   }, 15000);
 
   it("strips a legacy /api (or /v1) suffix from an Ollama base URL", () => {
@@ -1683,6 +1697,22 @@ describe("LanguageModelGatekeeper.startSession", () => {
       const config = { provider: "anthropic" as const, model: MODEL_ID, apiToken: "" };
       await expect(startSession(config, { ...OFF, ...DISABLED }).session)
           .rejects.toThrow(new Error(DISABLED_MESSAGE));
+    });
+
+    // Xcity: TokenHub models bypass the gateway (see getModel), so its policy doesn't apply.
+    it("starts a session for an Xcity TokenHub model once users may not", async () => {
+      const [record] = parseTokenhubModelCatalog({ data: [{ id: "deepseek-v4" }] }, {
+        tokenhubUrl: "https://tokenhub.xcity.ai",
+        apiKey: "sk-tokenhub-user",
+        xcityUserId: "01823f64-8ac8-715e-bf17-0f92801f2af3",
+      })!;
+      const { session, getConfig } = startSession(record.config, OFF, {
+        XCITY_TOKENHUB_URL: "https://tokenhub.xcity.ai",
+        XCITY_WALLET_URL: "https://wallet.xcity.ai",
+        WALLET_SERVICE_TOKEN: "wallet-service-token",
+      });
+      expect((await session).run).toBeTypeOf("function");
+      expect(getConfig).not.toHaveBeenCalled();
     });
   });
 });

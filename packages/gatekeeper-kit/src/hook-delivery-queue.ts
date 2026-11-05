@@ -64,6 +64,7 @@ const through = (index: string, time: number) => `${index}${timeKey(time + 1)}`;
  * #queue = new HookDeliveryQueue<Event>(this.ctx.storage.kv, () => logger.warn("dropped an event"));
  *
  * async alarm() {
+ *   if (await haltIfAlarmsDisabled(this.ctx, this.env, "hooks")) return; // see ./alarm-guard
  *   await this.#queue.run(Date.now(), (hookKey, event) => this.#deliver(hookKey, event));
  *   const next = this.#queue.nextDue();
  *   if (next !== undefined) await this.ctx.storage.setAlarm(next);

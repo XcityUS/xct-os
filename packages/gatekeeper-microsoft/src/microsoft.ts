@@ -29,6 +29,7 @@ import { workerVersionTag } from "@gadgets/workshop-shared/gatekeeper";
 import {
   PAGE_STYLE, connectHandoffPageHtml, errorPageHtml, escapeHtml, htmlResponse, INVALID_LINK_HTML,
 } from "@gadgets/gatekeeper-kit/connect-pages";
+import { haltIfAlarmsDisabled } from "@gadgets/gatekeeper-kit/alarm-guard";
 import { NONCE_KEY, advanceToOAuth, claimOAuth, putInitiation } from "@gadgets/gatekeeper-kit/connect-handshake";
 import { CONNECT_TIMEOUT_MS, NONCE_BYTES, generateNonce } from "@gadgets/gatekeeper-kit/connect-nonce";
 import {
@@ -713,6 +714,7 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    if (await haltIfAlarmsDisabled(this.ctx, this.env, "connect-timeout")) return;
     // Drop the account if the connect flow never completed.
     if (!this.#creds.stored()) await this.ctx.storage.deleteAll();
   }

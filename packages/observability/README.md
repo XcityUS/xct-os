@@ -21,3 +21,10 @@ is written once to its actor's index, the canonical copy to count, and once more
 workspace it names, so per-entity queries read their own index. The column layout lives in the import-free `metrics-schema.ts` (also
 exported as `@gadgets/observability/metrics-schema`), so dashboards can name columns rather than
 `blobN`.
+
+The `@gadgets/observability/alarm-guard` entry point holds the Durable Object alarm guardrails
+every `alarm()` handler uses. `haltIfAlarmsDisabled` is the `ALARMS_DISABLED` emergency stop,
+`scheduleAlarm` arms an alarm no earlier than one second from now, and `guardedAlarm` adds an
+hourly circuit breaker, failure backoff, and a limit on consecutive failures. It lives here
+because the workshop backend, the scheduler, `mcp-shared` and `gatekeeper-kit` (which re-exports
+it) all depend on this package already. See `docs/alarm-audit.md`.

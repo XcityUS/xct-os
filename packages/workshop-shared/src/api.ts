@@ -851,6 +851,21 @@ export interface AuthenticatedApi extends RpcTarget {
   /** Set the user's preferred Xcity marketplace agent slug for newly-created chats. */
   setPreferredXcityAgent(slug: string | null): Promise<void>;
 
+  /**
+   * Describe the user's default Xcity TokenHub provider: connected identity, tokenhub virtual
+   * key, which model IDs come from tokenhub, and per-hop `diagnostics` for this call. Returns
+   * null only when the deployment has no Xcity model plane configured; a user with no stored
+   * Xcity identity gets an empty info with `diagnostics.identity: false`.
+   */
+  getXcityProviderInfo(): Promise<XcityProviderInfo | null>;
+
+  /**
+   * Show or hide one Xcity TokenHub catalog model in the user's model list. Hiding is a per-user
+   * visibility toggle, not a deletion: hidden models still resolve for existing chats and can be
+   * re-added at any time. Ids not in the tokenhub catalog are ignored.
+   */
+  setXcityModelHidden(modelId: string, hidden: boolean): Promise<void>;
+
   /** Returns true if the user has completed the onboarding wizard. */
   isOnboardingCompleted(): Promise<boolean>;
 
@@ -1984,6 +1999,113 @@ export type ServerConfig = {
    * Compared with what VERSION_PATH answers to notice a connection that outlived a deploy.
    */
   backendVersion?: string;
+};
+
+/**
+ * The user's default Xcity TokenHub provider, shown on the /providers page when the deployment
+ * routes models through tokenhub. Contains the user's own tokenhub virtual key (a per-user
+ * secret already used as the apiToken of every tokenhub model config).
+ */
+export type XcityProviderInfo = {
+  /** Public tokenhub base URL the user's models are served from. */
+  tokenhubUrl: string;
+
+  /** Email of the connected Xcity identity, when known. */
+  email?: string;
+
+  /**
+   * The user's tokenhub virtual key — the same key the xcity.ai dashboard shows. Present once
+   * minted; absent while minting has not succeeded yet.
+   */
+  apiKey?: string;
+
+  /** IDs of the models listModels() currently sources from tokenhub (visible models only). */
+  modelIds: string[];
+
+  /**
+   * The full tokenhub model catalog with this user's per-model visibility. Entries with
+   * `hidden: true` are omitted from listModels() (and from `modelIds`) but still resolve for
+   * existing chats, and can be re-added at any time via setXcityModelHidden().
+   */
+  catalog: XcityCatalogModel[];
+
+  /**
+   * Per-hop outcome of the call that produced this info, so the /providers page can say which
+   * step of identity → wallet key mint → tokenhub catalog left the model list empty. Absent on
+   * older backends that don't collect it.
+   */
+  diagnostics?: XcityProviderDiagnostics;
+};
+
+/**
+ * Hop-by-hop outcome of resolving a user's tokenhub models: the stored Xcity identity, the
+ * per-user wallet key mint, and the tokenhub catalog fetch. Populated fresh on every
+ * getXcityProviderInfo() call — never a cached or global snapshot — and safe to show to the
+ * user: `error` is always a short classified string, never a raw error or stack.
+ */
+export type XcityProviderDiagnostics = {
+  /** True when the user has a stored Xcity identity (set at Xcity login). */
+  identity: boolean;
+
+  /** True when a wallet-minted tokenhub key for this user and wallet is available. */
+  keyPresent: boolean;
+
+  /**
+   * Outcome of the latest wallet key call (a mint, or a `resync` of the cached key), present
+   * only when this call made one.
+   */
+  keyMint?: {
+    /** Always true — the wallet hop ran (a cached key served as-is means this field is absent). */
+    attempted: boolean;
+
+    /** HTTP status of the wallet mint response, when one was received. */
+    status?: number;
+
+    /** Short classified failure: "network-error", "timeout", or "malformed-response". */
+    error?: string;
+
+    /**
+     * True when the call re-requested an already-cached key during a catalog refresh, so the
+     * wallet could re-sync it with the user's plan. Its failure is harmless: the cached key is
+     * used as-is and `keyPresent` stays true.
+     */
+    resync?: boolean;
+  };
+
+  /** Outcome of the tokenhub catalog hop, present once the catalog was fetched or served. */
+  catalog?: {
+    /** HTTP status of the tokenhub catalog response, when one was received. */
+    status?: number;
+
+    /** Short classified failure: "network-error", "timeout", or "malformed-response". */
+    error?: string;
+
+    /** Number of models the served catalog contains (0 means the key grants none). */
+    modelCount?: number;
+
+    /**
+     * True when the catalog came back holding nothing but LiteLLM grant sentinels (`*`,
+     * `all-proxy-models`, …), which are dropped as unusable — the gateway never expanded the
+     * key's model grant into real model names. Distinct from a plain `modelCount: 0`, which
+     * means the key legitimately grants no models.
+     */
+    grantNotExpanded?: boolean;
+
+    /** True when a cached catalog was served because a refresh was skipped or failed. */
+    servedStale?: boolean;
+  };
+};
+
+/** One tokenhub catalog model entry inside XcityProviderInfo, with per-user visibility. */
+export type XcityCatalogModel = {
+  /** Tokenhub model id (also the model's id in listModels()). */
+  id: string;
+
+  /** Human-readable model name. */
+  name: string;
+
+  /** True when the user has hidden this model from their model list. */
+  hidden: boolean;
 };
 
 /** One skill summary attached to an Xcity marketplace agent catalog entry. */

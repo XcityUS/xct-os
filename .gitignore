@@ -1,6 +1,9 @@
 # Dependencies
 node_modules/
 
+# Local code intelligence index
+.codegraph/
+
 # Build outputs
 dist/
 # Generated gatekeeper UI bundles, rebuilt as a prerequisite of build/deploy

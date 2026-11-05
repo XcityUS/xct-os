@@ -24,6 +24,7 @@ import {
   type SkillManifestMetadata,
 } from "./agent-skill.js";
 import { obsContext } from "./observability.js";
+import { alarmsDisabled, guardedAlarm } from "@gadgets/gatekeeper-kit/alarm-guard";
 import {
   decodeStoredContextBody, encodeStoredContextBody, truncateContextDescription,
 } from "./context-storage.js";
@@ -46,6 +47,10 @@ const GIT_REFRESH_MIN_INTERVAL_MS = 60_000;
 // Retry a failed git token revocation after 5 minutes, doubling up to a day.
 const GIT_TOKEN_REVOKE_RETRY_MS = 5 * 60_000;
 const GIT_TOKEN_REVOKE_RETRY_MAX_MS = 24 * 60 * 60_000;
+// Xcity: after this many consecutive failed revocation attempts (about nine days of backoff) the
+// alarm stops retrying. The issuer records stay, so the next access change tries once more. See
+// docs/alarm-audit.md.
+const GIT_TOKEN_REVOKE_MAX_ATTEMPTS = 16;
 // Allow simple branch names made of alphanumerics, '/', '.', '_', and '-', but not leading/trailing '/'.
 const GIT_BRANCH_RE = /^(?!\/)(?!.*\/$)[A-Za-z0-9/._-]{1,255}$/;
 // Older collections build this path list on first use. Increase the version when parsing rules
@@ -533,9 +538,12 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     let sweepLegacyTokens = meta.content.source === "git" && !!creator && !this.#canEdit(creator)
       && !this.storage.legacyGitTokensSwept.get();
 
+    let attempts = this.storage.gitTokenRevokeAttempts.get();
+    let exhausted = attempts >= GIT_TOKEN_REVOKE_MAX_ATTEMPTS;
     if (revocable.length > 0 || sweepLegacyTokens) {
-      // Rearm retries too, in case the runtime stops while an alarm's external call is pending.
-      await this.#armAccessCleanup();
+      // Rearm retries too, in case the runtime stops while an alarm's external call is pending
+      // (not once retries are exhausted, or the watchdog would keep them going).
+      if (!exhausted) await this.#armAccessCleanup();
       let repo: ArtifactsRepo | undefined;
       try {
         repo = await this.#artifacts().get(meta.id);
@@ -571,9 +579,15 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
       }
     }
 
-    let attempts = this.storage.gitTokenRevokeAttempts.get();
     if (unrevoked.size === 0) {
       if (attempts > 0) this.storage.gitTokenRevokeAttempts.put(0);
+    } else if (attempts + 1 >= GIT_TOKEN_REVOKE_MAX_ATTEMPTS) {
+      if (!exhausted) {
+        this.storage.gitTokenRevokeAttempts.put(attempts + 1);
+        logger.error("gave up retrying git token revocation", {
+          event: "artifacts.issuer.token.revoke.gave_up", collectionId: meta.id,
+        });
+      }
     } else {
       this.storage.gitTokenRevokeAttempts.put(attempts + 1);
       await this.ctx.storage.setAlarm(Date.now() + Math.min(
@@ -589,17 +603,29 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     }
   }
 
-  /** Resumes credential cleanup and memberless deletion, including interrupted grant changes. */
+  /**
+   * Resumes credential cleanup and memberless deletion, including interrupted grant changes.
+   *
+   * Xcity: runs under guardedAlarm (kill switch, hourly cap). A failed deletion throws, so the
+   * guard owns its retry: 5 min doubling to a day, abandoned after 12 consecutive failures. A
+   * failed revocation is caught and retried on its own backoff, bounded by
+   * GIT_TOKEN_REVOKE_MAX_ATTEMPTS. See docs/alarm-audit.md.
+   */
   async alarm(): Promise<void> {
-    await this.#serializeAccessChange(async () => {
+    await guardedAlarm(this.ctx, {
+      key: "context-collection", disabled: alarmsDisabled(this.env), maxPerHour: 60,
+      deferWhenOpen: true, backoff: { baseMs: GIT_TOKEN_REVOKE_RETRY_MS, maxMs: GIT_TOKEN_REVOKE_RETRY_MAX_MS },
+      maxConsecutiveFailures: 12,
+    }, () => this.#serializeAccessChange(async () => {
       if (this.storage.deletionPending.get()) await this.#deleteSelf();
       else {
         let unrevoked = await this.#revokeUnauthorizedGitTokens();
-        if (!await this.#deleteIfMemberless() && unrevoked.size === 0) {
+        let retriesLeft = this.storage.gitTokenRevokeAttempts.get() < GIT_TOKEN_REVOKE_MAX_ATTEMPTS;
+        if (!await this.#deleteIfMemberless() && (unrevoked.size === 0 || !retriesLeft)) {
           await this.ctx.storage.deleteAlarm();
         }
       }
-    });
+    }));
   }
 
   // Undefined for documents that are not text SKILL.md files. The error is one of

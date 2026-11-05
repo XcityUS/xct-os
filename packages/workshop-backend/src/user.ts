@@ -1,16 +1,16 @@
 import { RpcStub } from "capnweb";
 import type { ChatReadState, ChatTimelineHead, UnreadStateScope, UnreadStateSubscriber, UserUnreadState, UnreadThread, UserUnreadSummary, WorkspaceUnreadSummary } from "@gadgets/workshop-shared/api";
-import { WorkspaceMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, WorkspaceMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, XcityCatalogAgent, XcityChatAgentInfo, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart, type WebPushSubscription } from '@gadgets/workshop-shared/api';
+import { WorkspaceMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, WorkspaceMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart, type WebPushSubscription, XcityCatalogAgent, XcityChatAgentInfo, XcityProviderInfo } from '@gadgets/workshop-shared/api';
 import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
 import { XcityGatekeeperUser } from "@gadgets/workshop-shared/xcity-gatekeeper";
+import type { XcityWalletBalance } from "./xcity/usage-checker.js";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import type { Singleton } from "@gadgets/typed-storage";
 import {
   makeUserStorage, type BlueprintUserRecord, type CloudflareBilling, type ConnectedAccountRecord,
-  type XcityWalletBalance,
   type GadgetRecord, type PendingConnectFlow, type PendingDeviceHandoffRecord,
   type PendingHandoffRecord, type UserAiModelRecord, type UserStorage, type WorkspaceOutputEntry,
   type ChatReadCursor,
@@ -18,11 +18,15 @@ import {
 import { chatKey, chatKeyPrefix } from "./storage-schema/overseer-storage.js";
 import { recordAnalytics } from "./analytics";
 import { createWorkshopLogger } from "./observability";
+import { haltIfAlarmsDisabled } from "@gadgets/observability/alarm-guard";
 import { getGatewayModels, type GatewayModels } from "./ai-gateway.js";
 import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-billing/limits/config.js";
 import { getXcityAgentMarketplaceConfig, getXcityConfig } from "./xcity/config.js";
 import { getXcityAgent, isSafeXcityAgentSlug, listXcityAgents } from "./xcity/agent-catalog.js";
+import { getXcityProviderInfoForUser } from "./xcity/provider-info.js";
+import { filterVisibleXcityModels, toggleXcityHiddenModelId } from "./xcity/model-visibility.js";
 import { getXcityAgentPersona } from "./xcity/agent-persona.js";
+import { debitXcitySkillUseForTurn } from "./xcity/skill-billing.js";
 import {
   XcityModelPlane,
   XCITY_VENDOR_ID,
@@ -1278,30 +1282,21 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.#syncDirectory();
   }
 
+  async setOwnCommitEmail(email: string | null): Promise<void> {
+    let profile = this.storage.profile.get();
+    if (email === null) {
+      delete profile.commitEmail;
+    } else {
+      validateCommitEmail(email);
+      profile.commitEmail = email;
+    }
+    this.storage.profile.put(profile);
+  }
+
   async #getXcityModelPlane(): Promise<XcityModelPlane | null> {
     let config = getXcityConfig(this.env);
     let identity = this.storage.xcityIdentity.get();
-    if (!config) return null;
-
-    // Accounts that completed OAuth before Xcity identity persistence was introduced still have
-    // an authoritative gatekeeper capability. Recover the stable GoTrue subject from that
-    // capability on first model access instead of making the user disconnect and sign in again.
-    // The access token and TokenHub key stay server-side throughout this repair path.
-    if (!identity) {
-      try {
-        let account = await this.getXcityGatekeeperAccount();
-        let userId = account ? await account.getXcityUserId() : null;
-        if (userId) {
-          identity = { userId, email: this.storage.profile.get().id };
-          this.storage.xcityIdentity.put(identity);
-        }
-      } catch (err) {
-        logger.warn("failed to recover xcity identity from connected account", {
-          event: "xcity.identity.recover.failed", error: err,
-        });
-      }
-    }
-    if (!identity) return null;
+    if (!config || !identity) return null;
 
     try {
       return await XcityModelPlane.forUser(
@@ -1315,42 +1310,50 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
   }
 
-  async setOwnCommitEmail(email: string | null): Promise<void> {
-    let profile = this.storage.profile.get();
-    if (email === null) {
-      delete profile.commitEmail;
-    } else {
-      validateCommitEmail(email);
-      profile.commitEmail = email;
-    }
-    this.storage.profile.put(profile);
+  /**
+   * Describe the user's default Xcity TokenHub provider for the /providers page, with per-hop
+   * diagnostics for this call. Null only when the Xcity model plane is not configured; with no
+   * stored Xcity identity the info comes back empty with `diagnostics.identity: false`. Never
+   * throws.
+   */
+  async getXcityProviderInfo(): Promise<XcityProviderInfo | null> {
+    let identity = this.storage.xcityIdentity.get();
+    return getXcityProviderInfoForUser(
+        this.env, this.storage.xcityModelPlane, identity,
+        identity?.email ?? this.storage.profile.get().id,
+        this.storage.xcityHiddenModelIds.get());
+  }
+
+  /**
+   * Show or hide one Xcity TokenHub catalog model in this user's model list. Visibility only —
+   * hidden models still resolve in getChatContext(), so existing chats keep working. Ids not in
+   * the tokenhub catalog are ignored (with a warning inside the toggle helper).
+   */
+  async setXcityModelHidden(modelId: string, hidden: boolean): Promise<void> {
+    let xcityModelPlane = await this.#getXcityModelPlane();
+    let catalogIds = new Set(
+        (xcityModelPlane?.getModelList() ?? []).map(model => model.id));
+    this.storage.xcityHiddenModelIds.put(toggleXcityHiddenModelId(
+        this.storage.xcityHiddenModelIds.get(), catalogIds, modelId, hidden));
   }
 
   async listModels(kind: ModelKind = "language"): Promise<AiChatAuthorInfo[]> {
-    // Tokenhub serves language models only.
-    let xcityModelPlane = kind === "language" ? await this.#getXcityModelPlane() : null;
-    return this.#listModels(await getGatewayModels(this.env), kind, xcityModelPlane);
+    return this.#listModels(
+        await getGatewayModels(this.env), await this.#getXcityModelPlane(), kind);
   }
 
-  #listModels(models: GatewayModels | null, kind: ModelKind,
-              xcityModelPlane: XcityModelPlane | null = null): AiChatAuthorInfo[] {
+  #listModels(models: GatewayModels | null, xcityModelPlane: XcityModelPlane | null,
+              kind: ModelKind): AiChatAuthorInfo[] {
     let result: AiChatAuthorInfo[] = [];
 
     if (xcityModelPlane) {
-      let xcityModelIds = new Set<string>();
-      for (let entry of xcityModelPlane.getModelList()) {
-        result.push(entry);
-        xcityModelIds.add(entry.id);
-      }
-
-      // User-configured models remain available, but tokenhub is authoritative for duplicates.
-      for (let model of this.storage.aiModels.list()) {
-        if (!xcityModelIds.has(model.profile.id) &&
-            modelKind(model.config.provider, model.config.model) === kind) {
-          result.push(model.profile);
-        }
-      }
-      return result;
+      // Tokenhub is the ONLY model source on Xcity deployments: gateway and user-configured
+      // (BYOK) models are not merged in, and models the user has hidden are filtered out. Both
+      // are list-only exclusions — #resolveModel() still resolves hidden and BYOK models, so
+      // existing chats keep working. TokenHub serves language models only.
+      if (kind !== "language") return result;
+      return filterVisibleXcityModels(
+          xcityModelPlane.getModelList(), this.storage.xcityHiddenModelIds.get());
     }
 
     // When AI Gateway mode is active, include the gateway models the deployment offers.
@@ -1432,7 +1435,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async deleteModel(id: string): Promise<void> {
-    let xcityModel = (await this.#getXcityModelPlane())?.resolveModel(id);
+    let xcityModelPlane = await this.#getXcityModelPlane();
+    let xcityModel = xcityModelPlane?.resolveModel(id);
     if (xcityModel) {
       throw new Error(`Cannot delete built-in model "${xcityModel.profile.name}".`);
     }
@@ -1466,7 +1470,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   #chosenQuickModel(models: GatewayModels | null): UserAiModelRecord | undefined {
     let id = this.storage.quickModel.get();
     if (!id || isCloudflareLimitsEnabled(this.env)) return undefined;
-    return this.#resolveModel(id, models);
+    return this.#resolveModel(id, models, null);
   }
 
   async getPreferredModel(): Promise<string | null> {
@@ -1476,11 +1480,29 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async setPreferredModel(id: string | null): Promise<void> {
     if (id !== null) {
       // Any model that resolves is accepted, hidden ones included (see getExternalMessageChatContext()).
-      if (!this.#resolveModel(id, await getGatewayModels(this.env), await this.#getXcityModelPlane())) {
+      if (!this.#resolveModel(
+          id, await getGatewayModels(this.env), await this.#getXcityModelPlane())) {
         throw new Error(`No such model: ${id}`);
       }
     }
     this.storage.preferredModel.put(id);
+  }
+
+  /**
+   * Warms the Xcity model plane (per-user tokenhub key + model catalog) and the agent catalog so
+   * the frontend's first post-login requests hit warm caches. Best-effort: never throws, and a
+   * no-op when the Xcity model plane is not configured or the user has no Xcity identity.
+   */
+  async prewarmXcityModelPlane(): Promise<void> {
+    try {
+      // #getXcityModelPlane mints the key and loads the catalog into this DO's cache.
+      await this.#getXcityModelPlane();
+      await this.listXcityAgents();
+    } catch (err) {
+      logger.warn("xcity prewarm failed", {
+        event: "xcity.prewarm.failed", error: err,
+      });
+    }
   }
 
   async listXcityAgents(): Promise<XcityCatalogAgent[]> {
@@ -1551,6 +1573,24 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       },
       persona,
     };
+  }
+
+  /**
+   * Debit this user's Xcity wallet for one use of a priced marketplace skill. Called by the
+   * overseer once per user-prompted chat turn that runs with an active persona; `requestId` is the
+   * turn's idempotency key. Fail-open no-op when the marketplace is unconfigured, the user has no
+   * Xcity identity, or the skill is unpriced — billing must never block or fail a turn.
+   */
+  async debitXcitySkillUse(slug: string, requestId: string, chatRef?: string): Promise<void> {
+    let identity = this.storage.xcityIdentity.get();
+    await debitXcitySkillUseForTurn(
+        this.env,
+        this.storage.xcityModelPlane,
+        identity,
+        slug,
+        requestId,
+        chatRef,
+        identity?.email ?? this.storage.profile.get().id);
   }
 
   async #getXcityAgentPersona(slug: string): Promise<string | null> {
@@ -1699,7 +1739,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   #getChatContext(modelId: string | null, models: GatewayModels | null,
-                  xcityModelPlane: XcityModelPlane | null = null): UserChatContext {
+                  xcityModelPlane: XcityModelPlane | null): UserChatContext {
     let result: UserChatContext = {
       profile: this.storage.profile.get()
     };
@@ -1715,14 +1755,17 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       }
     }
 
-    // Resolve the quick model (used for lightweight tasks like title generation): tokenhub's own
-    // where the Xcity plane is active, else the user's choice where it may be used (see
-    // #chosenQuickModel), else in AI Gateway mode the deployment's own.
-    result.quickModel = xcityModelPlane
-        ? (models
-            ? models.gateway.getQuickModelConfig(xcityModelPlane)
-            : xcityModelPlane.getQuickModelConfig())
-        : this.#chosenQuickModel(models)?.config ?? models?.gateway.getQuickModelConfig();
+    // Resolve the quick model (used for lightweight tasks like title generation): the Xcity
+    // plane's, else the user's choice where it may be used (see #chosenQuickModel), else in AI
+    // Gateway mode the deployment's own.
+    if (xcityModelPlane) {
+      result.quickModel = models
+          ? models.gateway.getQuickModelConfig(xcityModelPlane)
+          : xcityModelPlane.getQuickModelConfig();
+    } else {
+      result.quickModel = this.#chosenQuickModel(models)?.config ??
+          models?.gateway.getQuickModelConfig();
+    }
     return result;
   }
 
@@ -1733,8 +1776,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let models = await getGatewayModels(this.env);
     let xcityModelPlane = await this.#getXcityModelPlane();
     let selectedModelId = existingChatModelId;
-    if (selectedModelId === null || !this.#resolveModel(selectedModelId, models, xcityModelPlane)) {
-      let offered = this.#listModels(models, "language", xcityModelPlane);
+    if (selectedModelId === null ||
+        !this.#resolveModel(selectedModelId, models, xcityModelPlane)) {
+      let offered = this.#listModels(models, xcityModelPlane, "language");
       let preferredModel = this.storage.preferredModel.get();
       selectedModelId = (offered.find(model => model.id === preferredModel) ?? offered[0])?.id ?? null;
     }
@@ -1745,13 +1789,14 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   /**
    * Resolve a model ID the way chats do: a gateway model shadows a stored model with the same ID
    * whatever its mode, so a disabled one resolves to nothing rather than to the stored model. No
-   * stored model resolves on a gateway deployment whose users may not add their own.
+   * stored model resolves on a gateway deployment whose users may not add their own. With the
+   * Xcity model plane, tokenhub models take the gateway's place, hidden ones included.
    */
   #resolveModel(id: string, models: GatewayModels | null,
-                xcityModelPlane: XcityModelPlane | null = null): UserAiModelRecord | undefined {
-    // Tokenhub is authoritative for the models it serves.
-    let xcityModel = xcityModelPlane?.resolveModel(id);
-    if (xcityModel) return xcityModel;
+                xcityModelPlane: XcityModelPlane | null): UserAiModelRecord | undefined {
+    if (xcityModelPlane) {
+      return xcityModelPlane.resolveModel(id) ?? this.storage.aiModels.get(id);
+    }
     if (models?.get(id)) return models.resolve(id);
     return models && !models.userModels ? undefined : this.storage.aiModels.get(id);
   }
@@ -2981,6 +3026,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * device handoffs and sessions. Device handoff cleanup also deletes its unactivated session.
    */
   async alarm(): Promise<void> {
+    if (await haltIfAlarmsDisabled(this.ctx, this.env, "handoff-sweep")) return;
     // A stalled workspace/push service must not prevent unrelated auth expiry cleanup.
     let deliveries = Promise.allSettled([this.#deliverNotifications()]);
     let now = Date.now();

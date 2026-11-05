@@ -14,6 +14,7 @@ vi.mock('../../AuthContext', () => ({
   useAuthenticatedApi: () => state.auth,
   useOptionalAuthenticatedApi: () => state.auth,
 }))
+// The Xcity fork's billing UI also reads the deployment's usage gate and recharge link.
 vi.mock('../../ServerConfigContext', () => ({
   useCloudflareLimitsEnabled: () => true,
   useUsageBillingEnabled: () => true,

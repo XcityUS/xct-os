@@ -80,7 +80,7 @@ export const NotificationSettings = () => {
         ) : (
           <p className="text-sm text-kumo-subtle">
             {support === "appleMobile"
-              ? "On iPhone and iPad, notifications come from the Cloudflare OS app."
+              ? "On iPhone and iPad, notifications come from the Xcity OS app."
               : "Browser notifications aren't available on Android yet."}
           </p>
         )}

@@ -29,6 +29,7 @@ import {
   connectHandoffPageHtml, errorPageHtml, htmlResponse, INVALID_LINK_HTML,
 } from "@gadgets/gatekeeper-kit/connect-pages";
 import { NONCE_KEY, advanceToOAuth, claimOAuth, putInitiation } from "@gadgets/gatekeeper-kit/connect-handshake";
+import { haltIfAlarmsDisabled } from "@gadgets/gatekeeper-kit/alarm-guard";
 import { CONNECT_TIMEOUT_MS, NONCE_BYTES, generateNonce } from "@gadgets/gatekeeper-kit/connect-nonce";
 import {
   CredentialCoordinator,
@@ -199,7 +200,7 @@ export default {
         // The refusal ends the attempt: its nonce is consumed so a replayed callback cannot resume it.
         if (!await stub.consumeOAuthNonce(oauthNonce)) return htmlResponse(INVALID_LINK_HTML);
         return htmlResponse(errorPageHtml(
-          "GitLab authorization failed", "Please restart the connection flow from Cloudflare OS."), 400);
+          "GitLab authorization failed", "Please restart the connection flow from Xcity OS."), 400);
       }
       const code = url.searchParams.get("code");
       if (!code) return new Response("Error: no 'code' provided", { status: 400 });
@@ -226,7 +227,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
       color: "#fff0e8",
       tagline: "Triage issues, review merge requests, and push to projects",
       description:
-          "Connect your GitLab account so Cloudflare OS can read and update issues, merge requests, " +
+          "Connect your GitLab account so Xcity OS can read and update issues, merge requests, " +
           "and reviews, and pull from and push to the projects you choose.",
       providesAuth: true,
     };
@@ -510,6 +511,7 @@ export class UserAccount extends DurableObject<Env> implements AccountCredential
   }
 
   async alarm(): Promise<void> {
+    if (await haltIfAlarmsDisabled(this.ctx, this.env, "connect-timeout")) return;
     // Drop the account if the flow never completed, or if this was a transient auth-only sign-in
     // grant (used once to read the email for login). The latter still holds live tokens, which
     // are revoked rather than left to expire.

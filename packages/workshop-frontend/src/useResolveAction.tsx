@@ -10,6 +10,21 @@ import { rpcFailureDescription } from './rpcErrors'
 type ActionDecision = 'approve' | 'deny'
 
 /**
+ * Server-side failures reach us as an opaque RPC error, and the message is the only clue the user
+ * gets — a bare "Failed to approve action" sent people to the code to find out what broke. Show the
+ * message as the toast's description, but only when it reads like a sentence: collapse it to its
+ * first line so a stack trace does not fill the viewport, cap the length, and drop values that carry
+ * no information (empty strings, a bare `Error`, `[object Object]`) so the toast degrades to the
+ * title alone.
+ */
+function errorDetail(error: unknown): string | undefined {
+  const raw = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
+  const firstLine = raw.split('\n')[0].trim().replace(/\s+/g, ' ')
+  if (!firstLine || firstLine === 'Error' || firstLine.startsWith('[object ')) return undefined
+  return firstLine.length > 200 ? `${firstLine.slice(0, 197)}...` : firstLine
+}
+
+/**
  * Returns `resolveAction` for an action's approve/deny controls, and `creationAccountModal` for
  * the caller to render: approving a creation first asks which account to create it in, and how.
  */
@@ -33,9 +48,12 @@ export function useResolveAction(
       onResolvedRef.current?.(actionId, decision === 'approve' ? 'approved' : 'rejected')
     } catch (error) {
       console.error(`Failed to ${decision} action:`, error)
+      // Upstream's rpcFailureDescription drops transient connection errors; errorDetail then
+      // keeps only a readable first line of what remains.
+      const detail = errorDetail(rpcFailureDescription(error))
       toasts.add({
         title: `Failed to ${decision} action`,
-        description: rpcFailureDescription(error),
+        ...(detail ? { description: detail } : {}),
         variant: 'error',
       })
     } finally {

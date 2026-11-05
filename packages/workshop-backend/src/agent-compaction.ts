@@ -6,7 +6,6 @@ import {composeEpochChanges, type CodeChange} from "@gadgets/workshop-shared/cod
 import type {Api, Message, Model} from "@earendil-works/pi-ai";
 import type {ChatBindingEntry, CompactionCheckpoint} from "./storage-schema/overseer-storage";
 import {zeroUsage} from "./ai-invoke";
-import { getXcityModelMetadata } from "./xcity/model-plane";
 
 // Context compaction keeps long chats within the model's limit. It summarizes the messages before a
 // boundary and stores their replay state in a checkpoint. Canonical history keeps every message, so
@@ -33,12 +32,10 @@ const DEFAULT_CONTEXT_WINDOW = 128_000;
  */
 export function getModelTokenLimits(config: AiModelConfig):
     {inputBudget: number, maxOutputTokens?: number} {
-  let xcityMetadata = getXcityModelMetadata(config);
   let model = SUGGESTED_MODELS[config.provider][config.model];
-  let maxOutputTokens = config.outputLimit ?? xcityMetadata?.maxOutputTokens ?? model?.outputLimit ??
+  let maxOutputTokens = config.outputLimit ?? model?.outputLimit ??
       (config.provider === "cloudflare" ? WORKERS_AI_OUTPUT_LIMIT : undefined);
-  let inputLimit = (config.contextWindow ?? xcityMetadata?.contextWindow ?? model?.contextWindow ??
-      DEFAULT_CONTEXT_WINDOW) -
+  let inputLimit = (config.contextWindow ?? model?.contextWindow ?? DEFAULT_CONTEXT_WINDOW) -
       (maxOutputTokens ?? 0);
   return {
     inputBudget: Math.min(

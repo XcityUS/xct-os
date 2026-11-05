@@ -18,6 +18,15 @@
       }
     }
   ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "WORKSHOP_OVERSEER",
+        "class_name": "OverseerDurableObject",
+        "script_name": "workshop-backend"
+      }
+    ]
+  },
   "migrations": [
     {
       "tag": "v0",

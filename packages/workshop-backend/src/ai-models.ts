@@ -38,15 +38,16 @@ import {
 } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
+import {
+  estimateSharedHeadTokens, hasGpt56PromptCaching, splitSystemPrompt,
+} from "./system-prompt-blocks.js";
 import { getXcityConfig } from "./xcity/config.js";
 import {
   attachXcityModelDescriptorMetadata,
   getXcityModelMetadata,
+  xcityModelInput,
   xcityModelCost,
 } from "./xcity/model-plane.js";
-import {
-  estimateSharedHeadTokens, hasGpt56PromptCaching, splitSystemPrompt,
-} from "./system-prompt-blocks.js";
 
  /**
   * Routing to bill a user's own Cloudflare account for inference (BYOK path once the free tier is
@@ -282,12 +283,11 @@ function gatewayCatalogModel(config: AiModelConfig): CatalogEntry | undefined {
 // catalog fills gaps for models we don't list, and unknown models get conservative defaults.
 function modelTokenWindow(config: AiModelConfig, catalog: CatalogEntry | undefined)
     : { contextWindow: number, maxTokens: number } {
-  let xcityMetadata = getXcityModelMetadata(config);
   const suggested = SUGGESTED_MODELS[config.provider]?.[config.model];
   return {
-    contextWindow: config.contextWindow ?? xcityMetadata?.contextWindow ??
-        suggested?.contextWindow ?? catalog?.contextWindow ?? 128_000,
-    maxTokens: config.outputLimit ?? xcityMetadata?.maxOutputTokens ?? suggested?.outputLimit ??
+    contextWindow: config.contextWindow ?? suggested?.contextWindow ?? catalog?.contextWindow ??
+        128_000,
+    maxTokens: config.outputLimit ?? suggested?.outputLimit ??
         (config.provider === "cloudflare" ? WORKERS_AI_OUTPUT_LIMIT : undefined) ??
         catalog?.maxTokens ?? 4096,
   };
@@ -627,8 +627,8 @@ function makeHandle(args: HandleArgs): ModelHandle {
             current = { ...current, user: args.openAiRequestUser };
             changed = true;
           }
-          const attributed = changed ? current : undefined;
-          const bridged = bridgePdfAttachments(args.model.api, current) ?? attributed;
+          const bridged = bridgePdfAttachments(args.model.api, current) ??
+              (changed ? current : undefined);
           const signed = signGeminiFunctionCalls(args.model, bridged ?? payload) ?? bridged;
           if (options.cacheRetention === "none") return signed;
           const split = splitSystemPrompt(args.model, transcript, signed ?? payload);
@@ -1047,53 +1047,53 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
       // users may paste the /v1 endpoint directly. When no API key was configured we assume
       // local auth and send no Authorization header at all (as before the pi migration; a strict
       // local proxy may reject an unexpected bearer token).
-      {
-        const xcityMetadata = getXcityModelMetadata(config);
-        const input: ("text" | "image")[] = xcityMetadata
-            ? (xcityMetadata.capabilities?.vision === true ||
-                xcityMetadata.capabilities?.pdfInput === true ? ["text", "image"] : ["text"])
-            : ["text", "image"];
-        return makeHandle({
-          model: attachXcityModelDescriptorMetadata({
-            id: config.model,
-            name: config.model,
-            api: "openai-completions",
-            provider: "ollama",
-            baseUrl: `${stripTrailingSlashes(config.apiUrl ?? "http://localhost:11434")
-                .replace(/\/(api|v1)$/, "")}/v1`,
-            reasoning: true,
-            input,
-            cost: xcityModelCost(config) ?? ZERO_COST,
+      return makeHandle({
+        model: attachXcityModelDescriptorMetadata({
+          id: config.model,
+          name: config.model,
+          api: "openai-completions",
+          provider: "ollama",
+          baseUrl: `${stripTrailingSlashes(config.apiUrl ?? "http://localhost:11434")
+              .replace(/\/(api|v1)$/, "")}/v1`,
+          reasoning: true,
+          input: xcityModelInput(config) ?? ["text", "image"],
+          cost: xcityModelCost(config) ?? ZERO_COST,
 
-            // Pi's OpenAI compat uses the "developer" role for the system prompt by default,
-            // disabling it only for certain hostnames which are known not to support it.
-            //
-            // In ollama, some models support it and some do not. Frustratingly, the ones that do not
-            // don't necessarily throw an error. They may just proceed without a system prompt. For
-            // example, when I tested Muse Glimmer the day after it was released, I found it
-            // understood what tool calls were available to it but didn't know any of the info in
-            // the system prompt. Annoyingly, Muse Glimmer seems to be trained to treat the system
-            // prompt as secret, so refused to answer my questions about it directly. But I figured
-            // out it clearly wasn't getting the system prompt. And when I disabled  the "developer"
-            // role, the problem was fixed. In contrast, though, Gemma 4 running under otherwise
-            // exactly the same setup does understand the "developer" role and works fine. Weird!
-            //
-            // Some users also filed issues about this because they were trying to use the ollama
-            // provider as a way to target an arbitrary third-party OpenAI-compatible provider. This
-            // is not the intended use case for the ollama provider -- we should add an explicit
-            // provider for this. The ollama provider could in the future switch to using the ollama
-            // native API rather than the OpenAI-compatible endpoint, which would break users using
-            // it in this way. That said, if this flag works as a temporary work-around for them
-            // util we add a real OpenAI provider option... great.
-            compat: catalog?.compat ?? {supportsDeveloperRole: false},
+          // Pi's OpenAI compat uses the "developer" role for the system prompt by default,
+          // disabling it only for certain hostnames which are known not to support it.
+          //
+          // In ollama, some models support it and some do not. Frustratingly, the ones that do not
+          // don't necessarily throw an error. They may just proceed without a system prompt. For
+          // example, when I tested Muse Glimmer the day after it was released, I found it
+          // understood what tool calls were available to it but didn't know any of the info in
+          // the system prompt. Annoyingly, Muse Glimmer seems to be trained to treat the system
+          // prompt as secret, so refused to answer my questions about it directly. But I figured
+          // out it clearly wasn't getting the system prompt. And when I disabled  the "developer"
+          // role, the problem was fixed. In contrast, though, Gemma 4 running under otherwise
+          // exactly the same setup does understand the "developer" role and works fine. Weird!
+          //
+          // Some users also filed issues about this because they were trying to use the ollama
+          // provider as a way to target an arbitrary third-party OpenAI-compatible provider. This
+          // is not the intended use case for the ollama provider -- we should add an explicit
+          // provider for this. The ollama provider could in the future switch to using the ollama
+          // native API rather than the OpenAI-compatible endpoint, which would break users using
+          // it in this way. That said, if this flag works as a temporary work-around for them
+          // util we add a real OpenAI provider option... great.
+          //
+          // Pi also sends `store: false` to any endpoint it takes for standard OpenAI. This
+          // provider fronts arbitrary OpenAI-compatible servers, notably the Xcity tokenhub
+          // (LiteLLM), which forwards the parameter to the real vendor and fails with
+          // UnsupportedParamsError when that vendor (e.g. Anthropic via a router model group)
+          // does not accept it. The chat-completions API is stateless, so omitting it is
+          // equivalent.
+          compat: { ...(catalog?.compat ?? { supportsDeveloperRole: false }), supportsStore: false },
 
-            ...window,
-          }, config),
-          ...directAuth(config, "Authorization"),
-          openAiRequestUser: xcityMetadata?.xcityUserId,
-          sessionAffinity,
-        });
-      }
+          ...window,
+        }, config),
+        ...directAuth(config, "Authorization"),
+        openAiRequestUser: getXcityModelMetadata(config)?.xcityUserId,
+        sessionAffinity,
+      });
     case "openai":
       return makeHandle({
         model: {
@@ -1212,6 +1212,9 @@ export type AiModelGatekeeperProps = {
  */
 async function bindingConfig(
     env: Cloudflare.Env, props: AiModelGatekeeperProps): Promise<AiModelConfig> {
+  // Xcity TokenHub models are neither gateway models nor the user's own: getModel() routes them
+  // past the gateway, so no gateway policy applies to them.
+  if (getXcityConfig(env) && getXcityModelMetadata(props.config)) return props.config;
   let models = await getGatewayModels(env);
   let { autoRouterPool, ...config } = props.config;
   if (models?.get(config.model)?.provider !== config.provider) {

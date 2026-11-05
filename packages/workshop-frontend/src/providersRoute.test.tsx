@@ -68,9 +68,10 @@ describe('ProvidersPage quick model', () => {
   }
 
   // A decision model as quick model would fail every title and binding-name request it was given.
+  // (The Xcity fork words the quick model as the "default model" on this page; see seam #11.)
   it('can be any language model but never a decision model', async () => {
     await renderPage()
-    expect(document.body.textContent).toContain('Quick model:')
+    expect(document.body.textContent).toContain('Default model:')
 
     expect(nameOf('Decision model').closest('[role="button"]')).toBeNull()
     await act(async () => nameOf('Decision model').click())
@@ -79,15 +80,15 @@ describe('ProvidersPage quick model', () => {
     expect(api.setQuickModel).toHaveBeenCalledWith('chat-model')
 
     const [chatMenu, decisionMenu] = document.body.querySelectorAll<HTMLElement>('[aria-label="Provider actions"]')
-    expect(await menuItems(chatMenu)).toContain('Clear quick model')
-    expect(await menuItems(decisionMenu)).not.toContainEqual(expect.stringContaining('quick model'))
+    expect(await menuItems(chatMenu)).toContain('Clear default model')
+    expect(await menuItems(decisionMenu)).not.toContainEqual(expect.stringContaining('default model'))
   })
 
   // Reachable by finishing onboarding without a model, then adding Clef for a blueprint.
   it('offers no quick model when only decision models are configured', async () => {
     api.listModels.mockResolvedValueOnce([])
     await renderPage()
-    expect(document.body.textContent).not.toContain('Quick model:')
+    expect(document.body.textContent).not.toContain('Default model:')
   })
 
   // The server refuses a quick model there, since quick tasks count against no usage limit.

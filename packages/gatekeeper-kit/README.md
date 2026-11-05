@@ -101,6 +101,7 @@ import {
 | `./git-pull-transfer` | `startGitPull`: a one-shot raw PACK stream with a separate RPC-visible terminal status. | A gatekeeper implements `Gatekeeper.gitPull()` and must preserve provider errors across Workers RPC. |
 | `./git-objects` | Commit-id validation, raw commit-object parsing, and commit advertising (`advertiseCommits`, and `advertisePages` as a `PageHookCursor` hook). | A session returns commit ids (advertise them) or simulates reads of commits queued for push from their local bytes. |
 | `./git-diff` | Tree-to-tree diff over an injected `TreeDiffSource`, and `parseUnifiedPatch` for provider patches, both producing the unified-patch hunk shape agents see. | A pull/merge request's source branch has queued pushes and the provider cannot compute the diff yet, or a provider returns unified patches. |
+| `./alarm-guard` | `ALARMS_DISABLED` kill switch, floored `scheduleAlarm`, and `guardedAlarm` (hourly circuit breaker, failure backoff, give-up). Re-exported from `@gadgets/observability`. | Every `alarm()` starts with `haltIfAlarmsDisabled`; a self-re-arming alarm runs under `guardedAlarm`. See `docs/alarm-audit.md`. |
 
 ## Internal modules
 

@@ -18,6 +18,7 @@ import type {
 } from "@gadgets/workshop-shared/gatekeeper";
 import { GmailApi, GmailApiError } from "./google-api";
 import { obsContext } from "./observability";
+import { haltIfAlarmsDisabled } from "@gadgets/gatekeeper-kit/alarm-guard";
 import type { PushHooksEnv } from "./pubsub-push";
 import type { GmailMessageHook } from "./types";
 
@@ -211,6 +212,7 @@ export class GmailHookDriver extends DurableObject<Env> {
    * - delivering each queued message whose (re)try time has come, and forgetting finished ones.
    */
   async alarm(): Promise<void> {
+    if (await haltIfAlarmsDisabled(this.ctx, this.env, "gmail-hooks")) return;
     const kv = this.ctx.storage.kv;
     await this.#trackAccounts();
     if (this.#registrations().length > 0 && (kv.get<number>("syncAt") ?? 0) <= Date.now()) await this.#sync();

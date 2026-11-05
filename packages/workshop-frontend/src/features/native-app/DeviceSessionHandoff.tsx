@@ -68,7 +68,7 @@ export const submitDeviceSession = (state: string, start: DeviceSessionHandoffSt
   }
 }
 
-/** Ask the user before transferring an install session to the native Cloudflare OS app. */
+/** Ask the user before transferring an install session to the native Xcity OS app. */
 export const DeviceSessionHandoff = ({
   authenticatedApi,
 }: {
@@ -131,12 +131,12 @@ export const DeviceSessionHandoff = ({
       <div className="flex max-w-sm flex-col items-center gap-4 text-center">
         {working && <div aria-hidden="true" className="h-8 w-8 animate-spin rounded-full border-2 border-kumo-brand border-t-transparent" />}
         <h1 className="text-lg font-semibold text-kumo-default">
-          {working ? 'Finishing sign-in…' : 'Continue in Cloudflare OS?'}
+          {working ? 'Finishing sign-in…' : 'Continue in Xcity OS?'}
         </h1>
         <p className="text-sm text-kumo-subtle">
           {working
             ? 'This browser will close and return to the app.'
-            : 'Continue only if you started this sign-in from the Cloudflare OS app.'}
+            : 'Continue only if you started this sign-in from the Xcity OS app.'}
         </p>
         {!working && identityFailed && (
           <p role="alert" className="text-sm text-kumo-danger">
@@ -153,7 +153,7 @@ export const DeviceSessionHandoff = ({
         {error && <p role="alert" className="text-sm text-kumo-danger">{error}</p>}
         {!working && !identityFailed && (
           <Button variant="primary" disabled={!confirmedUser} onClick={() => { void continueInApp() }}>
-            Continue in Cloudflare OS
+            Continue in Xcity OS
           </Button>
         )}
       </div>

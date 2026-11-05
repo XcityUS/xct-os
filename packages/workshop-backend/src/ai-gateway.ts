@@ -161,7 +161,6 @@ export class AiGatewayConfig {
     let xcityQuickModel = xcityModelPlane?.getQuickModelConfig();
     if (xcityQuickModel) return xcityQuickModel;
 
-    // Always use Workers AI here.
     return {
       provider: "cloudflare",
       model: QUICK_MODEL_ID,

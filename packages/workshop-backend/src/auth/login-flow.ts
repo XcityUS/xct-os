@@ -29,21 +29,23 @@
 // Capability access (repos, docs, billing) is granted later when the user explicitly connects the
 // gatekeeper, which requests the full scopes and persists the connection.
 //
-// Cloudflare and Xcity are the exceptions: signing in also links the account for billing, and the
-// gatekeeper keeps this callback for that account's lifetime. The PendingLogin DO therefore also
-// records which user and account the sign-in produced (`link`), outliving the login result, so
-// expiry notices and reconnects for the account reach its user DO.
+// Cloudflare is the exception: signing in also links the account for billing, and the gatekeeper
+// keeps this callback for that account's lifetime. The PendingLogin DO therefore also records which
+// user and account the sign-in produced (`link`), outliving the login result, so expiry notices and
+// reconnects for the account reach its user DO. Xcity (when deployed) is linked the same way, since
+// its balance gate needs a reusable user token (see xcity/login.ts).
 
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { ConnectHandoff, GatekeeperConnectCallback, GatekeeperUser } from "@gadgets/workshop-shared/gatekeeper";
-import type { XcityGatekeeperUser } from "@gadgets/workshop-shared/xcity-gatekeeper";
 import { createWorkshopLogger } from "../observability";
+import { haltIfAlarmsDisabled } from "@gadgets/observability/alarm-guard";
 import { CLOUDFLARE_VENDOR_ID, type UserDurableObject } from "../user.js";
 import { readAdminConfig } from "../admin-config.js";
 import {
   CONNECT_FLOW_LIFETIME_MS, handoffTargetOrigin, hashPresentedSecret, newSecretToken,
   PENDING_HANDOFF_LIFETIME_MS,
 } from "../connect-handoff.js";
+import { completeXcityLogin } from "../xcity/login.js";
 import { XCITY_VENDOR_ID } from "../xcity/model-plane.js";
 
 const logger = createWorkshopLogger("workshop.auth");
@@ -172,6 +174,7 @@ export class PendingLogin extends DurableObject<Cloudflare.Env> {
   }
 
   async alarm(): Promise<void> {
+    if (await haltIfAlarmsDisabled(this.ctx, this.env, "pending-login")) return;
     this.ctx.storage.kv.delete(RESULT_KEY);
   }
 }
@@ -231,20 +234,13 @@ export class LoginConnectCallbackImpl
       }
       // For billing-aware providers, signing in also links the account: startGatekeeperLogin
       // requested full (non-transient) scopes, so persist the grant before handing back the session.
-      if (this.ctx.props.vendorId === CLOUDFLARE_VENDOR_ID || this.ctx.props.vendorId === XCITY_VENDOR_ID) {
+      if (this.ctx.props.vendorId === CLOUDFLARE_VENDOR_ID ||
+          this.ctx.props.vendorId === XCITY_VENDOR_ID) {
         const accountId = await userStub.linkConnectedAccountFromLogin(
             account, this.ctx.props.vendorId, expiresAt);
         await pending.link(userStub.id.toString(), accountId);
-      }
-      if (this.ctx.props.vendorId === XCITY_VENDOR_ID) {
-        const xcityUserId =
-            await (account as unknown as Fetcher<XcityGatekeeperUser>).getXcityUserId();
-        if (xcityUserId) {
-          await userStub.setXcityIdentity({ userId: xcityUserId, email });
-        } else {
-          loginLogger.warn("xcity login had no user id", {
-            event: "xcity.login.user.id.missing",
-          });
+        if (this.ctx.props.vendorId === XCITY_VENDOR_ID) {
+          await completeXcityLogin(account, userStub, email, this.ctx);
         }
       }
       // Session tokens are "<doName>:<secret>"; PublicApi.authenticate() routes via idFromName of

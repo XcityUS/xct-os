@@ -51,11 +51,12 @@ export interface WranglerExtras {
    */
   kvPreviewIds?: Record<string, string>;
   /**
-   * Same-script Durable Object namespace bindings, emitted as `durable_objects.bindings`. Only for
-   * a class that must be reached through `env` because `ctx.exports` hangs after its stub is
-   * revived from durable storage (see gatekeeper-xcity).
+   * Durable Object namespace bindings to classes this Worker itself exports, emitted as
+   * `durable_objects.bindings` entries with no `script_name`. @cloudflare/config's
+   * `bindings.durableObject()` always names a script, which the release manifest rejects for a
+   * same-script binding (see manifest-lib.ts).
    */
-  durableObjects?: { name: string; class_name: string }[];
+  sameScriptDurableObjects?: { name: string; class_name: string }[];
 }
 
 /** The `wrangler` export of a gatekeeper validated by capnweb-validate that imports .txt/.svg. */

@@ -22,6 +22,7 @@ import {
   SidebarWorkspacesLists,
 } from './SidebarWorkspaces'
 import SidebarUtilityStrip from './SidebarUtilityStrip'
+import SidebarBuildVersion from './SidebarBuildVersion'
 import { inNativeApp, returnToInstalls } from '../../features/native-app/nativeApp'
 
 /**
@@ -202,6 +203,7 @@ export default function Sidebar({
       </SidebarWorkspacesProvider>
 
       <SidebarUtilityStrip collapsed={collapsed} />
+      <SidebarBuildVersion collapsed={collapsed} />
       {inNativeApp() && (
         <button
           type="button"

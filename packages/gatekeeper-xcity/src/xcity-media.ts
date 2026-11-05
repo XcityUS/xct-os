@@ -5,6 +5,12 @@ import type {
   MediaGenerationCost,
   XcityGeneratedMediaKind,
 } from "./types";
+import { VENDOR_ID } from "./vendor.js";
+import { obsContext } from "./observability.js";
+
+const logger = obsContext.createLogger({
+  component: "gatekeeper.xcity", vendorId: VENDOR_ID,
+});
 
 type VideoRatio = NonNullable<GenerateVideoOptions["ratio"]>;
 type VideoResolution = NonNullable<GenerateVideoOptions["resolution"]>;
@@ -17,6 +23,46 @@ type EnvLike = {
   WALLET_SERVICE_TOKEN?: string;
 };
 
+// Kept apart from EnvLike, whose values are all strings (see envString).
+type MediaWorkerEnv = {
+  // Optional service binding to the xcity-media Worker, the preferred transport for calls to
+  // XCITY_MEDIA_WORKER_URL. Not declared in this package's config: the deploying starter's
+  // generated config adds it (`xcity.mediaWorkerService`). See resolveMediaWorkerTransport.
+  XCITY_MEDIA?: MediaWorkerBinding;
+};
+
+/** The part of a service binding the media transport uses. */
+export type MediaWorkerBinding = Pick<Fetcher, "fetch">;
+
+/**
+ * How the gatekeeper reaches the xcity-media Worker. Request URLs are always built from
+ * `XcityMediaConfig.mediaWorkerUrl`, so the Worker sees its real host either way; only the
+ * transport differs.
+ */
+export type MediaWorkerTransport = {
+  readonly kind: "service-binding" | "fetch";
+  fetch(url: string, init: RequestInit): Promise<Response>;
+};
+
+/**
+ * Picks the transport for xcity-media Worker calls: the optional `XCITY_MEDIA` service binding
+ * when the deployment provides one, else `fetchImpl` (the global fetch by default).
+ *
+ * The binding matters because the media Worker lives in the same account: a public-URL fetch to it
+ * re-enters the Workers runtime and counts toward the nested subrequest-depth limit, which the
+ * already-deep gatekeeper call chain exceeds ("Subrequest depth limit exceeded").
+ */
+export function resolveMediaWorkerTransport(
+  env: MediaWorkerEnv,
+  fetchImpl?: typeof fetch,
+): MediaWorkerTransport {
+  const binding = env.XCITY_MEDIA;
+  if (binding) {
+    return { kind: "service-binding", fetch: (url, init) => binding.fetch(url, init) };
+  }
+  return { kind: "fetch", fetch: (url, init) => (fetchImpl ?? fetch)(url, init) };
+}
+
 /** Complete configuration needed for Xcity media generation and permanent archival. */
 export type XcityMediaConfig = {
   tokenhubUrl: string;
@@ -24,6 +70,9 @@ export type XcityMediaConfig = {
   walletUrl: string;
   walletServiceToken: string;
 };
+
+/** The wallet-facing subset of the config, shared by every capability that mints per-user keys. */
+export type XcityWalletConfig = { walletUrl: string; walletServiceToken: string };
 
 export type XcityVirtualKeyRecord = {
   userId: string;
@@ -57,6 +106,35 @@ export type XcityTokenhubImage = {
   b64Json?: string;
   url?: string;
   revisedPrompt?: string;
+};
+
+/**
+ * An approved-but-not-yet-applied generation, as persisted in the gatekeeper Durable Object. It
+ * lives here rather than in xcity.ts so the apply/failure state machine below can be exercised
+ * without a workerd harness.
+ */
+export type StoredGenerateVideoAction = {
+  kind: "video";
+  mediaId: string;
+  options: Required<GenerateVideoOptions>;
+  cost?: MediaGenerationCost;
+  submittedAt: number;
+};
+
+export type StoredGenerateImageAction = {
+  kind: "image";
+  mediaId: string;
+  options: Required<GenerateImageOptions>;
+  cost?: MediaGenerationCost;
+  submittedAt: number;
+};
+
+export type StoredGenerateAction = StoredGenerateVideoAction | StoredGenerateImageAction;
+
+/** The pending-action store as the apply path uses it. */
+export type PendingMediaActions = {
+  get(actionId: number): StoredGenerateAction | undefined;
+  remove(actionId: number): void;
 };
 
 export class XcityMediaApiError extends Error {
@@ -114,22 +192,24 @@ const SEEDANCE_MODELS = {
 
 const UPLOADABLE_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 
-function stripTrailingSlashes(value: string): string {
+export function stripTrailingSlashes(value: string): string {
   let end = value.length;
   while (end > 0 && value.charCodeAt(end - 1) === 47) --end;
   return end === value.length ? value : value.slice(0, end);
 }
 
-function envString(env: EnvLike, key: keyof EnvLike): string | undefined {
+export function envString<E extends Record<string, string | undefined>>(
+  env: E, key: keyof E & string,
+): string | undefined {
   const value = env[key];
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function optionalString(value: unknown): string | undefined {
+export function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
@@ -137,7 +217,7 @@ function optionalFiniteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function optionalBoolean(value: unknown): boolean | undefined {
+export function optionalBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
@@ -279,7 +359,7 @@ export function parseWalletKeyResponse(
 }
 
 export async function mintTokenhubKey(
-  config: XcityMediaConfig,
+  config: XcityWalletConfig,
   identity: { sub: string; email?: string },
   fetchImpl: typeof fetch = fetch,
 ): Promise<XcityVirtualKeyRecord | undefined> {
@@ -403,7 +483,7 @@ export function imageCreateBody(options: Required<GenerateImageOptions>): Record
 }
 
 export async function tokenhubRequestJson<T>(
-  config: XcityMediaConfig,
+  config: Pick<XcityMediaConfig, "tokenhubUrl">,
   apiKey: string,
   path: string,
   init: RequestInit,
@@ -506,7 +586,7 @@ export async function createImage(
   const { raw } = await tokenhubRequestJson<unknown>(
     config,
     apiKey,
-    "/images",
+    "/images/generations",
     { method: "POST", body: JSON.stringify(imageCreateBody(options)) },
     fetchImpl,
   );
@@ -532,14 +612,47 @@ export async function createImage(
   throw new Error("TokenHub image response did not contain an image.");
 }
 
+/**
+ * Sends one request to the xcity-media Worker over `mediaWorker`, returning the parsed body, or
+ * null for a non-2xx response. Failures are logged with the transport, so a broken service binding
+ * is distinguishable from a public-URL fetch failure; a thrown error is rethrown for the caller's
+ * own fallback.
+ */
+async function requestMediaWorker(
+  config: Pick<XcityMediaConfig, "mediaWorkerUrl">,
+  mediaWorker: MediaWorkerTransport,
+  path: "/archive" | "/upload",
+  init: RequestInit,
+): Promise<unknown> {
+  let response: Response;
+  try {
+    response = await mediaWorker.fetch(`${config.mediaWorkerUrl}${path}`, init);
+  } catch (error) {
+    logger.warn("xcity media worker request failed", {
+      event: "xcity.media_worker.request.failed",
+      path, transport: mediaWorker.kind, error,
+    });
+    throw error;
+  }
+  const raw = await parseBody(response);
+  if (!response.ok) {
+    logger.warn("xcity media worker request rejected", {
+      event: "xcity.media_worker.request.rejected",
+      path, transport: mediaWorker.kind, status: response.status, statusText: response.statusText,
+    });
+    return null;
+  }
+  return raw;
+}
+
 export async function archiveVideoToR2(
   config: XcityMediaConfig,
   apiKey: string,
   videoId: string,
   sourceUrl: string,
-  fetchImpl: typeof fetch = fetch,
+  mediaWorker: MediaWorkerTransport = resolveMediaWorkerTransport({}),
 ): Promise<Pick<GeneratedMedia, "url" | "key" | "bytes" | "cached"> | null> {
-  const response = await fetchImpl(`${config.mediaWorkerUrl}/archive`, {
+  const raw = await requestMediaWorker(config, mediaWorker, "/archive", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -549,8 +662,6 @@ export async function archiveVideoToR2(
     body: JSON.stringify({ video_id: videoId, source_url: sourceUrl }),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
-  const raw = await parseBody(response);
-  if (!response.ok) return null;
   if (!isRecord(raw)) return null;
   const url = optionalString(raw.url);
   const key = optionalString(raw.key);
@@ -569,7 +680,7 @@ export async function uploadImageToR2(
   apiKey: string,
   bytes: Uint8Array,
   contentType: string,
-  fetchImpl: typeof fetch = fetch,
+  mediaWorker: MediaWorkerTransport = resolveMediaWorkerTransport({}),
 ): Promise<Pick<GeneratedMedia, "url" | "key" | "bytes" | "cached"> | null> {
   if (!UPLOADABLE_IMAGE_TYPES.has(contentType)) {
     throw new Error(`Unsupported generated image content type: ${contentType}`);
@@ -577,7 +688,7 @@ export async function uploadImageToR2(
   if (bytes.byteLength > MAX_IMAGE_UPLOAD_BYTES) {
     throw new Error(`Generated image is too large to archive (${bytes.byteLength} bytes).`);
   }
-  const response = await fetchImpl(`${config.mediaWorkerUrl}/upload`, {
+  const raw = await requestMediaWorker(config, mediaWorker, "/upload", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -587,8 +698,6 @@ export async function uploadImageToR2(
     body: bytes,
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
-  const raw = await parseBody(response);
-  if (!response.ok) return null;
   if (!isRecord(raw)) return null;
   const url = optionalString(raw.url);
   const key = optionalString(raw.key);
@@ -643,10 +752,11 @@ export async function archiveVideoOrTemporary(
   base: Omit<GeneratedMedia, "url" | "key" | "bytes" | "cached" | "archived" | "expiresAt" | "status" | "updatedAt">,
   fetchImpl: typeof fetch = fetch,
   now: () => number = Date.now,
+  mediaWorker: MediaWorkerTransport = resolveMediaWorkerTransport({}, fetchImpl),
 ): Promise<GeneratedMedia> {
   let archived: Pick<GeneratedMedia, "url" | "key" | "bytes" | "cached"> | null = null;
   try {
-    archived = await archiveVideoToR2(config, apiKey, mediaId, sourceUrl, fetchImpl);
+    archived = await archiveVideoToR2(config, apiKey, mediaId, sourceUrl, mediaWorker);
   } catch {
     archived = null;
   }
@@ -677,6 +787,7 @@ export async function archiveImageOrTemporary(
   base: Omit<GeneratedMedia, "url" | "key" | "bytes" | "cached" | "archived" | "expiresAt" | "status" | "updatedAt">,
   fetchImpl: typeof fetch = fetch,
   now: () => number = Date.now,
+  mediaWorker: MediaWorkerTransport = resolveMediaWorkerTransport({}, fetchImpl),
 ): Promise<GeneratedMedia> {
   let imageBytes: { bytes: Uint8Array; contentType: string } | null = null;
   if (source.b64Json) {
@@ -692,7 +803,7 @@ export async function archiveImageOrTemporary(
   if (imageBytes) {
     let archived: Pick<GeneratedMedia, "url" | "key" | "bytes" | "cached"> | null = null;
     try {
-      archived = await uploadImageToR2(config, apiKey, imageBytes.bytes, imageBytes.contentType, fetchImpl);
+      archived = await uploadImageToR2(config, apiKey, imageBytes.bytes, imageBytes.contentType, mediaWorker);
     } catch {
       archived = null;
     }
@@ -734,4 +845,51 @@ export function pendingGeneratedMedia(
     createdAt: new Date(now()),
     updatedAt: new Date(now()),
   };
+}
+
+export function failedGeneratedMedia(
+  action: StoredGenerateAction,
+  error: unknown,
+  providerJobId?: string,
+  now: () => number = Date.now,
+): GeneratedMedia {
+  return {
+    id: action.mediaId,
+    kind: action.kind,
+    status: "failed",
+    archived: false,
+    ...(action.cost ? { cost: action.cost } : {}),
+    ...(providerJobId ? { providerJobId } : {}),
+    error: error instanceof Error ? error.message : String(error),
+    createdAt: new Date(action.submittedAt),
+    updatedAt: new Date(now()),
+  };
+}
+
+/**
+ * Applies one approved generation, turning an upstream failure into the generation's stored result.
+ *
+ * A generation that the provider rejects is an outcome of the approved action, not a failure to
+ * apply it: if the error escaped, the approval itself would fail, the user would see a bare
+ * "failed to approve action" with the real message discarded, and the pending record would survive
+ * so every retry failed identically. So the error is recorded where the agent already looks for the
+ * generation's status, and the pending record is cleared on both paths.
+ */
+export async function applyMediaAction(options: {
+  actionId: number;
+  pending: PendingMediaActions;
+  run: (action: StoredGenerateAction) => Promise<void>;
+  storeResult: (result: GeneratedMedia) => void;
+  onFailure?: (action: StoredGenerateAction, error: unknown) => void;
+}): Promise<void> {
+  const { actionId, pending, run, storeResult, onFailure } = options;
+  const action = pending.get(actionId);
+  if (!action) throw new Error(`Unknown pending Xcity media action: ${actionId}`);
+  try {
+    await run(action);
+  } catch (error) {
+    onFailure?.(action, error);
+    storeResult(failedGeneratedMedia(action, error));
+  }
+  pending.remove(actionId);
 }

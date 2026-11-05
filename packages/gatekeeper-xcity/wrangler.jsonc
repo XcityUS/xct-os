@@ -15,6 +15,14 @@
       "invocation_logs": false
     }
   },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "USER_ACCOUNT",
+        "class_name": "UserAccount"
+      }
+    ]
+  },
   "build": {
     "command": "pnpm exec capnweb-validate build --out .wrangler/validate",
     "watch_dir": "src"
@@ -29,14 +37,6 @@
       "fallthrough": false
     }
   ],
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "USER_ACCOUNT",
-        "class_name": "UserAccount"
-      }
-    ]
-  },
   "migrations": [
     {
       "tag": "v0",
@@ -48,6 +48,12 @@
       "tag": "v1",
       "new_sqlite_classes": [
         "XcityMediaGatekeeperImpl"
+      ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "XcityContextGatekeeperImpl"
       ]
     }
   ]

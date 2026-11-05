@@ -14,8 +14,6 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { reportIssue } from './errorReporting'
-import type { XcityCatalogAgent } from "@gadgets/workshop-shared/api";
-import { useServerConfig } from "./ServerConfigContext";
 import {
   Dialog,
   DropdownMenu,
@@ -86,6 +84,7 @@ import {
   BlueprintMerge,
   BlueprintOutput,
   MessageFormatRef,
+  XcityCatalogAgent,
 } from "@gadgets/workshop-shared/api";
 import { composeEpochChanges, type CodeChange } from "@gadgets/workshop-shared/code-change";
 import type { ChatChangeRow, ChatContentReader } from "./features/code/otClient";
@@ -115,6 +114,7 @@ import { useVendorBranding } from "./useVendorBranding";
 import OutOfCreditsModal from "./components/billing/OutOfCreditsModal";
 import { formatFullTimestamp } from "./utils/formatTimestamp";
 import { copyToClipboard } from "./clipboard";
+import { useServerConfig } from "./ServerConfigContext";
 import { isImeComposing } from "./keyboardEvent";
 import { formatAttachmentSize } from "./features/chat/attachmentFormatting";
 import { ChatComposer } from "./features/chat/composer/ChatComposer";
@@ -2831,6 +2831,9 @@ function ChatInterface({
   const [availableModels, setAvailableModels] = useState<AiChatAuthorInfo[]>(
     [],
   );
+  // The default model set on /providers; preferred for new chats over the device-local last
+  // selection.
+  const [defaultModelId, setDefaultModelId] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
   const [xcityAgents, setXcityAgents] = useState<XcityCatalogAgent[]>([]);
   const [selectedXcityAgentSlug, setSelectedXcityAgentSlug] = useState<string | null>(null);
@@ -3408,12 +3411,12 @@ function ChatInterface({
   // Update selected model when switching chats
   useEffect(() => {
     if (selectedChatId === null) {
-      setSelectedModel(getStoredSelectedModel(availableModels));
+      setSelectedModel(getStoredSelectedModel(availableModels, defaultModelId));
     } else {
       // An existing thread takes its active agent's model, else the one that last spoke.
       setSelectedModel(fallbackToStoredModelSelection(chatAgent?.id ?? null, availableModels));
     }
-  }, [selectedChatId, availableModels, chatAgent?.id]);
+  }, [selectedChatId, availableModels, defaultModelId, chatAgent?.id]);
 
   // Keep the ref in sync with selectedChatId state
   useEffect(() => {
@@ -3857,9 +3860,11 @@ function ChatInterface({
 
           // After subscribing, load the list of chats and models
           // This is safe because subscription will catch any new activity
-          const [chats, models] = await Promise.all([
+          const [chats, models, quickModel] = await Promise.all([
             overseer.listChats(),
             overseer.listModels(),
+            // The default model set on /providers; older backends may not implement it.
+            authenticatedApi.getQuickModel().catch(() => null),
           ]);
 
           chats.forEach((chat) => {
@@ -3869,8 +3874,9 @@ function ChatInterface({
           setChatListReady(true);
 
           setAvailableModels(models);
+          setDefaultModelId(quickModel);
 
-          setSelectedModel(getStoredSelectedModel(models));
+          setSelectedModel(getStoredSelectedModel(models, quickModel));
 
           forceUpdate();
         }
@@ -4163,6 +4169,11 @@ function ChatInterface({
   };
 
   // Handle model change
+  const handleModelChange = (modelId: string | null) => {
+    setSelectedModel(modelId);
+    persistSelectedModel(modelId);
+  };
+
   const handleXcityAgentChange = (slug: string | null) => {
     const previous = selectedXcityAgentSlug;
     setSelectedXcityAgentSlug(slug);
@@ -4171,11 +4182,6 @@ function ChatInterface({
       setSelectedXcityAgentSlug(previous);
       toasts.add({ title: "Failed to save marketplace agent", variant: "error" });
     });
-  };
-
-  const handleModelChange = (modelId: string | null) => {
-    setSelectedModel(modelId);
-    persistSelectedModel(modelId);
   };
 
   // Handle stopping the agent

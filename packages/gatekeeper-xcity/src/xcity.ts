@@ -828,6 +828,7 @@ class XcityMediaSessionContext {
             `Prompt:\n\n${truncate(normalized.prompt)}`,
         implementsRevert: false,
         awaitDecision: true,
+        autoApprovable: false, // Paid generation: always a manual decision.
         actionKind: { tag: "xcity.media.generate.video", label: "Generate Xcity video" },
       });
     } catch (error) {
@@ -856,6 +857,7 @@ class XcityMediaSessionContext {
             `Prompt:\n\n${truncate(normalized.prompt)}`,
         implementsRevert: false,
         awaitDecision: true,
+        autoApprovable: false, // Paid generation: always a manual decision.
         actionKind: { tag: "xcity.media.generate.image", label: "Generate Xcity image" },
       });
     } catch (error) {
@@ -1310,6 +1312,7 @@ class XcityContextSessionContext {
         description: description.description,
         implementsRevert: false,
         awaitDecision: true,
+        autoApprovable: false, // Paid generation: always a manual decision.
         actionKind: { tag: description.tag, label: description.title },
       });
     } catch (error) {
